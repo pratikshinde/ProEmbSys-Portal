@@ -1,0 +1,19 @@
+G04 CAM350/DFMSTREAM V14.6 (Build 1864) Date:  Thu Apr  9 15:34:22 2026 *
+G04 Database: D:\ProPCB\Ocelli Systems\Gerb_WIFI_V6\wifi_v6.cam *
+G04 Layer 12: Panel_border *
+%FSLAX34Y34*%
+%MOMM*%
+%SFA1.000B1.000*%
+
+%MIA0B0*%
+%IPPOS*%
+%ADD143C,0.10000*%
+%LNPanel_border*%
+%LPD*%
+G54D143*
+X0Y0D02*
+G01X1100000D01*
+Y2145000*
+X0*
+Y0*
+M02*

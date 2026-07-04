@@ -1,0 +1,958 @@
+'use client'
+
+import React, { useRef, useEffect, useLayoutEffect, useCallback, useState, useMemo } from 'react'
+import { useAppStore, getLayerZIndex } from '@/lib/store'
+import { mergeLayerBounds, GerberSvgResult } from '@/lib/gerber-svg'
+import { PanelResult } from '@/lib/panelization-engine'
+
+/**
+ * GerberViewer — SVG-based viewer using tracespace-rendered layers (Web Worker).
+ *
+ * Coordinate system:
+ * - The worker outputs SVG in Y-down convention (Y=0 at top = Gerber maxY)
+ * - boundsObj is in SVG-native (Y-down screen-space) coordinates
+ * - The viewer uses a STANDARD positive-height viewBox
+ * - Cursor display converts SVG Y back to Gerber Y by negation
+ */
+
+interface ViewState {
+  viewBox: string
+  zoom: number
+}
+
+/**
+ * Inject a raw SVG fragment string as the children of a <g> element.
+ * Uses an imperative innerHTML assignment via a ref so we avoid React's
+ * raw-html prop. The injected content comes from our own worker (tracespace),
+ * never from user-supplied HTML, so XSS is not in scope here.
+ */
+const RawSvgGroup = React.forwardRef<
+  SVGGElement,
+  { html: string } & Omit<React.SVGAttributes<SVGGElement>, 'dangerouslySetInnerHTML'>
+>(function RawSvgGroup({ html, ...rest }, externalRef) {
+  const innerRef = useRef<SVGGElement>(null)
+  // useLayoutEffect (not useEffect) so innerHTML lands synchronously before the
+  // browser paints — critical when the parent is referenced by <use>, since
+  // <use> needs to see the populated content on the same paint frame.
+  useLayoutEffect(() => {
+    const el = innerRef.current
+    if (el && el.innerHTML !== html) el.innerHTML = html
+  }, [html])
+  useEffect(() => {
+    if (typeof externalRef === 'function') externalRef(innerRef.current)
+    else if (externalRef) externalRef.current = innerRef.current
+  })
+  return <g ref={innerRef} {...rest} />
+})
+
+/**
+ * Same as RawSvgGroup but emits a <symbol> — used inside <defs> as the target
+ * of <use>. `overflow="visible"` lets the reused content render at its native
+ * bounds without needing an explicit viewBox on the symbol.
+ */
+function RawSvgSymbol({ id, html }: { id: string; html: string }) {
+  const ref = useRef<SVGSymbolElement>(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (el && el.innerHTML !== html) el.innerHTML = html
+  }, [html])
+  return <symbol ref={ref} id={id} overflow="visible" />
+}
+
+export default function GerberViewer() {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const svgRef = useRef<SVGSVGElement>(null)
+
+  const layers = useAppStore(s => s.layers)
+  const panelResult = useAppStore(s => s.panelResult)
+  const panelConfig = useAppStore(s => s.panelConfig)
+  const showGrid = useAppStore(s => s.showGrid)
+  const showCrosshair = useAppStore(s => s.showCrosshair)
+  const targetUnit = useAppStore(s => s.targetUnit)
+  const activeTab = useAppStore(s => s.activeTab)
+  const boardView = useAppStore(s => s.boardView)
+  const boardViewSide = useAppStore(s => s.boardViewSide)
+  const viewMode = useAppStore(s => s.viewMode)
+  const setViewMode = useAppStore(s => s.setViewMode)
+  const setBoardViewSide = useAppStore(s => s.setBoardViewSide)
+
+  const [viewState, setViewState] = useState<ViewState>({ viewBox: '0 0 200 200', zoom: 1 })
+  const [cursorPos, setCursorPos] = useState<{ gx: number; gy: number } | null>(null)
+  const [containerSize, setContainerSize] = useState({ w: 800, h: 600 })
+
+  // Refs for panning
+  const isPanningRef = useRef(false)
+  const lastMouseRef = useRef({ x: 0, y: 0 })
+  const viewStateRef = useRef(viewState)
+  useEffect(() => { viewStateRef.current = viewState }, [viewState])
+
+  // Observe container size
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setContainerSize({
+          w: entry.contentRect.width,
+          h: entry.contentRect.height - 28, // subtract status bar height
+        })
+      }
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  // Board mode is active whenever viewMode === 'board' and we have layers with SVG data
+  const isBoardMode =
+    viewMode === 'board' &&
+    layers.some(l => l.svgData && !l.svgData.isEmpty)
+
+  // Compute combined bounds. In board-view mode the bounds come from
+  // tracespace/core's renderBoard viewBox (already in Y-down screen-space).
+  // Otherwise fall back to per-layer merged bounds.
+  const { combinedBounds, nativeSvgBounds } = useMemo(() => {
+    let native: { minX: number; minY: number; maxX: number; maxY: number } | null
+    if (isBoardMode && boardView) {
+      const vb = boardView.viewBox
+      native = {
+        minX: vb.x,
+        minY: vb.y,
+        maxX: vb.x + vb.width,
+        maxY: vb.y + vb.height,
+      }
+    } else {
+      const svgLayers = layers.filter(l => l.visible && l.svgData && !l.svgData.isEmpty)
+      native = svgLayers.length > 0 ? mergeLayerBounds(svgLayers.map(l => l.svgData!)) : null
+    }
+
+    // On Panel tab, use panel dimensions for bounds (Y-inverted to match SVG space)
+    const combined = ((activeTab === 'panel' || activeTab === 'export') && panelResult)
+      ? { minX: 0, minY: -panelResult.panelHeight, maxX: panelResult.panelWidth, maxY: 0 }
+      : native
+
+    return { combinedBounds: combined, nativeSvgBounds: native }
+  }, [layers, activeTab, panelResult, isBoardMode, boardView])
+
+  const boundsCenterX = useMemo(() => {
+    if (!combinedBounds) return 0
+    return (combinedBounds.minX + combinedBounds.maxX) / 2
+  }, [combinedBounds])
+
+  // Screen-space convention: screenY = -gerberY (set by Python transforms)
+  // Cursor display: gerberY = -screenY (simple negation, no layer-specific offset needed)
+
+  // Fit to view — standard positive-height viewBox to center content
+  const fitToView = useCallback(() => {
+    if (!combinedBounds) return
+
+    const padding = 3 // mm padding
+    const contentW = combinedBounds.maxX - combinedBounds.minX + padding * 2
+    const contentH = combinedBounds.maxY - combinedBounds.minY + padding * 2
+    if (contentW <= 0 || contentH <= 0) return
+
+    const { w, h } = containerSize
+    if (w <= 0 || h <= 0) return
+
+    // Scale to fit (preserve aspect ratio)
+    const scaleX = w / contentW
+    const scaleY = h / contentH
+    const scale = Math.min(scaleX, scaleY)
+
+    // Standard positive-height viewBox
+    const scaledW = w / scale
+    const scaledH = h / scale
+
+    // Center content (with aspect-ratio correction)
+    const offsetX = (scaledW - contentW) / 2
+    const offsetY = (scaledH - contentH) / 2
+
+    setViewState({
+      viewBox: `${combinedBounds.minX - padding - offsetX} ${combinedBounds.minY - padding - offsetY} ${scaledW} ${scaledH}`,
+      zoom: scale,
+    })
+  }, [combinedBounds, containerSize])
+
+  // Auto-fit when layers change
+  useEffect(() => {
+    if (layers.length > 0 && combinedBounds) {
+      console.log('[GerberViewer] Layers:', layers.length, 'Bounds:', combinedBounds)
+      const t = setTimeout(() => {
+        fitToView()
+        console.log('[GerberViewer] viewBox:', viewStateRef.current.viewBox)
+      }, 150)
+      return () => clearTimeout(t)
+    }
+  }, [layers.length, combinedBounds, fitToView])
+
+  // Parse current viewBox into numeric components
+  const parseViewBox = useCallback((vbStr: string) => {
+    const parts = vbStr.split(' ').map(Number)
+    if (parts.length !== 4 || parts.some(isNaN)) return null
+    return { x: parts[0], y: parts[1], w: parts[2], h: parts[3] }
+  }, [])
+
+  // Convert screen coords to Gerber coords
+  // Screen space: screenX = gerberX, screenY = -gerberY
+  const screenToGerber = useCallback((sx: number, sy: number) => {
+    const vb = parseViewBox(viewStateRef.current.viewBox)
+    const { w, h } = containerSize
+    if (!vb || w <= 0 || h <= 0) return { gx: 0, gy: 0 }
+
+    // Map screen pixel to SVG coordinate
+    let svgX = vb.x + (sx / w) * vb.w
+    const svgY = vb.y + (sy / h) * vb.h
+
+    // If bottom board view is active, mirror the horizontal coordinate
+    const isBottomBoardView = viewMode === 'board' && boardViewSide === 'bottom'
+    if (isBottomBoardView && combinedBounds) {
+      const boundsCenterX = (combinedBounds.minX + combinedBounds.maxX) / 2
+      svgX = 2 * boundsCenterX - svgX
+    }
+
+    // Convert screen space to Gerber space: gerberY = -screenY
+    return { gx: svgX, gy: -svgY }
+  }, [containerSize, parseViewBox, viewMode, boardViewSide, combinedBounds])
+
+  // Mouse wheel zoom
+  const handleWheel = useCallback((e: WheelEvent) => {
+    e.preventDefault()
+    const vb = parseViewBox(viewStateRef.current.viewBox)
+    const { w, h } = containerSize
+    if (!vb || w <= 0 || h <= 0) return
+
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    const mx = e.clientX - rect.left
+    const my = e.clientY - rect.top
+
+    const zoomFactor = e.deltaY < 0 ? 0.85 : 1.18
+
+    const vbMouseX = vb.x + (mx / w) * vb.w
+    const vbMouseY = vb.y + (my / h) * vb.h
+
+    const newW = vb.w * zoomFactor
+    const newH = vb.h * zoomFactor
+
+    const newX = vbMouseX - (mx / w) * newW
+    const newY = vbMouseY - (my / h) * newH
+
+    setViewState(prev => ({
+      ...prev,
+      viewBox: `${newX} ${newY} ${newW} ${newH}`,
+      zoom: prev.zoom / zoomFactor,
+    }))
+  }, [containerSize, parseViewBox])
+
+  useEffect(() => {
+    const el = svgRef.current
+    if (!el) return
+    el.addEventListener('wheel', handleWheel, { passive: false })
+    return () => el.removeEventListener('wheel', handleWheel)
+  }, [handleWheel])
+
+  // Mouse panning
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button === 1 || (e.button === 0 && e.altKey)) {
+      isPanningRef.current = true
+      lastMouseRef.current = { x: e.clientX, y: e.clientY }
+      e.preventDefault()
+    }
+  }, [])
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    const vb = parseViewBox(viewStateRef.current.viewBox)
+    const { w, h } = containerSize
+    if (!vb || w <= 0 || h <= 0) return
+
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    const sx = e.clientX - rect.left
+    const sy = e.clientY - rect.top
+
+    const gp = screenToGerber(sx, sy)
+    setCursorPos(gp)
+
+    if (isPanningRef.current) {
+      const dx = e.clientX - lastMouseRef.current.x
+      const dy = e.clientY - lastMouseRef.current.y
+
+      const dvbX = -(dx / w) * vb.w
+      const dvbY = -(dy / h) * vb.h
+
+      setViewState(prev => ({
+        ...prev,
+        viewBox: `${vb.x + dvbX} ${vb.y + dvbY} ${vb.w} ${vb.h}`,
+      }))
+
+      lastMouseRef.current = { x: e.clientX, y: e.clientY }
+    }
+  }, [containerSize, screenToGerber, parseViewBox])
+
+  const handleMouseUp = useCallback(() => {
+    isPanningRef.current = false
+  }, [])
+
+  const handleDoubleClick = useCallback(() => {
+    fitToView()
+  }, [fitToView])
+
+  const doZoom = useCallback((factor: number) => {
+    const vb = parseViewBox(viewStateRef.current.viewBox)
+    if (!vb) return
+
+    const cx = vb.x + vb.w / 2
+    const cy = vb.y + vb.h / 2
+
+    const newW = vb.w * factor
+    const newH = vb.h * factor
+
+    setViewState(prev => ({
+      ...prev,
+      viewBox: `${cx - newW / 2} ${cy - newH / 2} ${newW} ${newH}`,
+      zoom: prev.zoom * (1 / factor),
+    }))
+  }, [parseViewBox])
+
+  // Build grid SVG content
+  const gridContent = useMemo(() => {
+    if (!showGrid || !combinedBounds) return null
+
+    const vb = parseViewBox(viewState.viewBox)
+    if (!vb) return null
+
+    // Visible range in SVG coords (standard positive-height viewBox)
+    const visMinX = vb.x
+    const visMaxX = vb.x + vb.w
+    const visMinY = vb.y
+    const visMaxY = vb.y + vb.h
+
+    // Adaptive grid spacing
+    const targetPixelSpacing = 50
+    const spacingEstimate = (vb.w / containerSize.w) * targetPixelSpacing
+    const magnitude = Math.pow(10, Math.floor(Math.log10(Math.max(spacingEstimate, 0.001))))
+    let niceSpacing: number
+    if (spacingEstimate / magnitude < 2) niceSpacing = magnitude
+    else if (spacingEstimate / magnitude < 5) niceSpacing = 2 * magnitude
+    else niceSpacing = 5 * magnitude
+
+    if (niceSpacing <= 0) return null
+
+    const startX = Math.floor(visMinX / niceSpacing) * niceSpacing
+    const endX = Math.ceil(visMaxX / niceSpacing) * niceSpacing
+    const startY = Math.floor(visMinY / niceSpacing) * niceSpacing
+    const endY = Math.ceil(visMaxY / niceSpacing) * niceSpacing
+
+    const sw = niceSpacing * 0.002
+    const lines: React.ReactNode[] = []
+
+    for (let x = startX; x <= endX; x += niceSpacing) {
+      lines.push(
+        <line key={`v${x}`} x1={x} y1={visMinY} x2={x} y2={visMaxY}
+          stroke="rgba(255,255,255,0.06)" strokeWidth={sw} />
+      )
+    }
+    for (let y = startY; y <= endY; y += niceSpacing) {
+      lines.push(
+        <line key={`h${y}`} x1={visMinX} y1={y} x2={visMaxX} y2={y}
+          stroke="rgba(255,255,255,0.06)" strokeWidth={sw} />
+      )
+    }
+
+    // Axis lines (screen space: screenX=gerberX, screenY=-gerberY)
+    // Gerber origin (0,0) is at screen position (0, 0)
+    const aw = niceSpacing * 0.005
+    lines.push(
+      <line key="axX" x1={0} y1={visMinY} x2={0} y2={visMaxY}
+        stroke="rgba(255,100,100,0.3)" strokeWidth={aw} />,
+      <line key="axY" x1={visMinX} y1={0} x2={visMaxX} y2={0}
+        stroke="rgba(100,255,100,0.3)" strokeWidth={aw} />
+    )
+
+    return lines
+  }, [showGrid, combinedBounds, viewState, containerSize, parseViewBox])
+
+  // Filter visible layers and sort them by PCB stack-up Z-order so silk
+  // renders on top of mask, mask on top of copper, drill on top, etc.
+  const visibleLayers = useMemo(() => {
+    return layers
+      .filter(l => l.visible && l.svgData && !l.svgData.isEmpty)
+      .slice()
+      .sort((a, b) => getLayerZIndex(a.type) - getLayerZIndex(b.type))
+  }, [layers])
+
+  // PCB-realistic colors for board mode compositing (replaces user-configurable colors)
+  const PCB_COLORS: Record<string, string> = {
+    'copper-top':    '#2e9e4f',  // mid-green copper traces under mask
+    'copper-bottom': '#2e9e4f',
+    'copper-none':   '#2e9e4f',
+    'mask-top':      '#d4af37',  // gold exposed pads
+    'mask-bottom':   '#d4af37',
+    'mask-none':     '#d4af37',
+    'silk-top':      '#e8e8e8',  // white silkscreen
+    'silk-bottom':   '#e8e8e8',
+    'silk-none':     '#e8e8e8',
+    'outline-none':  '#1a1a1a',
+    'outline-top':   '#1a1a1a',
+    'outline-bottom':'#1a1a1a',
+    'paste-top':     '#aaaaaa',
+    'paste-bottom':  '#aaaaaa',
+    'drill-none':    '#1a1a1a',  // dark grey drill hole interior
+    'drill-top':     '#1a1a1a',
+    'drill-bottom':  '#1a1a1a',
+    'other-none':    '#888888',
+  }
+  const getPcbColor = (type: string, side: string) =>
+    PCB_COLORS[`${type}-${side}`] ?? PCB_COLORS[`${type}-none`] ?? '#888888'
+
+  // PCB opacity for board mode
+  const PCB_OPACITY: Record<string, number> = {
+    copper: 1.0,
+    mask:   1.0,  // set to 1.0 so exposed gold pads render opaque on top of green copper traces
+    silk:   1.0,
+    outline: 1.0,
+    paste:  0.7,
+    drill:  1.0,
+    other:  0.5,
+  }
+
+  // Layers for board mode: filter by selected side, apply PCB colors
+  const boardModeLayers = useMemo(() => {
+    if (!isBoardMode) return []
+    return visibleLayers
+      .filter(l => {
+        if (l.type === 'fab' || l.type === 'other') return false
+        // outline and drill show on both sides
+        if (l.type === 'outline' || l.type === 'drill') return true
+        // for other types filter by side — 'none' shows on both
+        return l.side === boardViewSide || l.side === 'none'
+      })
+  }, [isBoardMode, visibleLayers, boardViewSide])
+
+  // Check which types of layers are visible for panel overlay decisions
+  const visibleLayerTypes = useMemo(() => {
+    return new Set(visibleLayers.map(l => l.type))
+  }, [visibleLayers])
+
+  // Panel overlay — only shown on the Panel Config tab
+  const panelOverlayContent = useMemo(() => {
+    if (!panelResult || (activeTab !== 'panel' && activeTab !== 'export')) return null
+
+    const pr = panelResult
+    const pc = panelConfig
+
+    // Determine if tooling holes should be shown (only when copper/mask/silk layers are visible)
+    // If only outline layer is visible, don't show tooling holes
+    const hasCopperOrMaskOrSilkLayers = visibleLayerTypes.has('copper') || visibleLayerTypes.has('mask') || visibleLayerTypes.has('silk')
+    const showToolingHoles = pc.enableToolingHoles && hasCopperOrMaskOrSilkLayers
+
+    const elements: React.ReactNode[] = []
+
+    const isMirrored = viewMode === 'board' && boardViewSide === 'bottom'
+    // PCB positions (Y-inverted to match Gerber SVG coordinate system)
+    for (const pos of pr.pcbPositions) {
+      const screenY = -pos.y
+      const screenYBottom = -(pos.y + pr.pcbHeight)
+      const tx = pos.x + pr.pcbWidth / 2
+      const textY = (screenY + screenYBottom) / 2
+      elements.push(
+        <rect key={`pcb-${pos.row}-${pos.col}`}
+          x={pos.x} y={screenYBottom} width={pr.pcbWidth} height={pr.pcbHeight}
+          fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth={0.1}
+          strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />
+      )
+
+      const labelText = (
+        <text key={`pcb-label-${pos.row}-${pos.col}`}
+          x={tx} y={textY}
+          fill="rgba(255,255,255,0.5)" fontSize="2"
+          textAnchor="middle" dominantBaseline="central"
+          fontFamily="monospace" vectorEffect="non-scaling-stroke">
+          {`${pos.row + 1},${pos.col + 1}`}
+        </text>
+      )
+
+      elements.push(
+        isMirrored ? (
+          <g key={`pcb-label-g-${pos.row}-${pos.col}`} transform={`translate(${tx}, 0) scale(-1, 1) translate(${-tx}, 0)`}>
+            {labelText}
+          </g>
+        ) : labelText
+      )
+    }
+
+    // Panel outline (Y-inverted)
+    elements.push(
+      <rect key="panel-outline"
+        x={0} y={-pr.panelHeight} width={pr.panelWidth} height={pr.panelHeight}
+        fill="none" stroke="rgba(255,255,0,0.5)" strokeWidth={0.15}
+        vectorEffect="non-scaling-stroke" />
+    )
+
+    // Tooling holes (Y-inverted)
+    if (showToolingHoles) {
+      for (const hole of pr.toolingHoles) {
+        const color = hole.type === 'tooling' ? 'rgba(0,200,255,0.7)' : 'rgba(200,200,0,0.5)'
+        const fill = hole.type === 'tooling' ? 'rgba(0,200,255,0.2)' : 'rgba(200,200,0,0.1)'
+        elements.push(
+          <circle key={`hole-${hole.x}-${hole.y}`}
+            cx={hole.x} cy={-hole.y} r={hole.diameter / 2}
+            fill={fill} stroke={color} strokeWidth={0.08}
+            vectorEffect="non-scaling-stroke" />
+        )
+      }
+
+      // Donut / annular rings around reference holes
+      const refHoles = pr.toolingHoles.filter(h => h.type === 'reference')
+      if (refHoles.length > 0) {
+        const od = pc.donutOuterDiameter || 2.25
+        const id = pc.donutInnerDiameter || 1.25
+        for (const ref of refHoles) {
+          elements.push(
+            <circle key={`donut-outer-${ref.x}-${ref.y}`}
+              cx={ref.x} cy={-ref.y} r={od / 2}
+              fill="none" stroke="rgba(255,165,0,0.6)" strokeWidth={0.08}
+              vectorEffect="non-scaling-stroke" />,
+            <circle key={`donut-inner-${ref.x}-${ref.y}`}
+              cx={ref.x} cy={-ref.y} r={id / 2}
+              fill="none" stroke="rgba(255,165,0,0.6)" strokeWidth={0.08}
+              vectorEffect="non-scaling-stroke" />
+          )
+        }
+      }
+    }
+
+    // Determine which side's fiducials should be rendered in the overlay
+    let showTopFids = false
+    let showBottomFids = false
+
+    if (pc.enableFiducials) {
+      if (isBoardMode) {
+        if (boardViewSide === 'top' && pc.fiducialsTop) showTopFids = true
+        if (boardViewSide === 'bottom' && pc.fiducialsBottom) showBottomFids = true
+      } else {
+        // Layers mode: check the side of the visible copper or mask layers
+        for (const layer of visibleLayers) {
+          if (layer.type === 'copper' || layer.type === 'mask') {
+            if (layer.side === 'top' && pc.fiducialsTop) showTopFids = true
+            if (layer.side === 'bottom' && pc.fiducialsBottom) showBottomFids = true
+          }
+        }
+      }
+    }
+
+    // Fiducials (Y-inverted)
+    if (showTopFids || showBottomFids) {
+      for (const fid of pr.fiducials) {
+        elements.push(
+          <circle key={`fid-clr-${fid.x}-${fid.y}`}
+            cx={fid.x} cy={-fid.y} r={fid.clearance / 2}
+            fill="none" stroke="rgba(0,255,100,0.4)" strokeWidth={0.08}
+            vectorEffect="non-scaling-stroke" />,
+          <circle key={`fid-dot-${fid.x}-${fid.y}`}
+            cx={fid.x} cy={-fid.y} r={fid.diameter / 2}
+            fill="rgba(0,255,100,0.8)" stroke="none" />
+        )
+      }
+    }
+
+    // Info text — render on side ribs (Y-inverted, rotation negated)
+    for (const [idx, info] of pr.infoTexts.entries()) {
+      const screenInfoY = -info.y
+      const rot = -(info.rotation || 0) // Negate rotation for Y-inverted space
+      const baseTransform = rot !== 0 ? `rotate(${rot}, ${info.x}, ${screenInfoY})` : undefined
+
+      // Calculate exact text width using the same region-font metrics to align SVG preview with Gerber
+      const CHAR_WIDTH_FONT = 0.6
+      const ADVANCE_WIDTH_FONT = 0.76
+      const textWidth = info.text 
+        ? ((info.text.length - 1) * ADVANCE_WIDTH_FONT + CHAR_WIDTH_FONT) * info.fontSize 
+        : 0
+
+      const textContent = (
+        <text
+          x={info.x} y={screenInfoY}
+          textLength={textWidth > 0 ? textWidth : undefined}
+          lengthAdjust="spacingAndGlyphs"
+          fill={info.mirrored
+            ? 'rgba(0,200,255,0.5)'      // dimmer cyan for mirrored (bottom) layer text
+            : info.location === 'left-rib' || info.location === 'right-rib'
+              ? 'rgba(0,200,255,0.8)'     // cyan for vertical rib text
+              : 'rgba(200,200,200,0.7)'}  // gray for horizontal rib text
+          fontSize={info.fontSize}
+          textAnchor={info.align === 'center' ? 'middle' : info.align === 'right' ? 'end' : 'start'}
+          fontFamily="monospace"
+          dominantBaseline="central"
+          transform={baseTransform}
+          vectorEffect="non-scaling-stroke">
+          {info.text}
+        </text>
+      )
+
+      // For mirrored text (bottom layers), wrap in a group that flips horizontally
+      // around the text's x position so it reads correctly from the PCB bottom side
+      if (info.mirrored) {
+        elements.push(
+          <g key={`info-${idx}-${info.x}-${info.y}`}
+            transform={`translate(${info.x}, 0) scale(-1, 1) translate(${-info.x}, 0)`}>
+            {textContent}
+          </g>
+        )
+      } else {
+        elements.push(
+          <g key={`info-${idx}-${info.x}-${info.y}`}>
+            {textContent}
+          </g>
+        )
+      }
+    }
+
+    // Panel dimensions (Y-inverted)
+    const dimWText = (
+      <text key="dim-w"
+        x={pr.panelWidth / 2} y={2}
+        fill="rgba(255,200,0,0.9)" fontSize="1.8"
+        textAnchor="middle" fontFamily="monospace"
+        vectorEffect="non-scaling-stroke">
+        {`${pr.panelWidth.toFixed(1)} mm`}
+      </text>
+    )
+
+    const dimHText = (
+      <text key="dim-h"
+        x={-2} y={-pr.panelHeight / 2}
+        fill="rgba(255,200,0,0.9)" fontSize="1.8"
+        textAnchor="middle" fontFamily="monospace"
+        transform={`rotate(-90, ${-2}, ${-pr.panelHeight / 2})`}
+        vectorEffect="non-scaling-stroke">
+        {`${pr.panelHeight.toFixed(1)} mm`}
+      </text>
+    )
+
+    elements.push(
+      isMirrored ? (
+        <g key="dim-w-g" transform={`translate(${pr.panelWidth / 2}, 0) scale(-1, 1) translate(${-pr.panelWidth / 2}, 0)`}>
+          {dimWText}
+        </g>
+      ) : dimWText,
+      isMirrored ? (
+        <g key="dim-h-g" transform={`translate(${-2}, 0) scale(-1, 1) translate(${2}, 0)`}>
+          {dimHText}
+        </g>
+      ) : dimHText
+    )
+
+    return elements
+  }, [panelResult, panelConfig, activeTab, visibleLayerTypes])
+
+  // Crosshair
+  const crosshairContent = useMemo(() => {
+    if (!showCrosshair || !cursorPos) return null
+    const vb = parseViewBox(viewState.viewBox)
+    if (!vb) return null
+
+    const visMinX = vb.x
+    const visMaxX = vb.x + vb.w
+    const visMinY = vb.y
+    const visMaxY = vb.y + vb.h
+
+    return (
+      <>
+        <line x1={cursorPos.gx} y1={visMinY} x2={cursorPos.gx} y2={visMaxY}
+          stroke="rgba(255,255,255,0.3)" strokeWidth={0.03} strokeDasharray="0.5 0.5" />
+        <line x1={visMinX} y1={cursorPos.gy} x2={visMaxX} y2={cursorPos.gy}
+          stroke="rgba(255,255,255,0.3)" strokeWidth={0.03} strokeDasharray="0.5 0.5" />
+      </>
+    )
+  }, [showCrosshair, cursorPos, viewState, parseViewBox])
+
+  const formatCoord = (val: number) => {
+    if (isNaN(val)) return '—'
+    return targetUnit === 'mm' ? val.toFixed(3) : (val / 25.4).toFixed(4)
+  }
+
+  return (
+    <div ref={containerRef} className="relative w-full h-full min-h-[400px] bg-[#020d1f] rounded-lg overflow-hidden border border-[#1a3a5c]">
+      <svg
+        ref={svgRef}
+        className="absolute inset-0 w-full cursor-crosshair"
+        style={{ height: `calc(100% - 28px)` }}
+        viewBox={viewState.viewBox}
+        preserveAspectRatio="xMidYMid meet"
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        onDoubleClick={handleDoubleClick}
+        onContextMenu={(e) => e.preventDefault()}
+      >
+        {/* Grid layer */}
+        {gridContent && <g data-layer="grid">{gridContent}</g>}
+
+        {/* Gerber content — board view (composited stack-up) when available,
+            per-layer overlay otherwise. */}
+        <g 
+          data-layer="gerber-content"
+          transform={viewMode === 'board' && boardViewSide === 'bottom' && combinedBounds
+            ? `translate(${boundsCenterX}, 0) scale(-1, 1) translate(${-boundsCenterX}, 0)`
+            : undefined}
+        >
+          {isBoardMode ? (() => {
+            // Board view: per-layer compositing with PCB-realistic colors.
+            // Uses the existing per-layer SVG data (already working) instead of
+            // tracespace/core renderBoard which had compositing issues.
+            const bLayers = boardModeLayers
+            const bounds = nativeSvgBounds
+
+            if (bLayers.length === 0) {
+              return (
+                <text x="0" y="0" fill="#888" fontSize="3" textAnchor="middle"
+                  transform={viewMode === 'board' && boardViewSide === 'bottom' ? 'scale(-1, 1)' : undefined}>
+                  No layers for {boardViewSide} side
+                </text>
+              )
+            }
+
+            // Dark FR4 substrate background
+            const bgRect = bounds ? (
+              <rect
+                key="pcb-bg"
+                x={bounds.minX - 0.2} y={bounds.minY - 0.2}
+                width={bounds.maxX - bounds.minX + 0.4}
+                height={bounds.maxY - bounds.minY + 0.4}
+                fill="#113f1d"
+              />
+            ) : null
+
+            if ((activeTab === 'panel' || activeTab === 'export') && panelResult && nativeSvgBounds) {
+              const pr = panelResult
+              const refBounds = nativeSvgBounds
+              return (
+                <>
+                  <defs>
+                    {bLayers.map(layer => (
+                      layer.svgData ? (
+                        <RawSvgSymbol
+                          key={`def-${layer.id}`}
+                          id={`layer-def-${layer.id}`}
+                          html={layer.svgData.svgFragment}
+                        />
+                      ) : null
+                    ))}
+                    {pr.pcbPositions.map((pos, idx) => (
+                      <clipPath key={`pcb-clip-${idx}`} id={`pcb-clip-${idx}`}>
+                        <rect
+                          x={pos.x}
+                          y={-(pos.y + pr.pcbHeight)}
+                          width={pr.pcbWidth}
+                          height={pr.pcbHeight}
+                        />
+                      </clipPath>
+                    ))}
+                  </defs>
+                  {pr.pcbPositions.map((pos, posIdx) => {
+                    const tx = pos.x - refBounds.minX
+                    const ty = -pos.y - refBounds.maxY
+                    return (
+                      <g key={`panel-pos-${posIdx}`} clipPath={`url(#pcb-clip-${posIdx})`}>
+                        <g transform={`translate(${tx.toFixed(6)}, ${ty.toFixed(6)})`}>
+                          {bgRect}
+                          {bLayers.map(layer => (
+                            <use
+                              key={layer.id}
+                              href={`#layer-def-${layer.id}`}
+                              data-layer={layer.id}
+                              style={{ color: getPcbColor(layer.type, layer.side), opacity: PCB_OPACITY[layer.type] ?? 1 }}
+                            />
+                          ))}
+                        </g>
+                      </g>
+                    )
+                  })}
+                </>
+              )
+            }
+
+            // Single-PCB board view
+            return (
+              <>
+                {bgRect}
+                {bLayers.map(layer => (
+                  <RawSvgGroup
+                    key={layer.id}
+                    data-layer={layer.id}
+                    style={{ color: getPcbColor(layer.type, layer.side), opacity: PCB_OPACITY[layer.type] ?? 1 }}
+                    html={layer.svgData!.svgFragment}
+                  />
+                ))}
+              </>
+            )
+          })() : (activeTab === 'panel' || activeTab === 'export') && panelResult && nativeSvgBounds ? (() => {
+            // Per-layer overlay — fallback when board view is unavailable.
+            const outlineLayer = visibleLayers.find(l => l.type === 'outline' && l.svgData?.boundsObj)
+            const refBounds = (outlineLayer?.svgData?.boundsObj) || nativeSvgBounds
+            const pr = panelResult
+
+            return (
+              <>
+                <defs>
+                  {visibleLayers.map(layer => (
+                    layer.svgData ? (
+                      <RawSvgSymbol
+                        key={`def-${layer.id}`}
+                        id={`layer-def-${layer.id}`}
+                        html={layer.svgData.svgFragment}
+                      />
+                    ) : null
+                  ))}
+                  {pr.pcbPositions.map((pos, idx) => (
+                    <clipPath key={`pcb-clip-${idx}`} id={`pcb-clip-${idx}`}>
+                      <rect
+                        x={pos.x}
+                        y={-(pos.y + pr.pcbHeight)}
+                        width={pr.pcbWidth}
+                        height={pr.pcbHeight}
+                      />
+                    </clipPath>
+                  ))}
+                </defs>
+
+                {pr.pcbPositions.map((pos, posIdx) => {
+                  const tx = pos.x - refBounds.minX
+                  const ty = -pos.y - refBounds.maxY
+                  return (
+                    <g key={`panel-pos-${posIdx}`} clipPath={`url(#pcb-clip-${posIdx})`}>
+                      <g transform={`translate(${tx.toFixed(6)}, ${ty.toFixed(6)})`}>
+                        {visibleLayers.map(layer => {
+                          if (!layer.svgData) return null
+                          return (
+                            <use
+                              key={layer.id}
+                              href={`#layer-def-${layer.id}`}
+                              data-layer={layer.id}
+                              style={{ color: layer.color, opacity: layer.opacity }}
+                            />
+                          )
+                        })}
+                      </g>
+                    </g>
+                  )
+                })}
+              </>
+            )
+          })() : (
+            visibleLayers.map(layer => {
+              if (!layer.svgData) return null
+              return (
+                <RawSvgGroup
+                  key={layer.id}
+                  data-layer={layer.id}
+                  style={{ color: layer.color, opacity: layer.opacity }}
+                  html={layer.svgData.svgFragment}
+                />
+              )
+            })
+          )}
+        </g>
+
+        {/* Panel overlay — only on panel tab */}
+        {panelOverlayContent && (
+          <g 
+            data-layer="panel-overlay"
+            transform={viewMode === 'board' && boardViewSide === 'bottom' && combinedBounds
+              ? `translate(${boundsCenterX}, 0) scale(-1, 1) translate(${-boundsCenterX}, 0)`
+              : undefined}
+          >
+            {panelOverlayContent}
+          </g>
+        )}
+
+        {/* Crosshair */}
+        {crosshairContent && <g data-layer="crosshair">{crosshairContent}</g>}
+      </svg>
+
+      {/* Status bar */}
+      <div className="absolute bottom-0 left-0 right-0 h-7 bg-[#020d1f]/90 text-xs text-[#94b8d4] flex items-center px-2 gap-4 font-mono rounded-b-lg border-t border-[#1a3a5c]">
+        <span className="text-[#4a6f94]">
+          {layers.length === 0 ? 'Import Gerber files to start' : `${visibleLayers.length}/${layers.length} layers`}
+        </span>
+        {cursorPos && (
+          <span>
+            X: {formatCoord(cursorPos.gx)} Y: {formatCoord(cursorPos.gy)} {targetUnit}
+          </span>
+        )}
+        <span>Zoom: {viewState.zoom.toFixed(1)}x</span>
+        {(activeTab === 'panel' || activeTab === 'export') && panelResult && (
+          <span className="text-[#0ea5e9]">
+            Panel: {panelResult.panelWidth.toFixed(1)}×{panelResult.panelHeight.toFixed(1)} mm | {panelResult.totalPCBs} PCBs
+          </span>
+        )}
+        <span className="ml-auto text-[#2a4a6a]">
+          Scroll=Zoom Alt+Drag=Pan DblClick=Fit
+        </span>
+      </div>
+
+      {/* View-mode + side toggle (only when layers exist) */}
+      {layers.length > 0 && (() => {
+        const topHasCopperOrSilk = layers.some(l => (l.type === 'copper' || l.type === 'silk') && l.side === 'top')
+        const botHasCopperOrSilk = layers.some(l => (l.type === 'copper' || l.type === 'silk') && l.side === 'bottom')
+        const currentSideEmpty = viewMode === 'board' && (
+          (boardViewSide === 'top' && !topHasCopperOrSilk) ||
+          (boardViewSide === 'bottom' && !botHasCopperOrSilk)
+        )
+        return (
+          <>
+            <div className="absolute top-2 left-2 flex gap-1 bg-[#020d1f]/85 rounded border border-[#1a3a5c] p-0.5 text-xs font-medium">
+              <button
+                onClick={() => setViewMode('board')}
+                className={`px-2 py-1 rounded transition-colors ${viewMode === 'board' ? 'bg-[#0ea5e9] text-white' : 'text-[#94b8d4] hover:bg-[#0f2848]/50'}`}
+                title="Composited PCB stack-up view"
+              >Board</button>
+              <button
+                onClick={() => setViewMode('layers')}
+                className={`px-2 py-1 rounded transition-colors ${viewMode === 'layers' ? 'bg-[#0ea5e9] text-white' : 'text-[#94b8d4] hover:bg-[#0f2848]/50'}`}
+                title="Individual layers overlay"
+              >Layers</button>
+              {viewMode === 'board' && (
+                <>
+                  <span className="w-px bg-[#1a3a5c] mx-0.5" />
+                  <button
+                    onClick={() => setBoardViewSide('top')}
+                    className={`px-2 py-1 rounded transition-colors ${boardViewSide === 'top' ? 'bg-[#38bdf8] text-white' : 'text-[#94b8d4] hover:bg-[#0f2848]/50'}`}
+                    title={topHasCopperOrSilk ? 'Top side' : 'Top side (no copper/silk layers)'}
+                  >Top{!topHasCopperOrSilk && <span className="ml-0.5 opacity-50">∅</span>}</button>
+                  <button
+                    onClick={() => setBoardViewSide('bottom')}
+                    className={`px-2 py-1 rounded transition-colors ${boardViewSide === 'bottom' ? 'bg-[#38bdf8] text-white' : 'text-[#94b8d4] hover:bg-[#0f2848]/50'}`}
+                    title={botHasCopperOrSilk ? 'Bottom side' : 'Bottom side (no copper/silk layers)'}
+                  >Bottom{!botHasCopperOrSilk && <span className="ml-0.5 opacity-50">∅</span>}</button>
+                </>
+              )}
+            </div>
+            {/* Warn when viewing a side with no copper data */}
+            {isBoardMode && currentSideEmpty && (
+              <div className="absolute top-10 left-1/2 -translate-x-1/2 bg-[#1a1a00]/90 border border-yellow-500/50 text-yellow-300 text-xs px-3 py-1.5 rounded-lg pointer-events-none">
+                No {boardViewSide} copper/silk layers imported — switch to {boardViewSide === 'top' ? 'Bottom' : 'Top'} view
+              </div>
+            )}
+          </>
+        )
+      })()}
+
+
+      {/* Zoom controls */}
+      <div className="absolute top-2 right-2 flex flex-col gap-1">
+        <button
+          onClick={() => doZoom(0.75)}
+          className="w-7 h-7 bg-[#0a1e38]/75 hover:bg-[#0f2848] text-[#f0f8ff] rounded flex items-center justify-center text-sm border border-[#1a3a5c] transition-colors"
+        >+</button>
+        <button
+          onClick={() => doZoom(1.33)}
+          className="w-7 h-7 bg-[#0a1e38]/75 hover:bg-[#0f2848] text-[#f0f8ff] rounded flex items-center justify-center text-sm border border-[#1a3a5c] transition-colors"
+        >−</button>
+        <button
+          onClick={fitToView}
+          className="w-7 h-7 bg-[#0a1e38]/75 hover:bg-[#0f2848] text-[#f0f8ff] rounded flex items-center justify-center text-sm border border-[#1a3a5c] transition-colors"
+          title="Fit to view"
+        >⊞</button>
+      </div>
+    </div>
+  )
+}
