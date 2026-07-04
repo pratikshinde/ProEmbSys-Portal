@@ -7,9 +7,9 @@ import JSZip from 'jszip'
 import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon } from './gerber-parser'
 import { gerberToSvg, gerberRenderBoardView, BoardView, GerberSvgResult } from './gerber-svg'
 import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber } from './panelization-engine'
+import { LayerType, LayerSide, detectLayerType, detectLayerSide } from './gerber-analysis'
 
-export type LayerType = 'copper' | 'mask' | 'silk' | 'outline' | 'paste' | 'drill' | 'fab' | 'other'
-export type LayerSide = 'top' | 'bottom' | 'none'
+export type { LayerType, LayerSide }
 
 export interface LayerEntry {
   id: string
@@ -88,87 +88,6 @@ interface AppState {
   toggleGrid: () => void
   showCrosshair: boolean
   toggleCrosshair: () => void
-}
-
-function detectLayerType(fileName: string): LayerType {
-  const upper = fileName.toUpperCase()
-  const baseName = fileName.split('.').pop()?.toUpperCase() || ''
-  const nameNoExt = fileName.replace(/\.[^.]+$/, '').toUpperCase()
-
-  // Drill detection (before other checks — .drl, .txt drill, etc.)
-  if (upper.includes('.DRL') || upper.includes('DRILL') || upper.includes('HOLE') || upper.includes('EXCELLON') || upper.includes('-XLN') || upper.includes('.XLN') || upper.includes('.TAP') || upper.includes('.CNC') || upper.includes('.NC') || upper.includes('.EXC') || upper.includes('.ROU') || upper.endsWith('.DRILL')) return 'drill'
-
-  // PADS-style short names (extensionless or short names like "bl", "tl", "to", "bs", "ts", "ko")
-  if (baseName === 'TL' || baseName === 'BL' || nameNoExt === 'TL' || nameNoExt === 'BL') return 'copper'
-  if (baseName === 'TS' || baseName === 'BS' || nameNoExt === 'TS' || nameNoExt === 'BS') return 'mask'
-  if (baseName === 'TO' || baseName === 'BO' || nameNoExt === 'TO' || nameNoExt === 'BO') return 'silk'
-  if (baseName === 'KO' || baseName === 'OUTLINE' || nameNoExt === 'KO') return 'outline'
-  if (baseName === 'DRL' || baseName === 'DRILL') return 'drill'
-
-  // Common Gerber extensions (.cmp = component/top copper, .sol = solder/bottom copper)
-  if (upper.endsWith('.CMP') || upper.endsWith('.SCMP')) return 'copper'
-  if (upper.endsWith('.SOL') || upper.endsWith('.SSOL')) return 'copper'
-  if (upper.endsWith('.BSLK') || upper.endsWith('.GTS') || upper.endsWith('.STS')) return 'mask'
-  if (upper.endsWith('.TSLK') || upper.endsWith('.GBS') || upper.endsWith('.SBS')) return 'mask'
-  if (upper.endsWith('.TSK') || upper.endsWith('.BSK')) return 'silk'
-
-  // PADS-style naming (.pho files)
-  if (baseName === 'COMPSIDE' || baseName === 'SOLDSIDE') return 'copper'
-  if (baseName === 'SILKTOP' || baseName === 'SILKBOT') return 'silk'
-  if (baseName === 'MASKTOP' || baseName === 'MASKBOT') return 'mask'
-  if (baseName === 'PASTETOP' || baseName === 'PASTEBOT') return 'paste'
-  if (baseName === 'DRILLDRAWING') return 'fab'
-
-  // Standard KiCad/Altium naming
-  if (upper.includes('GTL') || (upper.includes('TOP') && upper.includes('COPPER')) || upper.endsWith('.GTL')) return 'copper'
-  if (upper.includes('GBL') || (upper.includes('BOT') && upper.includes('COPPER')) || upper.endsWith('.GBL')) return 'copper'
-  if (upper.includes('GTS') || (upper.includes('TOP') && upper.includes('MASK')) || upper.endsWith('.GTS') || upper.includes('SMB') || upper.includes('SMT')) return 'mask'
-  if (upper.includes('GBS') || (upper.includes('BOT') && upper.includes('MASK')) || upper.endsWith('.GBS')) return 'mask'
-  if (upper.includes('GTO') || (upper.includes('TOP') && upper.includes('SILK')) || upper.endsWith('.GTO') || upper.includes('SST') || upper.includes('SSB')) return 'silk'
-  if (upper.includes('GBO') || (upper.includes('BOT') && upper.includes('SILK')) || upper.endsWith('.GBO')) return 'silk'
-  if (upper.includes('GKO') || upper.includes('OUTLINE') || upper.includes('BOARD') || upper.endsWith('.GKO') || upper.includes('EDGE') || upper.includes('PROFILE') || upper.includes('CONTOUR') || upper.includes('DIMENSION') || upper === 'MILL' || upper === 'MILLING' || upper === 'ROUTE' || upper.endsWith('.GM1') || upper.endsWith('.GML') || baseName === 'GM1' || baseName === 'GML') return 'outline'
-  if (upper.includes('GTP') || upper.includes('GBP') || upper.includes('PASTE')) return 'paste'
-
-  // Catch-all checks for bare BOT/BOTTOM/TOP copper layers (after mask/silk/etc have been checked)
-  if (upper.includes('BOT') || upper.includes('BOTTOM') || baseName === 'BOT' || baseName === 'BOTTOM' || nameNoExt === 'BOT') return 'copper'
-  if (upper.includes('TOP') || baseName === 'TOP' || nameNoExt === 'TOP') return 'copper'
-
-  // Fab/mechanical layers
-  if (upper.includes('GM2') || upper.includes('GM3') || upper.includes('FAB') || upper.includes('MECH') || upper.includes('DRAWING') || upper.includes('DIMENSION') || upper.includes('PLI') || upper.includes('PT')) return 'fab'
-  return 'other'
-}
-
-function detectLayerSide(fileName: string, type: LayerType): LayerSide {
-  if (type === 'outline' || type === 'drill' || type === 'fab' || type === 'other') return 'none'
-  const upper = fileName.toUpperCase()
-  const baseName = fileName.split('.').pop()?.toUpperCase() || ''
-  const nameNoExt = fileName.replace(/\.[^.]+$/, '').toUpperCase()
-
-  // PADS-style short names (bl=bottom, tl=top, bs=bottom, ts=top, to=top, bo=bottom)
-  if (baseName === 'BL' || nameNoExt === 'BL') return 'bottom'
-  if (baseName === 'TL' || nameNoExt === 'TL') return 'top'
-  if (baseName === 'BS' || nameNoExt === 'BS') return 'bottom'
-  if (baseName === 'TS' || nameNoExt === 'TS') return 'top'
-  if (baseName === 'TO' || nameNoExt === 'TO') return 'top'
-  if (baseName === 'BO' || nameNoExt === 'BO') return 'bottom'
-
-  // .cmp = component/top, .sol = solder/bottom, .tslk = top mask, .bslk = bottom mask
-  if (upper.endsWith('.CMP') || upper.endsWith('.SCMP') || upper.endsWith('.TSLK') || upper.endsWith('.TSK')) return 'top'
-  if (upper.endsWith('.SOL') || upper.endsWith('.SSOL') || upper.endsWith('.BSLK') || upper.endsWith('.BSK')) return 'bottom'
-
-  // PADS-style naming
-  if (baseName.includes('TOP')) return 'top'
-  if (baseName.includes('BOT')) return 'bottom'
-  // Bottom indicators (standard naming)
-  if (upper.includes('GBL') || upper.includes('GBS') || upper.includes('GBO') || upper.includes('GBP') ||
-      upper.includes('BOT') || upper.includes('BOTTOM') || upper.includes('B.') || upper.endsWith('BL') ||
-      upper.endsWith('BS') || upper.endsWith('BO') || upper.endsWith('BP') ||
-      upper.includes('SSB') || upper.includes('SMB')) return 'bottom'
-  // Top indicators
-  if (upper.includes('GTL') || upper.includes('GTS') || upper.includes('GTO') || upper.includes('GTP') ||
-      upper.includes('TOP') || upper.endsWith('TL') || upper.endsWith('TS') || upper.endsWith('TO') ||
-      upper.endsWith('TP') || upper.includes('SST') || upper.includes('SMT')) return 'top'
-  return 'none'
 }
 
 /** Map layer type + side to a default color (PCB-realistic palette, matches
@@ -340,7 +259,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Layer type detection: prefer TF.FileFunction (from Gerber content),
       // fall back to filename-based heuristics. Force 'drill' if content is Excellon.
       let type: LayerType, side: LayerSide
-      if (isExcellonDrillFile(finalContent)) {
+      if (isExcellonDrillFile(content)) {
         type = 'drill'
         side = 'none'
       } else if (svgData?.layerAnalysis?.type) {

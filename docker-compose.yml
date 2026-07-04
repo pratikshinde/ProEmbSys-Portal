@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: propcb
+      POSTGRES_PASSWORD: propcb_dev_password
+      POSTGRES_DB: propcb
+    ports:
+      - "5432:5432"
+    volumes:
+      - propcb_pgdata:/var/lib/postgresql/data
+volumes:
+  propcb_pgdata:

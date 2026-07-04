@@ -8,6 +8,13 @@ import ExportPanel from './export-panel';
 import { Button } from './ui/button';
 import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useAppStore } from '../lib/store';
+import JSZip from 'jszip';
+import { analyzeGerberSet, GerberQuoteAnalysis } from '../lib/gerber-analysis';
+import type { PcbQuoteBreakdownV2 } from '../lib/pricing-engine';
+import { toast } from '@/hooks/use-toast';
+import { useSession, signOut } from 'next-auth/react';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 
 
 // ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
@@ -32,16 +39,16 @@ const C = {
   text3:    "#2a4a6a",   // very muted
 };
 
-const NAV_ITEMS = [
+const NAV_ITEMS: { key: string; label: string; href?: string }[] = [
   { key:"home",  label:"Home" },
   { key:"order", label:"PCB Order" },
   { key:"panel", label:"Panelization" },
   { key:"assembly", label:"Assembly" },
   { key:"shop",  label:"Shop" },
   { key:"blog",  label:"Blog" },
+  { key:"capabilities", label:"Fab Capabilities", href:"/fab-capabilities" },
 ];
 
-const PCB_LAYER_PRICE = { "1":180, "2":320, "4":680, "6":1250, "8":2100 };
 const PCB_SPECS = {
   layers:  ["1","2","4","6","8"],
   qty:     ["5","10","25","50","100","250","500"],
@@ -73,8 +80,8 @@ const BLOG_POSTS = [
 
 // ─── SHARED UI COMPONENTS ─────────────────────────────────────────────────────
 
-function Btn({ children, variant="primary", onClick, style={}, full=false }: { children: React.ReactNode; variant?: "primary" | "outline" | "ghost" | "dark" | "gold"; onClick?: any; style?: React.CSSProperties; full?: boolean }) {
-  const base = { border:"none", borderRadius:8, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight:700, fontSize:14, transition:"all 0.18s", display:"inline-flex", alignItems:"center", justifyContent:"center", gap:6, width: full?"100%":"auto" };
+function Btn({ children, variant="primary", onClick, style={}, full=false, disabled=false }: { children: React.ReactNode; variant?: "primary" | "outline" | "ghost" | "dark" | "gold"; onClick?: any; style?: React.CSSProperties; full?: boolean; disabled?: boolean }) {
+  const base = { border:"none", borderRadius:8, cursor: disabled?"not-allowed":"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight:700, fontSize:14, transition:"all 0.18s", display:"inline-flex", alignItems:"center", justifyContent:"center", gap:6, width: full?"100%":"auto", opacity: disabled?0.55:1 };
   const variants = {
     primary:  { background: C.accent, color:"#fff", padding:"11px 24px", boxShadow:`0 0 20px ${C.accentGlow}` },
     outline:  { background:"transparent", color:C.accent, border:`1.5px solid ${C.border2}`, padding:"10px 22px" },
@@ -82,7 +89,7 @@ function Btn({ children, variant="primary", onClick, style={}, full=false }: { c
     dark:     { background:C.bg3, color:C.accent2, border:`1px solid ${C.border2}`, padding:"11px 24px" },
     gold:     { background:C.gold, color:"#020d1f", padding:"12px 28px", fontWeight:800 },
   };
-  return <button onClick={onClick} style={{...base,...variants[variant],...style}}>{children}</button>;
+  return <button onClick={onClick} disabled={disabled} style={{...base,...variants[variant],...style}}>{children}</button>;
 }
 
 function Tag({ children, color="blue" }) {
@@ -131,6 +138,8 @@ function CircuitBg({ opacity=0.04 }) {
 // ─── NAVBAR ──────────────────────────────────────────────────────────────────
 
 function Navbar({ page, setPage, cartCount }) {
+  const { data: session, status } = useSession();
+  const router = useRouter();
   return (
     <nav style={{ background:`${C.bg0}ee`, backdropFilter:"blur(16px)", borderBottom:`1px solid ${C.border}`, position:"sticky", top:0, zIndex:200 }}>
       <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 28px", height:62, display:"flex", alignItems:"center", gap:0 }}>
@@ -154,7 +163,13 @@ function Navbar({ page, setPage, cartCount }) {
 
         {/* Nav links */}
         <div style={{ display:"flex", gap:2, flex:1 }}>
-          {NAV_ITEMS.map(({key,label}) => (
+          {NAV_ITEMS.map(({key,label,href}) => href ? (
+            <Link key={key} href={href} style={{ background:"transparent", padding:"7px 14px", borderRadius:8, fontSize:13.5, textDecoration:"none", fontFamily:"'DM Sans',sans-serif", color:C.text1, fontWeight:400, transition:"all 0.15s" }}
+              onMouseEnter={e=>{ e.currentTarget.style.background=C.bg3; e.currentTarget.style.color=C.text0; }}
+              onMouseLeave={e=>{ e.currentTarget.style.background="transparent"; e.currentTarget.style.color=C.text1; }}>
+              {label}
+            </Link>
+          ) : (
             <button key={key} onClick={()=>setPage(key)} style={{ background: page===key ? C.accentDim : "transparent", border:"none", padding:"7px 14px", borderRadius:8, fontSize:13.5, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", color: page===key ? C.accent2 : C.text1, fontWeight: page===key ? 700 : 400, transition:"all 0.15s" }}
               onMouseEnter={e=>{ if(page!==key){ e.currentTarget.style.background=C.bg3; e.currentTarget.style.color=C.text0; }}}
               onMouseLeave={e=>{ if(page!==key){ e.currentTarget.style.background="transparent"; e.currentTarget.style.color=C.text1; }}}>
@@ -170,7 +185,16 @@ function Navbar({ page, setPage, cartCount }) {
               🛒 {cartCount}
             </div>
           )}
-          <Btn variant="ghost" style={{ fontSize:13, padding:"7px 16px" }}>Sign in</Btn>
+          {status === "authenticated" ? (
+            <>
+              <Link href="/orders" style={{ fontSize:13, color:C.text1, fontFamily:"'DM Sans',sans-serif", textDecoration:"none" }}>
+                {session.user?.name || session.user?.email}
+              </Link>
+              <Btn variant="ghost" onClick={()=>signOut({ callbackUrl: "/" })} style={{ fontSize:13, padding:"7px 16px" }}>Sign out</Btn>
+            </>
+          ) : (
+            <Btn variant="ghost" onClick={()=>router.push("/login")} style={{ fontSize:13, padding:"7px 16px" }}>Sign in</Btn>
+          )}
           <Btn variant="primary" onClick={()=>setPage("order")} style={{ fontSize:13, padding:"8px 18px" }}>Get Quote →</Btn>
         </div>
       </div>
@@ -969,11 +993,180 @@ function PCBOrderPage() {
   const [specs, setSpecs] = useState({ layers:"2", qty:"10", finish:"HASL (Lead-free)", color:"Green", copper:"1 oz", thickness:"1.6mm" });
   const [step, setStep] = useState(1);
   const [express, setExpress] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analysis, setAnalysis] = useState<GerberQuoteAnalysis | null>(null);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [width, setWidth] = useState("");
+  const [height, setHeight] = useState("");
+  const [dimsAutoFilled, setDimsAutoFilled] = useState(false);
+  const [orderRef, setOrderRef] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const base = PCB_LAYER_PRICE[specs.layers] || 320;
-  const qm = {"5":1,"10":1.6,"25":3.2,"50":5.5,"100":9,"250":18,"500":30}[specs.qty]||1;
-  const total = Math.round(base * qm * (express ? 1.2 : 1));
+  const widthMm = parseFloat(width) || 0;
+  const heightMm = parseFloat(height) || 0;
+  const hasValidDims = widthMm > 0 && heightMm > 0;
+
+  const [quote, setQuote] = useState<PcbQuoteBreakdownV2 | null>(null);
+  const [quoteLoading, setQuoteLoading] = useState(false);
+
+  // Pricing now lives server-side (admin-editable rates), so the quote is an
+  // async round-trip — debounced so spec-button clicks don't fire a request
+  // per keystroke/click.
+  useEffect(() => {
+    if (!hasValidDims) {
+      setQuote(null);
+      setQuoteLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setQuoteLoading(true);
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch('/api/quote', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            widthMm, heightMm,
+            layers: specs.layers,
+            qty: parseInt(specs.qty, 10) || 1,
+            finish: specs.finish,
+            copperWeight: specs.copper,
+            thickness: specs.thickness,
+            express,
+          }),
+        });
+        if (!res.ok) throw new Error('Quote request failed');
+        const data: PcbQuoteBreakdownV2 = await res.json();
+        if (!cancelled) setQuote(data);
+      } catch {
+        if (!cancelled) setQuote(null);
+      } finally {
+        if (!cancelled) setQuoteLoading(false);
+      }
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [hasValidDims, widthMm, heightMm, specs.layers, specs.qty, specs.finish, specs.copper, specs.thickness, express]);
+
+  async function extractEntries(f: File): Promise<{ name: string; content: string }[]> {
+    if (f.name.toLowerCase().endsWith('.zip')) {
+      const zip = await JSZip.loadAsync(f);
+      const entries: { name: string; content: string }[] = [];
+      for (const [path, entry] of Object.entries(zip.files)) {
+        if (entry.dir) continue;
+        entries.push({ name: path, content: await entry.async('string') });
+      }
+      return entries;
+    }
+    return [{ name: f.name, content: await f.text() }];
+  }
+
+  const handleFile = useCallback(async (f: File) => {
+    setFile(f);
+    setStep(2);
+    setOrderRef(null);
+    if (f.name.toLowerCase().endsWith('.rar')) {
+      setAnalysis(null);
+      setAnalysisError("RAR archives aren't analyzed automatically yet — enter board dimensions manually below.");
+      return;
+    }
+    setAnalyzing(true);
+    setAnalysisError(null);
+    try {
+      const entries = await extractEntries(f);
+      const result = analyzeGerberSet(entries);
+      setAnalysis(result);
+      if (result.boardWidthMm && result.boardHeightMm) {
+        setWidth(result.boardWidthMm.toFixed(2));
+        setHeight(result.boardHeightMm.toFixed(2));
+        setDimsAutoFilled(true);
+      } else {
+        setDimsAutoFilled(false);
+      }
+      if (result.copperLayerCount === 1 || result.copperLayerCount === 2) {
+        setSpecs(s => ({ ...s, layers: String(result.copperLayerCount) }));
+      }
+    } catch (err) {
+      setAnalysisError(err instanceof Error ? err.message : 'Could not read this file.');
+    } finally {
+      setAnalyzing(false);
+    }
+  }, []);
+
+  function handleDimsChange(axis: 'width' | 'height', value: string) {
+    setDimsAutoFilled(false);
+    if (axis === 'width') setWidth(value); else setHeight(value);
+  }
+
+  function resetToDetected() {
+    if (!analysis?.boardWidthMm || !analysis?.boardHeightMm) return;
+    setWidth(analysis.boardWidthMm.toFixed(2));
+    setHeight(analysis.boardHeightMm.toFixed(2));
+    setDimsAutoFilled(true);
+  }
+
+  const { status: sessionStatus } = useSession();
+  const router = useRouter();
+  const [submitting, setSubmitting] = useState(false);
+
+  async function submitOrder(placeOrder: boolean) {
+    if (sessionStatus !== "authenticated") {
+      toast({ title: "Sign in required", description: "Create an account or sign in to save a quote or place an order." });
+      router.push("/login?callbackUrl=/");
+      return null;
+    }
+    setSubmitting(true);
+    try {
+      const res = await fetch("/api/orders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: file?.name ?? null,
+          widthMm, heightMm,
+          layers: specs.layers,
+          qty: parseInt(specs.qty, 10) || 1,
+          finish: specs.finish,
+          color: specs.color,
+          copperWeight: specs.copper,
+          thickness: specs.thickness,
+          express,
+          placeOrder,
+        }),
+      });
+      if (!res.ok) {
+        toast({ title: "Something went wrong", description: "Could not save your order. Please try again." });
+        return null;
+      }
+      return await res.json();
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleSaveQuote() {
+    if (!quote) {
+      toast({ title: "Quote not ready", description: "Wait for the price to finish calculating before saving." });
+      return;
+    }
+    const order = await submitOrder(false);
+    if (!order) return;
+    toast({ title: "Quote saved", description: `Reference ${order.reference} — we'll follow up by email.` });
+  }
+
+  async function handlePlaceOrder() {
+    if (!hasValidDims) {
+      toast({ title: "Board dimensions needed", description: "Enter width and height (or upload Gerbers with an outline layer) before placing an order." });
+      return;
+    }
+    if (!quote) {
+      toast({ title: "Quote not ready", description: "Wait for the price to finish calculating before placing an order." });
+      return;
+    }
+    const order = await submitOrder(true);
+    if (!order) return;
+    setOrderRef(order.reference);
+    setStep(3);
+    toast({ title: "Order request received", description: `Reference ${order.reference} — our team will verify DRC and send a payment link.` });
+  }
 
   return (
     <div style={{ minHeight:"100vh", background:C.bg1, padding:"40px" }}>
@@ -1005,16 +1198,16 @@ function PCBOrderPage() {
                 <span style={{ fontSize:13, fontWeight:700, color:C.text0, fontFamily:"'DM Sans',sans-serif" }}>Gerber Files</span>
                 <Tag color="red">Required</Tag>
               </div>
-              <div onDrop={e=>{ e.preventDefault(); setDragging(false); const f=e.dataTransfer.files?.[0]; if(f){setFile(f);setStep(2);}}}
+              <div onDrop={e=>{ e.preventDefault(); setDragging(false); const f=e.dataTransfer.files?.[0]; if(f) handleFile(f); }}
                 onDragOver={e=>{ e.preventDefault(); setDragging(true); }} onDragLeave={()=>setDragging(false)}
                 onClick={()=>fileRef.current?.click()}
                 style={{ border:`2px dashed ${dragging?C.accent:file?C.border2:C.border}`, margin:16, borderRadius:10, padding:"36px 24px", textAlign:"center", cursor:"pointer", background:dragging?C.accentDim:file?"rgba(14,165,233,0.06)":"transparent", transition:"all 0.2s" }}>
-                <input ref={fileRef} type="file" accept=".gbr,.zip,.rar" style={{ display:"none" }} onChange={e=>{ if(e.target.files && e.target.files[0]){setFile(e.target.files[0]);setStep(2);}}}/>
+                <input ref={fileRef} type="file" accept=".gbr,.zip,.rar" style={{ display:"none" }} onChange={e=>{ const f=e.target.files?.[0]; if(f) handleFile(f); }}/>
                 {file ? (
                   <div>
-                    <div style={{ fontSize:32, marginBottom:10 }}>✅</div>
+                    <div style={{ fontSize:32, marginBottom:10 }}>{analyzing ? "⏳" : "✅"}</div>
                     <div style={{ fontWeight:700, color:C.accent2, fontSize:15, fontFamily:"'DM Sans',sans-serif" }}>{file.name}</div>
-                    <div style={{ fontSize:12, color:C.text2, marginTop:6 }}>Click to replace file</div>
+                    <div style={{ fontSize:12, color:C.text2, marginTop:6 }}>{analyzing ? "Reading Gerber layers…" : "Click to replace file"}</div>
                   </div>
                 ):(
                   <div>
@@ -1025,6 +1218,28 @@ function PCBOrderPage() {
                   </div>
                 )}
               </div>
+              {analysisError && (
+                <div style={{ margin:"0 16px 16px", padding:"10px 14px", background:"rgba(239,68,68,0.08)", border:`1px solid ${C.red}40`, borderRadius:8, fontSize:12, color:"#fca5a5", fontFamily:"'DM Sans',sans-serif" }}>
+                  {analysisError}
+                </div>
+              )}
+              {analysis && !analyzing && (
+                <div style={{ margin:"0 16px 16px", padding:"12px 14px", background:C.bg3, border:`1px solid ${C.border}`, borderRadius:8, display:"flex", flexWrap:"wrap", gap:16 }}>
+                  <div style={{ fontSize:11.5, color:C.text1, fontFamily:"'DM Sans',sans-serif" }}>
+                    <span style={{ color:C.text2 }}>Detected: </span>
+                    {analysis.boardWidthMm && analysis.boardHeightMm
+                      ? <strong style={{ color:C.text0 }}>{analysis.boardWidthMm.toFixed(1)} × {analysis.boardHeightMm.toFixed(1)} mm</strong>
+                      : <span style={{ color:C.text2 }}>no outline layer found</span>}
+                    {" · "}<strong style={{ color:C.text0 }}>{analysis.copperLayerCount || "?"} copper layer{analysis.copperLayerCount===1?"":"s"}</strong>
+                    {analysis.holeCount > 0 && <>{" · "}<strong style={{ color:C.text0 }}>{analysis.holeCount} holes</strong></>}
+                  </div>
+                  {analysis.copperLayerCount === 2 && (specs.layers === "4" || specs.layers === "6" || specs.layers === "8") && (
+                    <div style={{ fontSize:11, color:C.gold, fontFamily:"'DM Sans',sans-serif" }}>
+                      Only outer copper is visible from Gerbers — inner layers of a {specs.layers}-layer stack-up can&apos;t be auto-detected, confirm the layer count below is correct.
+                    </div>
+                  )}
+                </div>
+              )}
             </Card>
 
             {/* Specs */}
@@ -1033,6 +1248,33 @@ function PCBOrderPage() {
                 <span style={{ fontSize:13, fontWeight:700, color:C.text0, fontFamily:"'DM Sans',sans-serif" }}>Board Specifications</span>
               </div>
               <div style={{ padding:"20px" }}>
+                {/* Board dimensions — auto-filled from the Gerber outline, always editable */}
+                <div style={{ marginBottom:20, paddingBottom:20, borderBottom:`1px solid ${C.border}` }}>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+                    <div style={{ fontSize:11, fontWeight:700, color:C.text2, letterSpacing:1, fontFamily:"'DM Mono',monospace" }}>BOARD DIMENSIONS (MM)</div>
+                    {dimsAutoFilled ? (
+                      <Tag color="blue">Auto-detected</Tag>
+                    ) : analysis?.boardWidthMm ? (
+                      <button onClick={resetToDetected} style={{ background:"transparent", border:"none", color:C.accent2, fontSize:11, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight:700 }}>Reset to detected</button>
+                    ) : null}
+                  </div>
+                  <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                    <input type="number" min="0" step="0.1" value={width} placeholder="Width"
+                      onChange={e=>handleDimsChange('width', e.target.value)}
+                      style={{ width:100, padding:"8px 10px", borderRadius:7, border:`1.5px solid ${C.border}`, background:C.bg3, color:C.text0, fontSize:13, fontFamily:"'DM Sans',sans-serif" }}/>
+                    <span style={{ color:C.text3, fontSize:13 }}>×</span>
+                    <input type="number" min="0" step="0.1" value={height} placeholder="Height"
+                      onChange={e=>handleDimsChange('height', e.target.value)}
+                      style={{ width:100, padding:"8px 10px", borderRadius:7, border:`1.5px solid ${C.border}`, background:C.bg3, color:C.text0, fontSize:13, fontFamily:"'DM Sans',sans-serif" }}/>
+                    <span style={{ color:C.text2, fontSize:12 }}>mm</span>
+                  </div>
+                  {!hasValidDims && (
+                    <div style={{ fontSize:11.5, color:C.text2, marginTop:8, fontFamily:"'DM Sans',sans-serif" }}>
+                      Upload Gerbers with an outline/profile layer to auto-fill, or enter dimensions manually.
+                    </div>
+                  )}
+                </div>
+
                 <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20 }}>
                   {Object.entries(PCB_SPECS).map(([key,opts])=>(
                     <div key={key}>
@@ -1065,12 +1307,28 @@ function PCBOrderPage() {
           {/* Quote panel */}
           <div>
             <div style={{ background:C.bg0, border:`1px solid ${C.border2}`, borderRadius:16, padding:24, position:"sticky", top:80, boxShadow:`0 0 40px ${C.accentGlow}` }}>
-              <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:C.text3, letterSpacing:2, marginBottom:8 }}>INSTANT QUOTE</div>
-              <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:46, fontWeight:800, color:C.accent2, lineHeight:1, marginBottom:4 }}>₹{total.toLocaleString()}</div>
-              <div style={{ fontSize:12, color:C.text2, marginBottom:24 }}>for {specs.qty} boards · excl. GST & shipping</div>
+              <div style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:C.text3, letterSpacing:2, marginBottom:8 }}>
+                {!hasValidDims ? "QUOTE PENDING DIMENSIONS" : quoteLoading || !quote ? "RECALCULATING…" : "INSTANT QUOTE"}
+              </div>
+              {hasValidDims && quote ? (
+                <>
+                  <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:46, fontWeight:800, color:C.accent2, lineHeight:1, marginBottom:4, opacity:quoteLoading?0.5:1, transition:"opacity 0.15s" }}>₹{quote.total.toLocaleString()}</div>
+                  <div style={{ fontSize:12, color:C.text2, marginBottom:24 }}>for {specs.qty} boards · excl. GST & shipping</div>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontFamily:"'DM Sans',sans-serif", fontSize:32, fontWeight:800, color:C.text3, lineHeight:1, marginBottom:4 }}>
+                    {hasValidDims ? "…" : "—"}
+                  </div>
+                  <div style={{ fontSize:12, color:C.text2, marginBottom:24 }}>
+                    {hasValidDims ? "fetching latest pricing…" : "enter board dimensions to see pricing"}
+                  </div>
+                </>
+              )}
 
               <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:18, marginBottom:18 }}>
                 {[
+                  ["Board size", hasValidDims ? `${widthMm.toFixed(1)} × ${heightMm.toFixed(1)} mm` : "—"],
                   ["Layers", specs.layers+" layers"],
                   ["Quantity", specs.qty+" pcs"],
                   ["Surface finish", specs.finish],
@@ -1078,7 +1336,8 @@ function PCBOrderPage() {
                   ["Copper weight", specs.copper],
                   ["Board thickness", specs.thickness],
                   ["Lead time", express?"2–3 days (Express)":"5–7 working days"],
-                  ["DRC check", "Included ✓"],
+                  ["Setup / tooling fee", quote ? `₹${quote.toolingCharge.toLocaleString()}` : "—"],
+                  ["DRC check", "Manual review before production"],
                 ].map(([k,v])=>(
                   <div key={k} style={{ display:"flex", justifyContent:"space-between", marginBottom:9, fontSize:12.5 }}>
                     <span style={{ color:C.text2, fontFamily:"'DM Sans',sans-serif" }}>{k}</span>
@@ -1087,12 +1346,21 @@ function PCBOrderPage() {
                 ))}
               </div>
 
-              <Btn variant="gold" full style={{ fontSize:15, padding:"13px 0", marginBottom:10 }}>Place Order →</Btn>
-              <Btn variant="ghost" full style={{ fontSize:13, padding:"10px 0", marginBottom:16 }}>Save Quote</Btn>
+              {orderRef ? (
+                <div style={{ padding:"14px 16px", background:"rgba(16,185,129,0.1)", border:`1px solid ${C.green}40`, borderRadius:10, marginBottom:10 }}>
+                  <div style={{ fontSize:13, fontWeight:700, color:C.green, marginBottom:4, fontFamily:"'DM Sans',sans-serif" }}>✓ Order request received</div>
+                  <div style={{ fontSize:11.5, color:C.text1, fontFamily:"'DM Sans',sans-serif" }}>Reference <strong style={{ color:C.text0 }}>{orderRef}</strong> — we&apos;ll verify DRC and email a payment link within one business day.</div>
+                </div>
+              ) : (
+                <>
+                  <Btn variant="gold" full disabled={!quote || quoteLoading || submitting} style={{ fontSize:15, padding:"13px 0", marginBottom:10 }} onClick={handlePlaceOrder}>{submitting ? "Placing order…" : "Place Order →"}</Btn>
+                  <Btn variant="ghost" full disabled={!quote || quoteLoading || submitting} style={{ fontSize:13, padding:"10px 0", marginBottom:16 }} onClick={handleSaveQuote}>{submitting ? "Saving…" : "Save Quote"}</Btn>
+                </>
+              )}
 
               <div style={{ padding:"12px 14px", background:C.accentDim, borderRadius:10, border:`1px solid ${C.border2}` }}>
-                <div style={{ fontSize:11, fontWeight:700, color:C.accent2, marginBottom:5, fontFamily:"'DM Sans',sans-serif" }}>✓ What's included</div>
-                {["Automated DRC on all Gerber layers","IPC-A-600 quality standard","Electrical test (continuity)","UL-certified materials"].map(t=>(
+                <div style={{ fontSize:11, fontWeight:700, color:C.accent2, marginBottom:5, fontFamily:"'DM Sans',sans-serif" }}>✓ What&apos;s included</div>
+                {["Manual DRC review on all Gerber layers","IPC-A-600 quality standard","Electrical test (continuity)","UL-certified materials"].map(t=>(
                   <div key={t} style={{ fontSize:11, color:C.text2, marginBottom:3, fontFamily:"'DM Sans',sans-serif" }}>• {t}</div>
                 ))}
               </div>

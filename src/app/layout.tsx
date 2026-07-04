@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { DM_Sans, DM_Mono } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
+import AppSessionProvider from "@/components/session-provider";
+import AppQueryProvider from "@/components/query-provider";
 
 const dmSans = DM_Sans({
   variable: "--font-dm-sans",
@@ -36,8 +38,12 @@ export default function RootLayout({
         style={{ colorScheme: 'dark', fontFamily: "var(--font-dm-sans), sans-serif" }}
         suppressHydrationWarning
       >
-        {children}
-        <Toaster />
+        <AppSessionProvider>
+          <AppQueryProvider>
+            {children}
+            <Toaster />
+          </AppQueryProvider>
+        </AppSessionProvider>
       </body>
     </html>
   );
