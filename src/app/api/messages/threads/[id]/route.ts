@@ -1,16 +1,8 @@
 import { NextResponse } from "next/server"
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
-
-async function canAccessThread(
-  threadId: string,
-  user: { id: string; role: string }
-): Promise<boolean> {
-  if (user.role === "ADMIN" || user.role === "ENGINEER") return true
-  const thread = await db.messageThread.findUnique({ where: { id: threadId }, include: { order: true } })
-  if (!thread) return false
-  return thread.createdById === user.id || thread.order?.userId === user.id
-}
+import { canAccessThread } from "@/lib/messaging"
+import { saveMessageAttachment, type SavedAttachment } from "@/lib/attachments"
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -29,6 +21,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   return NextResponse.json(thread)
 }
 
+// Accepts multipart/form-data: "body" (text, optional if a file is attached)
+// and "file" (an image screenshot, optional if body text is present).
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
   const session = await auth()
@@ -37,14 +31,26 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     return NextResponse.json({ error: "Forbidden" }, { status: 403 })
   }
 
-  const { body } = await req.json()
-  if (!body || typeof body !== "string" || !body.trim()) {
-    return NextResponse.json({ error: "body is required." }, { status: 400 })
+  const formData = await req.formData()
+  const body = (formData.get("body") as string | null)?.trim() ?? ""
+  const file = formData.get("file")
+
+  if (!body && !(file instanceof File)) {
+    return NextResponse.json({ error: "A message or attachment is required." }, { status: 400 })
+  }
+
+  let attachment: SavedAttachment | null = null
+  if (file instanceof File && file.size > 0) {
+    try {
+      attachment = await saveMessageAttachment(id, file)
+    } catch (err) {
+      return NextResponse.json({ error: err instanceof Error ? err.message : "Could not save attachment." }, { status: 400 })
+    }
   }
 
   const message = await db.$transaction(async (tx) => {
     const created = await tx.message.create({
-      data: { threadId: id, authorId: session.user.id, body: body.trim() },
+      data: { threadId: id, authorId: session.user.id, body, ...attachment },
       include: { author: { select: { id: true, name: true, email: true, role: true } } },
     })
     await tx.messageThread.update({ where: { id }, data: { updatedAt: new Date() } })

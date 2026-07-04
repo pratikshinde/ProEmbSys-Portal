@@ -191,6 +191,15 @@ model Message {
   createdAt DateTime  @default(now())
   readAt    DateTime?
 
+  // One image attachment per message (screenshots) — stored on local disk
+  // for now (see src/lib/attachments.ts), path is relative to the upload
+  // root and includes the threadId so access-control can be checked from
+  // the path alone without a DB round trip in the serving route.
+  attachmentPath String?
+  attachmentName String?
+  attachmentType String?
+  attachmentSize Int?
+
   thread MessageThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
   author User          @relation(fields: [authorId], references: [id], onDelete: Cascade)
 
