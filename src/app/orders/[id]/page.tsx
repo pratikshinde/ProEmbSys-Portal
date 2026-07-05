@@ -4,6 +4,7 @@ import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import MessageThread from "@/components/messaging/message-thread"
 import { Navbar } from "@/components/portal-main"
+import { asAddressSnapshot, formatAddressSnapshot } from "@/lib/format-address"
 
 export default async function OrderDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -12,6 +13,9 @@ export default async function OrderDetailPage({ params }: { params: Promise<{ id
 
   const order = await db.order.findUnique({ where: { id }, include: { messageThread: true } })
   if (!order) notFound()
+
+  const deliveryAddress = asAddressSnapshot(order.deliveryAddress)
+  const billingAddress = asAddressSnapshot(order.billingAddress)
 
   const isStaff = session.user.role === "ADMIN" || session.user.role === "ENGINEER"
   if (!isStaff && order.userId !== session.user.id) notFound() // don't leak existence to non-owners
@@ -66,6 +70,37 @@ export default async function OrderDetailPage({ params }: { params: Promise<{ id
             </div>
           </div>
         </div>
+
+        {order.gerberFilePath && (
+          <div className="rounded-lg border border-border bg-card p-5 text-sm">
+            <span className="text-muted-foreground">Design files</span>
+            <div className="mt-1">
+              <a href={`/api/orders/${order.id}/file`} className="font-medium text-primary hover:underline">
+                Download {order.fileName ?? "Gerber files"}
+              </a>
+            </div>
+          </div>
+        )}
+
+        {(deliveryAddress || billingAddress) && (
+          <div className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-card p-5 text-sm">
+            {deliveryAddress && (
+              <div>
+                <span className="text-muted-foreground">Delivery address</span>
+                <div className="font-medium text-foreground">{formatAddressSnapshot(deliveryAddress)}</div>
+              </div>
+            )}
+            {billingAddress && (
+              <div>
+                <span className="text-muted-foreground">Billing address</span>
+                <div className="font-medium text-foreground">{formatAddressSnapshot(billingAddress)}</div>
+                {billingAddress.gstNumber && (
+                  <div className="mt-1 text-xs text-muted-foreground">GST: {billingAddress.gstNumber}</div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {order.messageThread && <MessageThread threadId={order.messageThread.id} />}
       </div>

@@ -191,7 +191,10 @@ model Order {
   status         OrderStatus    @default(QUOTE)
   deliveryFormat DeliveryFormat @default(INDIVIDUAL)
 
-  fileName     String?
+  fileName       String? // original filename, e.g. "board_v2.zip"
+  gerberFilePath String? // storage path relative to uploads/orders/, e.g. "<uuid>.<ext>" — see src/lib/order-files.ts
+  gerberFileType String? // best-effort MIME type
+  gerberFileSize Int? // bytes
   widthMm      Decimal     @db.Decimal(10, 2)
   heightMm     Decimal     @db.Decimal(10, 2)
   layers       String
@@ -206,6 +209,13 @@ model Order {
   // orders must NOT silently reprice when an admin edits a PricingRate later.
   priceBreakdown Json
   total          Decimal @db.Decimal(10, 2) // denormalized for cheap sort/filter
+
+  // Snapshots of the chosen Address rows at order time — same reasoning as
+  // priceBreakdown: Address is editable/deletable by the customer, so a
+  // live foreign key would let past orders silently change or break. Shape
+  // matches Address minus id/userId/type/isDefault/timestamps.
+  deliveryAddress Json? // required to place an order (not to save a quote); null for quotes and pre-existing orders
+  billingAddress  Json? // optional — not every customer needs a GST invoice
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

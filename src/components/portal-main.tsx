@@ -16,6 +16,8 @@ import { useSession, signOut } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import type { AddressRecord } from '@/components/account/account-client';
 
 
 // ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
@@ -1137,6 +1139,30 @@ function PCBOrderPage() {
   const router = useRouter();
   const [submitting, setSubmitting] = useState(false);
 
+  const [addresses, setAddresses] = useState<AddressRecord[]>([]);
+  const [deliveryAddressId, setDeliveryAddressId] = useState<string>("");
+  const [billingAddressId, setBillingAddressId] = useState<string>("");
+  const deliveryAddresses = addresses.filter(a => a.type === "DELIVERY");
+  const billingAddresses = addresses.filter(a => a.type === "BILLING");
+
+  useEffect(() => {
+    if (sessionStatus !== "authenticated") return;
+    fetch("/api/account/addresses")
+      .then(res => res.ok ? res.json() : [])
+      .then((data: AddressRecord[]) => {
+        setAddresses(data);
+        const defaultDelivery = data.find(a => a.type === "DELIVERY" && a.isDefault) ?? data.find(a => a.type === "DELIVERY");
+        const defaultBilling = data.find(a => a.type === "BILLING" && a.isDefault) ?? data.find(a => a.type === "BILLING");
+        if (defaultDelivery) setDeliveryAddressId(defaultDelivery.id);
+        if (defaultBilling) setBillingAddressId(defaultBilling.id);
+      })
+      .catch(() => {});
+  }, [sessionStatus]);
+
+  function formatAddress(a: AddressRecord) {
+    return `${a.label ? a.label + " — " : ""}${a.line1}, ${a.city}, ${a.state} ${a.postalCode}`;
+  }
+
   async function submitOrder(placeOrder: boolean) {
     if (sessionStatus !== "authenticated") {
       toast({ title: "Sign in required", description: "Create an account or sign in to save a quote or place an order." });
@@ -1145,23 +1171,23 @@ function PCBOrderPage() {
     }
     setSubmitting(true);
     try {
-      const res = await fetch("/api/orders", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileName: file?.name ?? null,
-          widthMm, heightMm,
-          layers: specs.layers,
-          qty: parseInt(specs.qty, 10) || 1,
-          finish: specs.finish,
-          color: specs.color,
-          copperWeight: specs.copper,
-          thickness: specs.thickness,
-          express,
-          deliveryFormat,
-          placeOrder,
-        }),
-      });
+      const formData = new FormData();
+      formData.set("widthMm", String(widthMm));
+      formData.set("heightMm", String(heightMm));
+      formData.set("layers", specs.layers);
+      formData.set("qty", String(parseInt(specs.qty, 10) || 1));
+      formData.set("finish", specs.finish);
+      formData.set("color", specs.color);
+      formData.set("copperWeight", specs.copper);
+      formData.set("thickness", specs.thickness);
+      formData.set("express", String(express));
+      formData.set("deliveryFormat", deliveryFormat);
+      if (deliveryAddressId) formData.set("deliveryAddressId", deliveryAddressId);
+      if (billingAddressId) formData.set("billingAddressId", billingAddressId);
+      formData.set("placeOrder", String(placeOrder));
+      if (file) formData.set("file", file);
+
+      const res = await fetch("/api/orders", { method: "POST", body: formData });
       if (!res.ok) {
         toast({ title: "Something went wrong", description: "Could not save your order. Please try again." });
         return null;
@@ -1189,6 +1215,14 @@ function PCBOrderPage() {
     }
     if (!quote) {
       toast({ title: "Quote not ready", description: "Wait for the price to finish calculating before placing an order." });
+      return;
+    }
+    if (!deliveryAddressId) {
+      toast({ title: "Delivery address needed", description: "Select or add a delivery address before placing an order." });
+      return;
+    }
+    if (!file) {
+      toast({ title: "Gerber file needed", description: "Upload your Gerber files before placing an order." });
       return;
     }
     const order = await submitOrder(true);
@@ -1383,6 +1417,45 @@ function PCBOrderPage() {
                     </div>
                   )}
                 </div>
+
+                {/* Shipping & billing */}
+                {sessionStatus === "authenticated" && (
+                  <div style={{ marginTop:16, padding:"14px 16px", background:C.bg3, borderRadius:10, border:`1px solid ${C.border}` }}>
+                    <div style={{ fontSize:11, fontWeight:700, color:C.text2, letterSpacing:1, marginBottom:10, fontFamily:"'DM Mono',monospace" }}>SHIPPING &amp; BILLING</div>
+                    <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+                      <div>
+                        <div style={{ fontSize:11, color:C.text2, marginBottom:6, fontFamily:"'DM Sans',sans-serif" }}>Delivery address</div>
+                        {deliveryAddresses.length === 0 ? (
+                          <div style={{ fontSize:12, color:C.text2 }}>
+                            No delivery address saved. <Link href="/account" style={{ color:C.accent2 }}>Add one in My Account</Link>
+                          </div>
+                        ) : (
+                          <Select value={deliveryAddressId} onValueChange={setDeliveryAddressId}>
+                            <SelectTrigger className="w-full"><SelectValue placeholder="Select a delivery address"/></SelectTrigger>
+                            <SelectContent>
+                              {deliveryAddresses.map(a => <SelectItem key={a.id} value={a.id}>{formatAddress(a)}</SelectItem>)}
+                            </SelectContent>
+                          </Select>
+                        )}
+                      </div>
+                      <div>
+                        <div style={{ fontSize:11, color:C.text2, marginBottom:6, fontFamily:"'DM Sans',sans-serif" }}>Billing address (optional — for GST invoice)</div>
+                        {billingAddresses.length === 0 ? (
+                          <div style={{ fontSize:12, color:C.text2 }}>
+                            No billing address saved. <Link href="/account" style={{ color:C.accent2 }}>Add one in My Account</Link>
+                          </div>
+                        ) : (
+                          <Select value={billingAddressId} onValueChange={setBillingAddressId}>
+                            <SelectTrigger className="w-full"><SelectValue placeholder="Select a billing address"/></SelectTrigger>
+                            <SelectContent>
+                              {billingAddresses.map(a => <SelectItem key={a.id} value={a.id}>{formatAddress(a)}</SelectItem>)}
+                            </SelectContent>
+                          </Select>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             </Card>
           </div>
@@ -1422,6 +1495,7 @@ function PCBOrderPage() {
                   ["Delivery format", deliveryFormat === "INDIVIDUAL" ? "Individual PCBs" : deliveryFormat === "PANEL_BY_CUSTOMER" ? "Panelized (by you)" : "Panelized (by ProPCB)"],
                   ["Setup / tooling fee", quote ? `₹${quote.toolingCharge.toLocaleString()}` : "—"],
                   ...(deliveryFormat === "PANEL_BY_PROPCB" ? [["Panelization service fee", quote ? `₹${quote.panelizationCharge.toLocaleString()}` : "—"]] : []),
+                  ...(sessionStatus === "authenticated" ? [["Ship to", deliveryAddresses.find(a=>a.id===deliveryAddressId) ? formatAddress(deliveryAddresses.find(a=>a.id===deliveryAddressId)!) : "—"]] : []),
                   ["DRC check", "Manual review before production"],
                 ].map(([k,v])=>(
                   <div key={k} style={{ display:"flex", justifyContent:"space-between", marginBottom:9, fontSize:12.5 }}>

@@ -2,6 +2,7 @@ import { notFound } from "next/navigation"
 import { db } from "@/lib/db"
 import MessageThread from "@/components/messaging/message-thread"
 import OrderStatusControl from "@/components/admin/order-status-control"
+import { asAddressSnapshot, formatAddressSnapshot } from "@/lib/format-address"
 
 export default async function AdminOrderDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -11,6 +12,9 @@ export default async function AdminOrderDetailPage({ params }: { params: Promise
     include: { messageThread: true, user: { select: { name: true, email: true } } },
   })
   if (!order) notFound()
+
+  const deliveryAddress = asAddressSnapshot(order.deliveryAddress)
+  const billingAddress = asAddressSnapshot(order.billingAddress)
 
   return (
     <div className="flex max-w-2xl flex-col gap-6">
@@ -60,6 +64,41 @@ export default async function AdminOrderDetailPage({ params }: { params: Promise
           </div>
         </div>
       </div>
+
+      <div className="rounded-lg border border-border bg-card p-5 text-sm">
+        <span className="text-muted-foreground">Design files</span>
+        <div className="mt-1">
+          {order.gerberFilePath ? (
+            <a href={`/api/orders/${order.id}/file`} className="font-medium text-primary hover:underline">
+              Download {order.fileName ?? "Gerber files"}
+            </a>
+          ) : (
+            <span className="font-medium text-amber-600 dark:text-amber-400">
+              No Gerber file on record for this order.
+            </span>
+          )}
+        </div>
+      </div>
+
+      {(deliveryAddress || billingAddress) && (
+        <div className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-card p-5 text-sm">
+          {deliveryAddress && (
+            <div>
+              <span className="text-muted-foreground">Delivery address</span>
+              <div className="font-medium text-foreground">{formatAddressSnapshot(deliveryAddress)}</div>
+            </div>
+          )}
+          {billingAddress && (
+            <div>
+              <span className="text-muted-foreground">Billing address</span>
+              <div className="font-medium text-foreground">{formatAddressSnapshot(billingAddress)}</div>
+              {billingAddress.gstNumber && (
+                <div className="mt-1 text-xs text-muted-foreground">GST: {billingAddress.gstNumber}</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {order.deliveryFormat === "PANEL_BY_PROPCB" && (
         <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-600 dark:text-amber-400">
