@@ -2,6 +2,7 @@ import { redirect } from "next/navigation"
 import Link from "next/link"
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
+import { Navbar } from "@/components/portal-main"
 
 export default async function OrdersListPage() {
   const session = await auth()
@@ -13,12 +14,10 @@ export default async function OrdersListPage() {
   })
 
   return (
-    <div className="min-h-screen bg-background px-6 py-12">
-      <div className="mx-auto max-w-3xl">
-        <Link href="/" className="text-sm text-muted-foreground hover:text-primary">
-          &larr; Back to ProPCB
-        </Link>
-        <h1 className="mt-4 mb-6 text-2xl font-bold text-foreground">My Orders</h1>
+    <div className="min-h-screen bg-background">
+      <Navbar />
+      <div className="mx-auto max-w-3xl px-6 py-12">
+        <h1 className="mb-6 text-2xl font-bold text-foreground">My Orders</h1>
         {orders.length === 0 ? (
           <p className="text-muted-foreground">You haven&apos;t placed any orders yet.</p>
         ) : (

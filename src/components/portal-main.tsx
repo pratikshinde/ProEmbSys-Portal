@@ -15,6 +15,7 @@ import { toast } from '@/hooks/use-toast';
 import { useSession, signOut } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 
 
 // ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
@@ -148,14 +149,18 @@ function CircuitBg({ opacity=0.04 }) {
 
 // ─── NAVBAR ──────────────────────────────────────────────────────────────────
 
-function Navbar({ page, setPage, cartCount }) {
+export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPage?: (p: string) => void; cartCount?: number }) {
   const { data: session, status } = useSession();
   const router = useRouter();
+  // Standalone usage (fab-capabilities, orders pages) has no switcher `page`
+  // state to flip — navigate to "/" with a ?page= param instead, which App
+  // reads on load to jump straight to that section.
+  const goToPage = (key: string) => setPage ? setPage(key) : router.push(key === "home" ? "/" : `/?page=${key}`);
   return (
     <nav style={{ background:`${C.bg0}ee`, backdropFilter:"blur(16px)", borderBottom:`1px solid ${C.border}`, position:"sticky", top:0, zIndex:200 }}>
       <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 28px", height:62, display:"flex", alignItems:"center", gap:0 }}>
         {/* Logo */}
-        <div onClick={()=>setPage("home")} style={{ display:"flex", alignItems:"center", gap:10, marginRight:36, cursor:"pointer", flexShrink:0 }}>
+        <div onClick={()=>goToPage("home")} style={{ display:"flex", alignItems:"center", gap:10, marginRight:36, cursor:"pointer", flexShrink:0 }}>
           <div style={{ width:36, height:36, background:`linear-gradient(135deg, ${C.accent} 0%, #0369a1 100%)`, borderRadius:9, display:"flex", alignItems:"center", justifyContent:"center", boxShadow:`0 0 14px ${C.accentGlow}` }}>
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
               <polygon points="12,2 20,7 20,17 12,22 4,17 4,7" fill="none" stroke="white" strokeWidth="1.5"/>
@@ -181,7 +186,7 @@ function Navbar({ page, setPage, cartCount }) {
               {label}
             </Link>
           ) : (
-            <button key={key} onClick={()=>setPage(key)} style={{ background: page===key ? C.accentDim : "transparent", border:"none", padding:"7px 14px", borderRadius:8, fontSize:13.5, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", color: page===key ? C.accent2 : C.text1, fontWeight: page===key ? 700 : 400, transition:"all 0.15s" }}
+            <button key={key} onClick={()=>goToPage(key)} style={{ background: page===key ? C.accentDim : "transparent", border:"none", padding:"7px 14px", borderRadius:8, fontSize:13.5, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", color: page===key ? C.accent2 : C.text1, fontWeight: page===key ? 700 : 400, transition:"all 0.15s" }}
               onMouseEnter={e=>{ if(page!==key){ e.currentTarget.style.background=C.bg3; e.currentTarget.style.color=C.text0; }}}
               onMouseLeave={e=>{ if(page!==key){ e.currentTarget.style.background="transparent"; e.currentTarget.style.color=C.text1; }}}>
               {label}
@@ -192,21 +197,32 @@ function Navbar({ page, setPage, cartCount }) {
         {/* Right actions */}
         <div style={{ display:"flex", gap:10, alignItems:"center", flexShrink:0 }}>
           {cartCount>0 && (
-            <div onClick={()=>setPage("shop")} style={{ cursor:"pointer", background:C.accentDim, border:`1px solid ${C.border2}`, borderRadius:8, padding:"7px 14px", fontSize:13, color:C.accent2, fontFamily:"'DM Sans',sans-serif", fontWeight:700 }}>
+            <div onClick={()=>goToPage("shop")} style={{ cursor:"pointer", background:C.accentDim, border:`1px solid ${C.border2}`, borderRadius:8, padding:"7px 14px", fontSize:13, color:C.accent2, fontFamily:"'DM Sans',sans-serif", fontWeight:700 }}>
               🛒 {cartCount}
             </div>
           )}
           {status === "authenticated" ? (
-            <>
-              <Link href="/orders" style={{ fontSize:13, color:C.text1, fontFamily:"'DM Sans',sans-serif", textDecoration:"none" }}>
-                {session.user?.name || session.user?.email}
-              </Link>
-              <Btn variant="ghost" onClick={()=>signOut({ callbackUrl: "/" })} style={{ fontSize:13, padding:"7px 16px" }}>Sign out</Btn>
-            </>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button style={{ fontSize:13, color:C.text1, fontFamily:"'DM Sans',sans-serif", background:"transparent", border:"none", cursor:"pointer", padding:"6px 4px" }}>
+                  {session.user?.name || session.user?.email}
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem asChild>
+                  <Link href="/account">My Account</Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link href="/orders">My Orders</Link>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={()=>signOut({ callbackUrl: "/" })}>Sign out</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           ) : (
             <Btn variant="ghost" onClick={()=>router.push("/login")} style={{ fontSize:13, padding:"7px 16px" }}>Sign in</Btn>
           )}
-          <Btn variant="primary" onClick={()=>setPage("order")} style={{ fontSize:13, padding:"8px 18px" }}>Get Quote →</Btn>
+          <Btn variant="primary" onClick={()=>goToPage("order")} style={{ fontSize:13, padding:"8px 18px" }}>Get Quote →</Btn>
         </div>
       </div>
     </nav>
@@ -1925,6 +1941,16 @@ export default function App() {
     shop:     <ShopPage/>,
     blog:     <BlogPage/>,
   };
+
+  // Standalone pages (fab-capabilities, orders) link back here via
+  // /?page=order etc. since they're outside this switcher's state — this
+  // reads that once on mount, client-side only (mirrors the sidebar-width
+  // hydration pattern below: avoid touching `window` during SSR).
+  useEffect(() => {
+    const requested = new URLSearchParams(window.location.search).get("page");
+    if (requested && requested in pages) setPage(requested);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div style={{ fontFamily:"'DM Sans', sans-serif", background:C.bg1, minHeight:"100vh", color:C.text0 }}>

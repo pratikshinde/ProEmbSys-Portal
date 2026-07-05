@@ -30,8 +30,39 @@ model User {
   passwordResetTokens PasswordResetToken[]
   messages            Message[]
   pricingRateEdits    PricingRate[] @relation("PricingRateEditedBy")
+  addresses           Address[]
 
   @@map("users")
+}
+
+enum AddressType {
+  BILLING
+  DELIVERY
+}
+
+// A customer's saved address book — multiple per type, one flagged default
+// per type. GST registration in India is tied to a specific place of
+// business, so `gstNumber` lives on the (billing) address, not the User.
+model Address {
+  id         String      @id @default(cuid())
+  userId     String
+  type       AddressType
+  label      String? // friendly name, e.g. "Head Office", "Warehouse 2"
+  line1      String
+  line2      String?
+  city       String
+  state      String
+  postalCode String
+  country    String      @default("India")
+  gstNumber  String? // relevant for BILLING addresses
+  isDefault  Boolean     @default(false)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("addresses")
 }
 
 model Account {
@@ -142,9 +173,20 @@ enum DeliveryFormat {
   PANEL_BY_PROPCB
 }
 
+// Backs the human-readable, date-encoded order reference (PCB-YYYYMMDD-NNNN).
+// One row per day (IST) — `lastValue` is incremented atomically via upsert
+// in src/lib/order-reference.ts so concurrent order placements on the same
+// day never collide.
+model OrderSequence {
+  period    String @id // "YYYYMMDD" in IST
+  lastValue Int    @default(0)
+
+  @@map("order_sequences")
+}
+
 model Order {
   id             String         @id @default(cuid())
-  reference      String         @unique // short human-facing ref (id prefix, uppercased)
+  reference      String         @unique // human-facing order ID — PCB-YYYYMMDD-NNNN, see src/lib/order-reference.ts
   userId         String
   status         OrderStatus    @default(QUOTE)
   deliveryFormat DeliveryFormat @default(INDIVIDUAL)

@@ -1,4 +1,4 @@
-import Link from "next/link"
+import { Navbar } from "@/components/portal-main"
 
 interface Spec {
   label: string
@@ -64,12 +64,10 @@ const SPEC_GROUPS: SpecGroup[] = [
 
 export default function FabCapabilitiesPage() {
   return (
-    <div className="min-h-screen bg-background px-6 py-16">
-      <div className="mx-auto max-w-3xl">
-        <Link href="/" className="text-sm text-muted-foreground hover:text-primary">
-          &larr; Back to ProPCB
-        </Link>
-        <h1 className="mt-4 text-3xl font-bold text-foreground">PCB Fab Capabilities</h1>
+    <div className="min-h-screen bg-background">
+      <Navbar />
+      <div className="mx-auto max-w-3xl px-6 py-16">
+        <h1 className="text-3xl font-bold text-foreground">PCB Fab Capabilities</h1>
         <p className="mt-2 text-muted-foreground">
           Standard process capabilities for boards fabricated by ProEmbSys Technologies. If your design falls
           outside these specs, contact us before ordering — some advanced specs are available on request.

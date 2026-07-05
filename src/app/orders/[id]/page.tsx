@@ -3,6 +3,7 @@ import Link from "next/link"
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import MessageThread from "@/components/messaging/message-thread"
+import { Navbar } from "@/components/portal-main"
 
 export default async function OrderDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -16,8 +17,9 @@ export default async function OrderDetailPage({ params }: { params: Promise<{ id
   if (!isStaff && order.userId !== session.user.id) notFound() // don't leak existence to non-owners
 
   return (
-    <div className="min-h-screen bg-background px-6 py-12">
-      <div className="mx-auto flex max-w-2xl flex-col gap-6">
+    <div className="min-h-screen bg-background">
+      <Navbar />
+      <div className="mx-auto flex max-w-2xl flex-col gap-6 px-6 py-12">
         <div>
           <Link href="/orders" className="text-sm text-muted-foreground hover:text-primary">
             &larr; My Orders

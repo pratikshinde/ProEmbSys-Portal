@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server"
-import crypto from "crypto"
 import { Prisma, DeliveryFormat } from "@prisma/client"
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import { buildRatesMap, calculatePcbQuoteV2 } from "@/lib/pricing-engine"
+import { generateOrderReference } from "@/lib/order-reference"
 
 export async function GET() {
   const session = await auth()
@@ -51,9 +51,8 @@ export async function POST(req: Request) {
     rates
   )
 
-  const reference = crypto.randomBytes(4).toString("hex").toUpperCase()
-
   const order = await db.$transaction(async (tx) => {
+    const reference = await generateOrderReference(tx)
     const created = await tx.order.create({
       data: {
         reference,
