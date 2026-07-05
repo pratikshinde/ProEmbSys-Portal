@@ -32,6 +32,7 @@ const rows: SeedRow[] = [
   { category: "SURFACE_FINISH", key: "OSP", label: "OSP", value: 5, unit: "PERCENT_SURCHARGE", sortOrder: 2 },
   { category: "SURFACE_FINISH", key: "Immersion Silver", label: "Immersion Silver", value: 12, unit: "PERCENT_SURCHARGE", sortOrder: 3 },
   { category: "SURFACE_FINISH", key: "Hard Gold", label: "Hard Gold", value: 35, unit: "PERCENT_SURCHARGE", sortOrder: 4 },
+  { category: "SURFACE_FINISH", key: "Leaded HASL", label: "Leaded HASL", value: 0, unit: "PERCENT_SURCHARGE", sortOrder: 5 },
 
   // COPPER_THICKNESS — percent surcharge on base price
   { category: "COPPER_THICKNESS", key: "1 oz", label: "1 oz copper", value: 0, unit: "PERCENT_SURCHARGE", sortOrder: 0 },

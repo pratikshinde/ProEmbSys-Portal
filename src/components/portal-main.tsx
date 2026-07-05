@@ -52,10 +52,21 @@ const NAV_ITEMS: { key: string; label: string; href?: string }[] = [
 const PCB_SPECS = {
   layers:  ["1","2","4","6","8"],
   qty:     ["5","10","25","50","100","250","500"],
-  finish:  ["HASL (Lead-free)","ENIG","OSP","Immersion Silver","Hard Gold"],
+  finish:  ["HASL (Lead-free)","Leaded HASL","ENIG","OSP","Immersion Silver","Hard Gold"],
   color:   ["Green","Black","Blue","Red","White","Yellow"],
   copper:  ["1 oz","2 oz","3 oz"],
   thickness:["0.8mm","1.0mm","1.2mm","1.6mm","2.0mm"],
+};
+
+// Real solder-mask swatch colors, keyed off PCB_SPECS.color — selecting a
+// color pill fills it with the actual color instead of the generic accent.
+const SOLDER_MASK_SWATCH: Record<string, { bg: string; text: string }> = {
+  Green:  { bg:"#1f7a3d", text:"#ffffff" },
+  Black:  { bg:"#1a1a1a", text:"#ffffff" },
+  Blue:   { bg:"#1857a4", text:"#ffffff" },
+  Red:    { bg:"#b3261e", text:"#ffffff" },
+  White:  { bg:"#e8e6df", text:"#1a1a1a" },
+  Yellow: { bg:"#d9a91a", text:"#1a1a1a" },
 };
 
 const PRODUCTS = [
@@ -1280,12 +1291,21 @@ function PCBOrderPage() {
                     <div key={key}>
                       <div style={{ fontSize:11, fontWeight:700, color:C.text2, letterSpacing:1, marginBottom:10, fontFamily:"'DM Mono',monospace" }}>{key.toUpperCase()}</div>
                       <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
-                        {opts.map(o=>(
-                          <button key={o} onClick={()=>setSpecs(s=>({...s,[key]:o}))}
-                            style={{ padding:"6px 13px", borderRadius:7, border:`1.5px solid ${specs[key]===o?C.accent:C.border}`, background:specs[key]===o?C.accentDim:C.bg3, color:specs[key]===o?C.accent2:C.text1, fontSize:12, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight:specs[key]===o?700:400, transition:"all 0.15s" }}>
-                            {o}
-                          </button>
-                        ))}
+                        {opts.map(o=>{
+                          const swatch = key === "color" ? SOLDER_MASK_SWATCH[o] : undefined;
+                          const selected = specs[key] === o;
+                          const style = swatch
+                            ? { padding:"6px 13px", borderRadius:7, border:`1.5px solid ${selected ? swatch.bg : C.border}`, background: selected ? swatch.bg : C.bg3, color: selected ? swatch.text : C.text1, fontSize:12, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight: selected ? 700 : 400, transition:"all 0.15s", display:"inline-flex", alignItems:"center", gap:6 }
+                            : { padding:"6px 13px", borderRadius:7, border:`1.5px solid ${selected?C.accent:C.border}`, background:selected?C.accentDim:C.bg3, color:selected?C.accent2:C.text1, fontSize:12, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight:selected?700:400, transition:"all 0.15s" };
+                          return (
+                            <button key={o} onClick={()=>setSpecs(s=>({...s,[key]:o}))} style={style}>
+                              {swatch && !selected && (
+                                <span style={{ width:10, height:10, borderRadius:"50%", background:swatch.bg, border:`1px solid ${C.border2}`, flexShrink:0 }}/>
+                              )}
+                              {o}
+                            </button>
+                          );
+                        })}
                       </div>
                     </div>
                   ))}
