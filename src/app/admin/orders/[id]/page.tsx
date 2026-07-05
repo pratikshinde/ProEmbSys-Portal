@@ -49,7 +49,24 @@ export default async function AdminOrderDetailPage({ params }: { params: Promise
           <span className="text-muted-foreground">Board thickness</span>
           <div className="font-medium text-foreground">{order.thickness}</div>
         </div>
+        <div>
+          <span className="text-muted-foreground">Delivery format</span>
+          <div className="font-medium text-foreground">
+            {order.deliveryFormat === "INDIVIDUAL"
+              ? "Individual PCBs"
+              : order.deliveryFormat === "PANEL_BY_CUSTOMER"
+              ? "Panelized (by customer)"
+              : "Panelized (by ProPCB)"}
+          </div>
+        </div>
       </div>
+
+      {order.deliveryFormat === "PANEL_BY_PROPCB" && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-600 dark:text-amber-400">
+          This order needs to be panelized by our team before production — use the Panelization tool on the
+          uploaded Gerber files.
+        </div>
+      )}
 
       {order.messageThread && <MessageThread threadId={order.messageThread.id} />}
     </div>

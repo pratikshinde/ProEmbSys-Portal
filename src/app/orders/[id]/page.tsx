@@ -53,6 +53,16 @@ export default async function OrderDetailPage({ params }: { params: Promise<{ id
             <span className="text-muted-foreground">Board thickness</span>
             <div className="font-medium text-foreground">{order.thickness}</div>
           </div>
+          <div>
+            <span className="text-muted-foreground">Delivery format</span>
+            <div className="font-medium text-foreground">
+              {order.deliveryFormat === "INDIVIDUAL"
+                ? "Individual PCBs"
+                : order.deliveryFormat === "PANEL_BY_CUSTOMER"
+                ? "Panelized (by you)"
+                : "Panelized (by ProPCB)"}
+            </div>
+          </div>
         </div>
 
         {order.messageThread && <MessageThread threadId={order.messageThread.id} />}

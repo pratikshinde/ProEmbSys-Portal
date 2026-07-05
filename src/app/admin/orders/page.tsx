@@ -35,6 +35,11 @@ export default async function AdminOrdersPage() {
                   <td className="px-4 py-3 text-foreground">{order.user.name || order.user.email}</td>
                   <td className="px-4 py-3 text-foreground">
                     {order.widthMm.toString()}×{order.heightMm.toString()}mm · {order.layers}L · qty {order.qty}
+                    {order.deliveryFormat === "PANEL_BY_PROPCB" && (
+                      <span className="ml-2 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+                        Panelize
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-foreground">{order.status}</td>
                   <td className="px-4 py-3 text-right font-medium text-foreground">

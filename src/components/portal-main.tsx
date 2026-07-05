@@ -1004,6 +1004,7 @@ function PCBOrderPage() {
   const [specs, setSpecs] = useState({ layers:"2", qty:"10", finish:"HASL (Lead-free)", color:"Green", copper:"1 oz", thickness:"1.6mm" });
   const [step, setStep] = useState(1);
   const [express, setExpress] = useState(false);
+  const [deliveryFormat, setDeliveryFormat] = useState<"INDIVIDUAL" | "PANEL_BY_CUSTOMER" | "PANEL_BY_PROPCB">("INDIVIDUAL");
   const [analyzing, setAnalyzing] = useState(false);
   const [analysis, setAnalysis] = useState<GerberQuoteAnalysis | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
@@ -1044,6 +1045,7 @@ function PCBOrderPage() {
             copperWeight: specs.copper,
             thickness: specs.thickness,
             express,
+            deliveryFormat,
           }),
         });
         if (!res.ok) throw new Error('Quote request failed');
@@ -1056,7 +1058,7 @@ function PCBOrderPage() {
       }
     }, 300);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [hasValidDims, widthMm, heightMm, specs.layers, specs.qty, specs.finish, specs.copper, specs.thickness, express]);
+  }, [hasValidDims, widthMm, heightMm, specs.layers, specs.qty, specs.finish, specs.copper, specs.thickness, express, deliveryFormat]);
 
   async function extractEntries(f: File): Promise<{ name: string; content: string }[]> {
     if (f.name.toLowerCase().endsWith('.zip')) {
@@ -1140,6 +1142,7 @@ function PCBOrderPage() {
           copperWeight: specs.copper,
           thickness: specs.thickness,
           express,
+          deliveryFormat,
           placeOrder,
         }),
       });
@@ -1320,6 +1323,50 @@ function PCBOrderPage() {
                     <div style={{ position:"absolute", top:3, left:express?22:3, width:20, height:20, borderRadius:"50%", background:"#fff", transition:"left 0.2s" }}/>
                   </div>
                 </div>
+
+                {/* Delivery format */}
+                <div style={{ marginTop:16, padding:"14px 16px", background:C.bg3, borderRadius:10, border:`1px solid ${C.border}` }}>
+                  <div style={{ fontSize:11, fontWeight:700, color:C.text2, letterSpacing:1, marginBottom:10, fontFamily:"'DM Mono',monospace" }}>DELIVERY FORMAT</div>
+                  <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom: deliveryFormat!=="INDIVIDUAL" ? 12 : 0 }}>
+                    {([
+                      ["INDIVIDUAL","Individual PCBs"],
+                      ["PANEL_BY_CUSTOMER","Panelized"],
+                    ] as const).map(([key,label])=>{
+                      const selected = key === "INDIVIDUAL" ? deliveryFormat === "INDIVIDUAL" : deliveryFormat !== "INDIVIDUAL";
+                      return (
+                        <button key={key}
+                          onClick={()=>setDeliveryFormat(key === "INDIVIDUAL" ? "INDIVIDUAL" : "PANEL_BY_CUSTOMER")}
+                          style={{ padding:"6px 13px", borderRadius:7, border:`1.5px solid ${selected?C.accent:C.border}`, background:selected?C.accentDim:C.bg2, color:selected?C.accent2:C.text1, fontSize:12, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight:selected?700:400, transition:"all 0.15s" }}>
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {deliveryFormat !== "INDIVIDUAL" && (
+                    <div>
+                      <div style={{ fontSize:11, color:C.text2, marginBottom:8, fontFamily:"'DM Sans',sans-serif" }}>Who panelizes the design?</div>
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                        {([
+                          ["PANEL_BY_CUSTOMER","Panel by Customer","You upload a pre-panelized Gerber design"],
+                          ["PANEL_BY_PROPCB","Panel by ProPCB","Our team panelizes it for you · fixed service fee"],
+                        ] as const).map(([key,label,desc])=>{
+                          const selected = deliveryFormat === key;
+                          return (
+                            <button key={key} onClick={()=>setDeliveryFormat(key)} title={desc}
+                              style={{ padding:"6px 13px", borderRadius:7, border:`1.5px solid ${selected?C.accent:C.border}`, background:selected?C.accentDim:C.bg2, color:selected?C.accent2:C.text1, fontSize:12, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight:selected?700:400, transition:"all 0.15s" }}>
+                              {label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div style={{ fontSize:11, color:C.text2, marginTop:8, fontFamily:"'DM Sans',sans-serif" }}>
+                        {deliveryFormat === "PANEL_BY_PROPCB"
+                          ? "Our engineers will panelize your design — a fixed service fee applies, shown in the quote."
+                          : "Upload your Gerbers as an already-panelized set — no extra fee."}
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
             </Card>
           </div>
@@ -1356,7 +1403,9 @@ function PCBOrderPage() {
                   ["Copper weight", specs.copper],
                   ["Board thickness", specs.thickness],
                   ["Lead time", express?"2–3 days (Express)":"5–7 working days"],
+                  ["Delivery format", deliveryFormat === "INDIVIDUAL" ? "Individual PCBs" : deliveryFormat === "PANEL_BY_CUSTOMER" ? "Panelized (by you)" : "Panelized (by ProPCB)"],
                   ["Setup / tooling fee", quote ? `₹${quote.toolingCharge.toLocaleString()}` : "—"],
+                  ...(deliveryFormat === "PANEL_BY_PROPCB" ? [["Panelization service fee", quote ? `₹${quote.panelizationCharge.toLocaleString()}` : "—"]] : []),
                   ["DRC check", "Manual review before production"],
                 ].map(([k,v])=>(
                   <div key={k} style={{ display:"flex", justifyContent:"space-between", marginBottom:9, fontSize:12.5 }}>

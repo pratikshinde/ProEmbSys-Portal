@@ -6,12 +6,12 @@
  *
  * Formula (additive, per the business requirement): tooling charge + base
  * price + copper thickness + surface finish + substrate thickness + lead
- * time + qty slab discount. Layer count is a cost driver of both TOOLING and
- * BASE (a 4-layer board costs more to tool and more per cm² than a 2-layer
- * board) rather than a separate additive term.
+ * time + panelization charge + qty slab discount. Layer count is a cost
+ * driver of both TOOLING and BASE (a 4-layer board costs more to tool and
+ * more per cm² than a 2-layer board) rather than a separate additive term.
  */
 
-import type { PricingRate } from "@prisma/client"
+import type { PricingRate, DeliveryFormat } from "@prisma/client"
 
 export type PricingRatesMap = Record<string, Record<string, { value: number; unit: string }>>
 
@@ -36,6 +36,7 @@ export interface PcbQuoteInputV2 {
   copperWeight: string
   thickness: string
   express: boolean
+  deliveryFormat: DeliveryFormat
 }
 
 export interface RateUsed {
@@ -53,6 +54,7 @@ export interface PcbQuoteBreakdownV2 {
   surfaceFinishSurcharge: number
   substrateThicknessSurcharge: number
   leadTimeSurcharge: number
+  panelizationCharge: number // flat fee, only nonzero for PANEL_BY_PROPCB
   qtySlabDiscount: number // negative or zero — modeled as an addend so the whole formula stays one legible sum
   total: number
   ratesUsed: RateUsed[]
@@ -89,6 +91,7 @@ export function calculatePcbQuoteV2(input: PcbQuoteInputV2, rates: PricingRatesM
   const substratePct = lookupRate(rates, "SUBSTRATE_THICKNESS", input.thickness, ratesUsed)
   const leadTimePct = lookupRate(rates, "LEAD_TIME", input.express ? "express" : "standard", ratesUsed)
   const qtySlabPct = lookupRate(rates, "QTY_SLAB", String(qty), ratesUsed)
+  const panelizationCharge = lookupRate(rates, "PANELIZATION", input.deliveryFormat, ratesUsed)
 
   const copperThicknessSurcharge = basePrice * (copperPct / 100)
   const surfaceFinishSurcharge = basePrice * (finishPct / 100)
@@ -96,7 +99,13 @@ export function calculatePcbQuoteV2(input: PcbQuoteInputV2, rates: PricingRatesM
   const leadTimeSurcharge = basePrice * (leadTimePct / 100)
 
   const subtotal =
-    toolingCharge + basePrice + copperThicknessSurcharge + surfaceFinishSurcharge + substrateThicknessSurcharge + leadTimeSurcharge
+    toolingCharge +
+    basePrice +
+    copperThicknessSurcharge +
+    surfaceFinishSurcharge +
+    substrateThicknessSurcharge +
+    leadTimeSurcharge +
+    panelizationCharge
 
   const qtySlabDiscount = -(subtotal * (qtySlabPct / 100))
   const total = Math.round(subtotal + qtySlabDiscount)
@@ -109,6 +118,7 @@ export function calculatePcbQuoteV2(input: PcbQuoteInputV2, rates: PricingRatesM
     surfaceFinishSurcharge,
     substrateThicknessSurcharge,
     leadTimeSurcharge,
+    panelizationCharge,
     qtySlabDiscount,
     total,
     ratesUsed,

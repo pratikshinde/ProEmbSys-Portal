@@ -58,6 +58,13 @@ const rows: SeedRow[] = [
   { category: "QTY_SLAB", key: "100", label: "Qty 100", value: 0, unit: "PERCENT_DISCOUNT", sortOrder: 4 },
   { category: "QTY_SLAB", key: "250", label: "Qty 250", value: 0, unit: "PERCENT_DISCOUNT", sortOrder: 5 },
   { category: "QTY_SLAB", key: "500", label: "Qty 500", value: 0, unit: "PERCENT_DISCOUNT", sortOrder: 6 },
+
+  // PANELIZATION — flat INR fee by delivery format. Individual/customer-panelized
+  // are free; ProPCB-panelized carries a fixed service charge (placeholder,
+  // tune the real value at /admin/pricing).
+  { category: "PANELIZATION", key: "INDIVIDUAL", label: "Individual PCBs", value: 0, unit: "INR_FLAT", sortOrder: 0 },
+  { category: "PANELIZATION", key: "PANEL_BY_CUSTOMER", label: "Panel by Customer", value: 0, unit: "INR_FLAT", sortOrder: 1 },
+  { category: "PANELIZATION", key: "PANEL_BY_PROPCB", label: "Panel by ProPCB (service fee)", value: 500, unit: "INR_FLAT", sortOrder: 2 },
 ]
 
 async function main() {

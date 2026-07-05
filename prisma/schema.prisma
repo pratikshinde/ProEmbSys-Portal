@@ -97,6 +97,7 @@ enum PricingCategory {
   SUBSTRATE_THICKNESS
   LEAD_TIME
   QTY_SLAB
+  PANELIZATION
 }
 
 // One row = one resolvable rate for one (category, key) pair. Single generic
@@ -130,11 +131,23 @@ enum OrderStatus {
   CANCELLED
 }
 
+// How the fabricated boards should be delivered:
+// - INDIVIDUAL: single boards, no panelization (default, existing behavior)
+// - PANEL_BY_CUSTOMER: customer supplies an already-panelized Gerber set
+// - PANEL_BY_PROPCB: we panelize on the customer's behalf, for a fixed fee
+//   (PricingRate category PANELIZATION, admin-editable)
+enum DeliveryFormat {
+  INDIVIDUAL
+  PANEL_BY_CUSTOMER
+  PANEL_BY_PROPCB
+}
+
 model Order {
-  id           String      @id @default(cuid())
-  reference    String      @unique // short human-facing ref (id prefix, uppercased)
-  userId       String
-  status       OrderStatus @default(QUOTE)
+  id             String         @id @default(cuid())
+  reference      String         @unique // short human-facing ref (id prefix, uppercased)
+  userId         String
+  status         OrderStatus    @default(QUOTE)
+  deliveryFormat DeliveryFormat @default(INDIVIDUAL)
 
   fileName     String?
   widthMm      Decimal     @db.Decimal(10, 2)

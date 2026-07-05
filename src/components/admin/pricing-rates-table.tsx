@@ -26,6 +26,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   SUBSTRATE_THICKNESS: "Substrate Thickness",
   LEAD_TIME: "Lead Time",
   QTY_SLAB: "Quantity Slabs",
+  PANELIZATION: "Panelization",
 }
 
 function RateRow({ rate }: { rate: PricingRateRow }) {
