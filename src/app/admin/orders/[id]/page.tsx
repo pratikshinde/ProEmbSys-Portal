@@ -3,6 +3,7 @@ import { db } from "@/lib/db"
 import MessageThread from "@/components/messaging/message-thread"
 import OrderStatusControl from "@/components/admin/order-status-control"
 import { asAddressSnapshot, formatAddressSnapshot } from "@/lib/format-address"
+import { SOLDER_MASK_SWATCH } from "@/lib/solder-mask-colors"
 
 export default async function AdminOrderDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -24,6 +25,14 @@ export default async function AdminOrderDetailPage({ params }: { params: Promise
           {order.widthMm.toString()} × {order.heightMm.toString()} mm · {order.layers} layers
         </h1>
         <div className="text-sm text-muted-foreground">{order.user.name || order.user.email}</div>
+        <div className="text-sm text-muted-foreground">
+          Placed on{" "}
+          {order.createdAt.toLocaleString("en-IN", {
+            dateStyle: "medium",
+            timeStyle: "short",
+            timeZone: "Asia/Kolkata",
+          })}
+        </div>
       </div>
 
       <div className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-card p-5 text-sm">
@@ -46,12 +55,31 @@ export default async function AdminOrderDetailPage({ params }: { params: Promise
           <div className="font-medium text-foreground">{order.finish}</div>
         </div>
         <div>
+          <span className="text-muted-foreground">Solder mask</span>
+          <div className="mt-1">
+            <span
+              className="inline-block rounded-md px-2 py-0.5 text-xs font-semibold"
+              style={
+                SOLDER_MASK_SWATCH[order.color]
+                  ? { backgroundColor: SOLDER_MASK_SWATCH[order.color].bg, color: SOLDER_MASK_SWATCH[order.color].text }
+                  : undefined
+              }
+            >
+              {order.color}
+            </span>
+          </div>
+        </div>
+        <div>
           <span className="text-muted-foreground">Copper weight</span>
           <div className="font-medium text-foreground">{order.copperWeight}</div>
         </div>
         <div>
           <span className="text-muted-foreground">Board thickness</span>
           <div className="font-medium text-foreground">{order.thickness}</div>
+        </div>
+        <div>
+          <span className="text-muted-foreground">Lead time</span>
+          <div className="font-medium text-foreground">{order.express ? "Express (2–3 days)" : "Standard (5–7 days)"}</div>
         </div>
         <div>
           <span className="text-muted-foreground">Delivery format</span>

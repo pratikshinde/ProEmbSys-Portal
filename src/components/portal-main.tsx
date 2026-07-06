@@ -18,6 +18,7 @@ import Link from 'next/link';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import type { AddressRecord } from '@/components/account/account-client';
+import { SOLDER_MASK_SWATCH } from '@/lib/solder-mask-colors';
 
 
 // ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
@@ -59,17 +60,6 @@ const PCB_SPECS = {
   color:   ["Green","Black","Blue","Red","White","Yellow"],
   copper:  ["1 oz","2 oz","3 oz"],
   thickness:["0.8mm","1.0mm","1.2mm","1.6mm","2.0mm"],
-};
-
-// Real solder-mask swatch colors, keyed off PCB_SPECS.color — selecting a
-// color pill fills it with the actual color instead of the generic accent.
-const SOLDER_MASK_SWATCH: Record<string, { bg: string; text: string }> = {
-  Green:  { bg:"#1f7a3d", text:"#ffffff" },
-  Black:  { bg:"#1a1a1a", text:"#ffffff" },
-  Blue:   { bg:"#1857a4", text:"#ffffff" },
-  Red:    { bg:"#b3261e", text:"#ffffff" },
-  White:  { bg:"#e8e6df", text:"#1a1a1a" },
-  Yellow: { bg:"#d9a91a", text:"#1a1a1a" },
 };
 
 const PRODUCTS = [
