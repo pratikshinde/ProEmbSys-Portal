@@ -21,10 +21,24 @@ export default async function AdminLayout({ children }: { children: React.ReactN
             <Link href="/admin/orders" className="text-muted-foreground hover:text-primary">
               Orders
             </Link>
+            <Link href="/admin/blog" className="text-muted-foreground hover:text-primary">
+              Blog
+            </Link>
+            <Link href="/admin/products" className="text-muted-foreground hover:text-primary">
+              Products
+            </Link>
+            <Link href="/admin/testimonials" className="text-muted-foreground hover:text-primary">
+              Testimonials
+            </Link>
             {session.user.role === "ADMIN" && (
-              <Link href="/admin/pricing" className="text-muted-foreground hover:text-primary">
-                Pricing
-              </Link>
+              <>
+                <Link href="/admin/team" className="text-muted-foreground hover:text-primary">
+                  Team
+                </Link>
+                <Link href="/admin/pricing" className="text-muted-foreground hover:text-primary">
+                  Pricing
+                </Link>
+              </>
             )}
           </nav>
           <Link href="/" className="ml-auto text-sm text-muted-foreground hover:text-primary">

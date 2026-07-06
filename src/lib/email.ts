@@ -11,8 +11,17 @@ function getResendClient() {
 
 const FROM = process.env.EMAIL_FROM ?? "ProPCB <noreply@propcb.local>"
 
+// The Resend SDK does NOT throw on API-level failures (e.g. an invalid or
+// placeholder API key) — send() resolves with { data, error } either way.
+// Callers rely on a thrown error to detect "email didn't actually go out"
+// (e.g. the staff-creation flow's emailSent fallback), so surface `error`
+// as a real exception here rather than letting it pass silently.
+function throwIfFailed(result: { error: { message: string } | null }) {
+  if (result.error) throw new Error(result.error.message)
+}
+
 export async function sendPasswordResetEmail(to: string, resetUrl: string) {
-  await getResendClient().emails.send({
+  const result = await getResendClient().emails.send({
     from: FROM,
     to,
     subject: "Reset your ProPCB password",
@@ -22,4 +31,18 @@ export async function sendPasswordResetEmail(to: string, resetUrl: string) {
       <p>If you didn't request this, you can safely ignore this email.</p>
     `,
   })
+  throwIfFailed(result)
+}
+
+export async function sendStaffWelcomeEmail(to: string, role: string, setPasswordUrl: string) {
+  const result = await getResendClient().emails.send({
+    from: FROM,
+    to,
+    subject: "You've been added to the ProPCB team",
+    html: `
+      <p>An admin has created a ProPCB staff account for you with the role <strong>${role}</strong>.</p>
+      <p><a href="${setPasswordUrl}">Click here to set your password</a> — this link expires in 1 hour.</p>
+    `,
+  })
+  throwIfFailed(result)
 }

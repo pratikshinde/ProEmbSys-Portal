@@ -2,16 +2,28 @@ import Link from "next/link"
 import { db } from "@/lib/db"
 
 export default async function AdminDashboardPage() {
-  const [totalOrders, pendingReview, totalUsers] = await Promise.all([
+  const [totalOrders, pendingReview, totalUsers, totalStaff, totalBlogPosts, totalProducts, totalTestimonials] = await Promise.all([
     db.order.count(),
     db.order.count({ where: { status: "PENDING_REVIEW" } }),
     db.user.count(),
+    db.user.count({ where: { role: { in: ["ADMIN", "ENGINEER"] }, isActive: true } }),
+    db.blogPost.count(),
+    db.product.count(),
+    db.testimonial.count(),
   ])
 
   const stats = [
     { label: "Total orders", value: totalOrders },
     { label: "Awaiting review", value: pendingReview },
     { label: "Registered users", value: totalUsers },
+  ]
+
+  const quickLinks = [
+    { href: "/admin/orders", label: "Orders", count: totalOrders },
+    { href: "/admin/team", label: "Team", count: totalStaff },
+    { href: "/admin/blog", label: "Blog Posts", count: totalBlogPosts },
+    { href: "/admin/products", label: "Shop Products", count: totalProducts },
+    { href: "/admin/testimonials", label: "Testimonials", count: totalTestimonials },
   ]
 
   return (
@@ -25,10 +37,17 @@ export default async function AdminDashboardPage() {
           </div>
         ))}
       </div>
-      <div className="flex gap-4">
-        <Link href="/admin/orders" className="text-primary hover:underline">
-          View all orders &rarr;
-        </Link>
+      <div className="grid grid-cols-3 gap-3">
+        {quickLinks.map((l) => (
+          <Link
+            key={l.href}
+            href={l.href}
+            className="flex items-center justify-between rounded-lg border border-border bg-card p-4 hover:border-primary"
+          >
+            <span className="text-sm font-medium text-foreground">{l.label}</span>
+            <span className="text-sm text-muted-foreground">{l.count}</span>
+          </Link>
+        ))}
       </div>
     </div>
   )

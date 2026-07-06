@@ -62,26 +62,6 @@ const PCB_SPECS = {
   thickness:["0.8mm","1.0mm","1.2mm","1.6mm","2.0mm"],
 };
 
-const PRODUCTS = [
-  { name:"ESP32-S3 DevKit Pro",     price:"₹849",  tag:"In Stock", cat:"Microcontroller", icon:"🔲" },
-  { name:"RP2040 Nano Board",       price:"₹399",  tag:"In Stock", cat:"Microcontroller", icon:"🔳" },
-  { name:"STM32F4 Breakout Shield", price:"₹1,199",tag:"Low Stock",cat:"Microcontroller", icon:"◼" },
-  { name:"CAN Bus Transceiver Mod", price:"₹649",  tag:"In Stock", cat:"Interface",       icon:"◻" },
-  { name:"2.4GHz RF Transceiver",   price:"₹299",  tag:"In Stock", cat:"RF / Wireless",  icon:"◈" },
-  { name:"LiPo Charge Controller",  price:"₹549",  tag:"In Stock", cat:"Power",           icon:"⬡" },
-  { name:"BME280 Sensor Board",     price:"₹349",  tag:"In Stock", cat:"Sensors",         icon:"◉" },
-  { name:"0.96″ OLED Display",      price:"₹199",  tag:"Low Stock",cat:"Displays",        icon:"▣" },
-];
-
-const BLOG_POSTS = [
-  { title:"4-layer PCB stack-up design for EMC compliance",       date:"May 8, 2026",  tag:"Design Tips",    mins:7 },
-  { title:"PCB panelization best practices for SMT reflow",       date:"Apr 29, 2026", tag:"Manufacturing",  mins:5 },
-  { title:"Choosing the right surface finish for your board",     date:"Apr 14, 2026", tag:"Materials",      mins:4 },
-  { title:"Gerber file formats: RS-274X vs. Gerber X2 explained", date:"Mar 31, 2026", tag:"Basics",         mins:6 },
-  { title:"Impedance control in high-speed PCB design",           date:"Mar 18, 2026", tag:"Advanced",       mins:9 },
-  { title:"How we achieve 99.4% first-pass yield at ProEmbSys",   date:"Mar 5, 2026",  tag:"Case Study",     mins:6 },
-];
-
 // ─── SHARED UI COMPONENTS ─────────────────────────────────────────────────────
 
 function Btn({ children, variant="primary", onClick, style={}, full=false, disabled=false }: { children: React.ReactNode; variant?: "primary" | "outline" | "ghost" | "dark" | "gold"; onClick?: any; style?: React.CSSProperties; full?: boolean; disabled?: boolean }) {
@@ -337,12 +317,21 @@ function PCBSchematic() {
 function HomePage({ setPage }) {
   const [activeService, setActiveService] = useState(0);
   const [tick, setTick] = useState(0);
+  const [homeBlogPosts, setHomeBlogPosts] = useState<BlogPostSummary[]>([]);
+  const [homeProducts, setHomeProducts] = useState<ProductSummary[]>([]);
+  const [testimonials, setTestimonials] = useState<TestimonialSummary[]>([]);
 
   // Animate stat counters on mount
   useEffect(()=>{
     const t = setInterval(()=> setTick(n => n < 60 ? n+1 : n), 22);
     return ()=>clearInterval(t);
   },[]);
+
+  useEffect(() => {
+    fetch("/api/blog").then(res => res.ok ? res.json() : []).then(setHomeBlogPosts).catch(()=>{});
+    fetch("/api/products").then(res => res.ok ? res.json() : []).then(setHomeProducts).catch(()=>{});
+    fetch("/api/testimonials").then(res => res.ok ? res.json() : []).then(setTestimonials).catch(()=>{});
+  }, []);
 
   const ease = (t) => t < 1 ? t*t*(3-2*t) : 1;
   const prog = ease(Math.min(tick/60,1));
@@ -779,8 +768,8 @@ function HomePage({ setPage }) {
 
           {/* Featured + grid layout */}
           <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:16 }}>
-            {PRODUCTS.slice(0,4).map((p,i)=>(
-              <div key={i} onClick={()=>setPage("shop")}
+            {homeProducts.slice(0,4).map((p,i)=>(
+              <div key={p.id} onClick={()=>setPage("shop")}
                 style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:14,
                   overflow:"hidden", cursor:"pointer", transition:"all 0.2s",
                   ...(i===0 ? { gridColumn:"span 2" } : {}),
@@ -793,17 +782,17 @@ function HomePage({ setPage }) {
                   {p.icon}
                   <span style={{ position:"absolute", top:10, right:10 }}>
                     <span style={{ fontSize:10, fontWeight:700,
-                      background: p.tag==="In Stock"?"rgba(16,185,129,0.15)":"rgba(245,158,11,0.15)",
-                      color: p.tag==="In Stock"?C.green:C.gold,
+                      background: p.stockStatus==="IN_STOCK"?"rgba(16,185,129,0.15)":"rgba(245,158,11,0.15)",
+                      color: p.stockStatus==="IN_STOCK"?C.green:C.gold,
                       padding:"3px 9px", borderRadius:20, fontFamily:"'DM Mono',monospace", letterSpacing:0.5 }}>
-                      {p.tag}
+                      {STOCK_TAG[p.stockStatus].label}
                     </span>
                   </span>
                 </div>
                 <div style={{ padding:"14px 18px" }}>
                   <div style={{ fontSize:10, color:C.text3, fontWeight:700,
                     fontFamily:"'DM Mono',monospace", marginBottom:5, letterSpacing:1 }}>
-                    {p.cat.toUpperCase()}
+                    {p.category.toUpperCase()}
                   </div>
                   <div style={{ fontSize: i===0?16:13, fontWeight:600, color:C.text0,
                     marginBottom:10, lineHeight:1.35, fontFamily:"'DM Sans',sans-serif" }}>
@@ -811,7 +800,7 @@ function HomePage({ setPage }) {
                   </div>
                   <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                     <span style={{ fontSize: i===0?20:16, fontWeight:800, color:"#a78bfa",
-                      fontFamily:"'DM Sans',sans-serif" }}>{p.price}</span>
+                      fontFamily:"'DM Sans',sans-serif" }}>₹{Number(p.price).toLocaleString()}</span>
                     <span style={{ fontSize:12, color:"#a78bfa", fontWeight:600 }}>Add →</span>
                   </div>
                 </div>
@@ -867,13 +856,15 @@ function HomePage({ setPage }) {
                 </div>
                 <h3 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:26, fontWeight:800,
                   color:C.text0, margin:"0 0 16px", lineHeight:1.3, letterSpacing:"-0.5px" }}>
-                  The complete guide to PCB impedance control for high-speed designs
+                  {homeBlogPosts[0]?.title ?? "Loading…"}
                 </h3>
                 <p style={{ fontSize:14, color:C.text1, lineHeight:1.75, margin:"0 0 28px", maxWidth:520 }}>
-                  At GHz frequencies, trace geometry becomes as critical as component selection. From microstrip to stripline, our RF engineers explain it all.
+                  {homeBlogPosts[0]?.excerpt ?? ""}
                 </p>
                 <div style={{ display:"flex", alignItems:"center", gap:16 }}>
-                  <span style={{ fontSize:12, color:C.text3, fontFamily:"'DM Mono',monospace" }}>May 10, 2026 · 12 min read</span>
+                  <span style={{ fontSize:12, color:C.text3, fontFamily:"'DM Mono',monospace" }}>
+                    {homeBlogPosts[0] ? `${new Date(homeBlogPosts[0].createdAt).toLocaleDateString("en-IN",{dateStyle:"long"})} · ${homeBlogPosts[0].readMinutes} min read` : ""}
+                  </span>
                   <button onClick={()=>setPage("blog")} style={{
                     background:"transparent", color:C.gold,
                     border:`1px solid rgba(245,158,11,0.35)`,
@@ -886,30 +877,32 @@ function HomePage({ setPage }) {
 
             {/* Side post list */}
             <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
-              {BLOG_POSTS.slice(0,4).map((p,i)=>(
-                <div key={i} onClick={()=>setPage("blog")}
-                  style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:12,
-                    padding:"16px 18px", cursor:"pointer", transition:"all 0.2s",
-                    display:"flex", gap:14, alignItems:"flex-start",
-                    borderLeft:`3px solid ${[C.accent,C.gold,C.green,"#a78bfa"][i]}`,
-                  }}
-                  onMouseEnter={e=>{ e.currentTarget.style.background=C.bg3; }}
-                  onMouseLeave={e=>{ e.currentTarget.style.background=C.bg2; }}>
-                  <div style={{ flex:1 }}>
-                    <div style={{ fontSize:10, fontWeight:700, fontFamily:"'DM Mono',monospace",
-                      color:[C.accent,C.gold,C.green,"#a78bfa"][i], letterSpacing:1, marginBottom:5 }}>
-                      {p.tag.toUpperCase()}
+              {homeBlogPosts.slice(1,5).map((p,i)=>(
+                <a key={p.id} href={`/blog/${p.slug}`} style={{ textDecoration:"none" }}>
+                  <div
+                    style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:12,
+                      padding:"16px 18px", cursor:"pointer", transition:"all 0.2s",
+                      display:"flex", gap:14, alignItems:"flex-start",
+                      borderLeft:`3px solid ${[C.accent,C.gold,C.green,"#a78bfa"][i]}`,
+                    }}
+                    onMouseEnter={e=>{ e.currentTarget.style.background=C.bg3; }}
+                    onMouseLeave={e=>{ e.currentTarget.style.background=C.bg2; }}>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontSize:10, fontWeight:700, fontFamily:"'DM Mono',monospace",
+                        color:[C.accent,C.gold,C.green,"#a78bfa"][i], letterSpacing:1, marginBottom:5 }}>
+                        {p.tag.toUpperCase()}
+                      </div>
+                      <div style={{ fontSize:13, fontWeight:600, color:C.text0,
+                        lineHeight:1.4, marginBottom:5, fontFamily:"'DM Sans',sans-serif" }}>
+                        {p.title}
+                      </div>
+                      <div style={{ fontSize:11, color:C.text3, fontFamily:"'DM Mono',monospace" }}>
+                        {new Date(p.createdAt).toLocaleDateString("en-IN",{dateStyle:"medium"})} · {p.readMinutes} min
+                      </div>
                     </div>
-                    <div style={{ fontSize:13, fontWeight:600, color:C.text0,
-                      lineHeight:1.4, marginBottom:5, fontFamily:"'DM Sans',sans-serif" }}>
-                      {p.title}
-                    </div>
-                    <div style={{ fontSize:11, color:C.text3, fontFamily:"'DM Mono',monospace" }}>
-                      {p.date} · {p.mins} min
-                    </div>
+                    <span style={{ fontSize:14, color:C.text3, flexShrink:0, paddingTop:2 }}>→</span>
                   </div>
-                  <span style={{ fontSize:14, color:C.text3, flexShrink:0, paddingTop:2 }}>→</span>
-                </div>
+                </a>
               ))}
             </div>
           </div>
@@ -940,6 +933,33 @@ function HomePage({ setPage }) {
           </div>
         </div>
       </section>
+
+      {/* ═══════════════════════════════════════════════════
+          TESTIMONIALS — customer quotes
+      ═══════════════════════════════════════════════════ */}
+      {testimonials.length > 0 && (
+        <section style={{ background:C.bg1, padding:"80px 48px", borderBottom:`1px solid ${C.border}` }}>
+          <div style={{ maxWidth:1100, margin:"0 auto" }}>
+            <div style={{ textAlign:"center", marginBottom:48 }}>
+              <SectionLabel>WHAT CUSTOMERS SAY</SectionLabel>
+              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:36, fontWeight:800,
+                color:C.text0, margin:"8px 0 0", letterSpacing:"-0.8px" }}>
+                Trusted by engineers and teams across India
+              </h2>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(280px, 1fr))", gap:20 }}>
+              {testimonials.slice(0,6).map(t=>(
+                <div key={t.id} style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:14, padding:"26px" }}>
+                  <div style={{ color:C.gold, fontSize:15, letterSpacing:2, marginBottom:14 }}>{"★".repeat(t.rating)}{"☆".repeat(5-t.rating)}</div>
+                  <p style={{ color:C.text1, fontSize:14, lineHeight:1.75, margin:"0 0 20px" }}>&ldquo;{t.quote}&rdquo;</p>
+                  <div style={{ fontSize:13, fontWeight:700, color:C.text0, fontFamily:"'DM Sans',sans-serif" }}>{t.customerName}</div>
+                  {t.customerTitle && <div style={{ fontSize:12, color:C.text3, marginTop:2 }}>{t.customerTitle}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* ═══════════════════════════════════════════════════
           CTA BANNER — full-width conversion section
@@ -1152,6 +1172,58 @@ function PCBOrderPage() {
   function formatAddress(a: AddressRecord) {
     return `${a.label ? a.label + " — " : ""}${a.line1}, ${a.city}, ${a.state} ${a.postalCode}`;
   }
+
+  // Reorder: /orders/[id]'s "Reorder this board" button lands here via
+  // /?page=order&reorder=<id>. Pre-fills specs from the past order, then
+  // re-uploads its stored Gerber file through the normal handleFile() path
+  // so it's re-analyzed exactly like a fresh upload — everything below
+  // stays editable, since the customer may want to change details (e.g.
+  // solder mask color) before placing the new order.
+  useEffect(() => {
+    if (sessionStatus !== "authenticated") return;
+    const reorderId = new URLSearchParams(window.location.search).get("reorder");
+    if (!reorderId) return;
+
+    (async () => {
+      const res = await fetch(`/api/orders/${reorderId}`);
+      if (!res.ok) {
+        toast({ title: "Couldn't load that order", description: "It may no longer be available." });
+        return;
+      }
+      const old = await res.json();
+
+      setSpecs({
+        layers: old.layers,
+        qty: String(old.qty),
+        finish: old.finish,
+        color: old.color,
+        copper: old.copperWeight,
+        thickness: old.thickness,
+      });
+      setExpress(!!old.express);
+      setDeliveryFormat(old.deliveryFormat);
+      setWidth(String(old.widthMm));
+      setHeight(String(old.heightMm));
+      setDimsAutoFilled(false);
+
+      if (old.gerberFilePath) {
+        try {
+          const fileRes = await fetch(`/api/orders/${reorderId}/file`);
+          if (fileRes.ok) {
+            const blob = await fileRes.blob();
+            const reorderedFile = new File([blob], old.fileName ?? "gerbers.zip", { type: blob.type });
+            await handleFile(reorderedFile);
+          }
+        } catch {
+          // Specs are still pre-filled even if the file re-fetch fails —
+          // the customer can just re-upload manually.
+        }
+      }
+
+      toast({ title: `Reordering from ${old.reference}`, description: "Review the specs and Gerber file below — change anything you like before placing the order." });
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionStatus]);
 
   async function submitOrder(placeOrder: boolean) {
     if (sessionStatus !== "authenticated") {
@@ -1795,12 +1867,36 @@ function AssemblyPage() {
 
 // ─── SHOP PAGE ────────────────────────────────────────────────────────────────
 
+interface ProductSummary {
+  id: string;
+  name: string;
+  price: number | string;
+  category: string;
+  icon: string;
+  stockStatus: "IN_STOCK" | "LOW_STOCK" | "OUT_OF_STOCK";
+}
+
+const STOCK_TAG: Record<ProductSummary["stockStatus"], { label: string; color: string }> = {
+  IN_STOCK: { label:"In Stock", color:"green" },
+  LOW_STOCK: { label:"Low Stock", color:"gold" },
+  OUT_OF_STOCK: { label:"Out of Stock", color:"gray" },
+};
+
 function ShopPage() {
   const [cart, setCart] = useState<Record<string, number>>({});
   const [filter, setFilter] = useState("All");
-  const cats = ["All","Microcontroller","Interface","RF / Wireless","Power","Sensors","Displays"];
+  const [products, setProducts] = useState<ProductSummary[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const visible = PRODUCTS.filter(p=>filter==="All"||p.cat===filter);
+  useEffect(() => {
+    fetch("/api/products")
+      .then(res => res.ok ? res.json() : [])
+      .then(setProducts)
+      .finally(() => setLoading(false));
+  }, []);
+
+  const cats = ["All", ...Array.from(new Set(products.map(p => p.category)))];
+  const visible = products.filter(p=>filter==="All"||p.category===filter);
 
   return (
     <div style={{ minHeight:"100vh", background:C.bg1, padding:"40px" }}>
@@ -1823,33 +1919,42 @@ function ShopPage() {
           ))}
         </div>
 
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(215px, 1fr))", gap:18 }}>
-          {visible.map((p,i)=>{
-            const idx = PRODUCTS.indexOf(p);
-            return (
-              <div key={i} style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:14, overflow:"hidden", transition:"all 0.2s" }}
-                onMouseEnter={e=>{ e.currentTarget.style.borderColor=C.accent; e.currentTarget.style.boxShadow=`0 4px 24px ${C.accentGlow}`; e.currentTarget.style.transform="translateY(-3px)"; }}
-                onMouseLeave={e=>{ e.currentTarget.style.borderColor=C.border; e.currentTarget.style.boxShadow="none"; e.currentTarget.style.transform="none"; }}>
-                <div style={{ height:120, background:C.bg3, display:"flex", alignItems:"center", justifyContent:"center", fontSize:50, position:"relative" }}>
-                  {p.icon}
-                  <span style={{ position:"absolute", top:10, right:10 }}>
-                    <Tag color={p.tag==="In Stock"?"green":"gold"}>{p.tag}</Tag>
-                  </span>
-                </div>
-                <div style={{ padding:"14px 16px" }}>
-                  <div style={{ fontSize:10, color:C.text3, fontWeight:700, fontFamily:"'DM Mono',monospace", marginBottom:6, letterSpacing:1 }}>{p.cat.toUpperCase()}</div>
-                  <div style={{ fontSize:14, fontWeight:600, color:C.text0, marginBottom:12, lineHeight:1.4, fontFamily:"'DM Sans',sans-serif" }}>{p.name}</div>
-                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                    <span style={{ fontSize:18, fontWeight:800, color:C.accent2, fontFamily:"'DM Sans',sans-serif" }}>{p.price}</span>
-                    <button onClick={()=>setCart(c=>({...c,[idx]:(c[idx]||0)+1}))} style={{ background:cart[idx]?C.green:C.accentDim, color:cart[idx]?"#fff":C.accent2, border:`1.5px solid ${cart[idx]?C.green:C.border2}`, padding:"7px 14px", borderRadius:8, fontSize:13, cursor:"pointer", fontWeight:700, fontFamily:"'DM Sans',sans-serif", transition:"all 0.2s" }}>
-                      {cart[idx]?`✓ ${cart[idx]} added`:"+ Add"}
-                    </button>
+        {loading ? (
+          <p style={{ color:C.text2, fontSize:14 }}>Loading products…</p>
+        ) : products.length === 0 ? (
+          <p style={{ color:C.text2, fontSize:14 }}>No products available yet.</p>
+        ) : (
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(215px, 1fr))", gap:18 }}>
+            {visible.map((p)=>{
+              const stock = STOCK_TAG[p.stockStatus];
+              return (
+                <div key={p.id} style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:14, overflow:"hidden", transition:"all 0.2s" }}
+                  onMouseEnter={e=>{ e.currentTarget.style.borderColor=C.accent; e.currentTarget.style.boxShadow=`0 4px 24px ${C.accentGlow}`; e.currentTarget.style.transform="translateY(-3px)"; }}
+                  onMouseLeave={e=>{ e.currentTarget.style.borderColor=C.border; e.currentTarget.style.boxShadow="none"; e.currentTarget.style.transform="none"; }}>
+                  <div style={{ height:120, background:C.bg3, display:"flex", alignItems:"center", justifyContent:"center", fontSize:50, position:"relative" }}>
+                    {p.icon}
+                    <span style={{ position:"absolute", top:10, right:10 }}>
+                      <Tag color={stock.color}>{stock.label}</Tag>
+                    </span>
+                  </div>
+                  <div style={{ padding:"14px 16px" }}>
+                    <div style={{ fontSize:10, color:C.text3, fontWeight:700, fontFamily:"'DM Mono',monospace", marginBottom:6, letterSpacing:1 }}>{p.category.toUpperCase()}</div>
+                    <div style={{ fontSize:14, fontWeight:600, color:C.text0, marginBottom:12, lineHeight:1.4, fontFamily:"'DM Sans',sans-serif" }}>{p.name}</div>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                      <span style={{ fontSize:18, fontWeight:800, color:C.accent2, fontFamily:"'DM Sans',sans-serif" }}>₹{Number(p.price).toLocaleString()}</span>
+                      <button
+                        disabled={p.stockStatus==="OUT_OF_STOCK"}
+                        onClick={()=>setCart(c=>({...c,[p.id]:(c[p.id]||0)+1}))}
+                        style={{ background:cart[p.id]?C.green:C.accentDim, color:cart[p.id]?"#fff":C.accent2, border:`1.5px solid ${cart[p.id]?C.green:C.border2}`, padding:"7px 14px", borderRadius:8, fontSize:13, cursor:p.stockStatus==="OUT_OF_STOCK"?"not-allowed":"pointer", opacity:p.stockStatus==="OUT_OF_STOCK"?0.5:1, fontWeight:700, fontFamily:"'DM Sans',sans-serif", transition:"all 0.2s" }}>
+                        {cart[p.id]?`✓ ${cart[p.id]} added`:"+ Add"}
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </div>
-            );
-          })}
-        </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1857,8 +1962,40 @@ function ShopPage() {
 
 // ─── BLOG PAGE ────────────────────────────────────────────────────────────────
 
+interface TestimonialSummary {
+  id: string;
+  customerName: string;
+  customerTitle: string | null;
+  quote: string;
+  rating: number;
+}
+
+interface BlogPostSummary {
+  id: string;
+  title: string;
+  slug: string;
+  excerpt: string;
+  tag: string;
+  readMinutes: number;
+  createdAt: string;
+}
+
 function BlogPage() {
-  const tagColors = { "Design Tips":"blue","Manufacturing":"green","Materials":"gold","Basics":"gray","Advanced":"blue","Case Study":"gold" };
+  const tagColors: Record<string,string> = { "Design Tips":"blue","Manufacturing":"green","Materials":"gold","Basics":"gray","Advanced":"blue","Case Study":"gold" };
+  const [posts, setPosts] = useState<BlogPostSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedTag, setSelectedTag] = useState("All");
+
+  useEffect(() => {
+    fetch("/api/blog")
+      .then(res => res.ok ? res.json() : [])
+      .then(setPosts)
+      .finally(() => setLoading(false));
+  }, []);
+
+  const tags = ["All", ...Array.from(new Set(posts.map(p => p.tag)))];
+  const filtered = selectedTag === "All" ? posts : posts.filter(p => p.tag === selectedTag);
+  const [featured, ...rest] = filtered;
 
   return (
     <div style={{ minHeight:"100vh", background:C.bg1, padding:"40px" }}>
@@ -1869,57 +2006,67 @@ function BlogPage() {
           <p style={{ color:C.text1, fontSize:15, margin:0 }}>Design guides · Manufacturing insights · Engineering tips from the ProEmbSys team</p>
         </div>
 
-        {/* Featured */}
-        <div style={{ background:C.bg0, border:`1px solid ${C.border2}`, borderRadius:18, padding:36, marginBottom:36, position:"relative", overflow:"hidden" }}>
-          <CircuitBg opacity={0.03}/>
-          <div style={{ position:"relative" }}>
-            <div style={{ marginBottom:14 }}><Tag color="gold">FEATURED ARTICLE</Tag></div>
-            <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:28, fontWeight:800, color:C.text0, margin:"0 0 14px", lineHeight:1.3, letterSpacing:"-0.5px" }}>
-              The complete guide to PCB impedance control for high-speed designs
-            </h2>
-            <p style={{ color:C.text1, fontSize:15, lineHeight:1.7, margin:"0 0 24px", maxWidth:640 }}>
-              At GHz frequencies, trace geometry becomes as critical as component selection. From microstrip to stripline, differential pairs to coplanar waveguide — our RF engineers explain it all.
-            </p>
-            <div style={{ display:"flex", alignItems:"center", gap:20 }}>
-              <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                <div style={{ width:34, height:34, borderRadius:"50%", background:C.accentDim, border:`1px solid ${C.border2}`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:14 }}>👨‍💻</div>
-                <div>
-                  <div style={{ fontSize:13, fontWeight:600, color:C.text0, fontFamily:"'DM Sans',sans-serif" }}>ProEmbSys Engineering Team</div>
-                  <div style={{ fontSize:11, color:C.text2, fontFamily:"'DM Sans',sans-serif" }}>May 10, 2026 · 12 min read</div>
+        {loading ? (
+          <p style={{ color:C.text2, fontSize:14 }}>Loading articles…</p>
+        ) : posts.length === 0 ? (
+          <p style={{ color:C.text2, fontSize:14 }}>No articles published yet.</p>
+        ) : (
+          <>
+            {/* Featured */}
+            {featured && (
+              <a href={`/blog/${featured.slug}`} style={{ textDecoration:"none", display:"block" }}>
+                <div style={{ background:C.bg0, border:`1px solid ${C.border2}`, borderRadius:18, padding:36, marginBottom:36, position:"relative", overflow:"hidden" }}>
+                  <CircuitBg opacity={0.03}/>
+                  <div style={{ position:"relative" }}>
+                    <div style={{ marginBottom:14 }}><Tag color="gold">FEATURED ARTICLE</Tag></div>
+                    <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:28, fontWeight:800, color:C.text0, margin:"0 0 14px", lineHeight:1.3, letterSpacing:"-0.5px" }}>
+                      {featured.title}
+                    </h2>
+                    <p style={{ color:C.text1, fontSize:15, lineHeight:1.7, margin:"0 0 24px", maxWidth:640 }}>
+                      {featured.excerpt}
+                    </p>
+                    <div style={{ display:"flex", alignItems:"center", gap:20 }}>
+                      <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                        <div style={{ width:34, height:34, borderRadius:"50%", background:C.accentDim, border:`1px solid ${C.border2}`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:14 }}>👨‍💻</div>
+                        <div>
+                          <div style={{ fontSize:13, fontWeight:600, color:C.text0, fontFamily:"'DM Sans',sans-serif" }}>ProEmbSys Engineering Team</div>
+                          <div style={{ fontSize:11, color:C.text2, fontFamily:"'DM Sans',sans-serif" }}>{new Date(featured.createdAt).toLocaleDateString("en-IN",{dateStyle:"long"})} · {featured.readMinutes} min read</div>
+                        </div>
+                      </div>
+                      <Btn variant="primary" style={{ fontSize:13, padding:"9px 20px" }}>Read Article →</Btn>
+                    </div>
+                  </div>
                 </div>
-              </div>
-              <Btn variant="primary" style={{ fontSize:13, padding:"9px 20px" }}>Read Article →</Btn>
+              </a>
+            )}
+
+            {/* Category filter */}
+            <div style={{ display:"flex", gap:8, marginBottom:28, flexWrap:"wrap" }}>
+              {tags.map(c=>(
+                <span key={c} onClick={()=>setSelectedTag(c)} style={{ padding:"5px 16px", borderRadius:20, background:selectedTag===c?C.accentDim:C.bg2, color:selectedTag===c?C.accent2:C.text1, fontSize:12, cursor:"pointer", fontWeight:selectedTag===c?700:500, border:`1px solid ${selectedTag===c?C.accent:C.border}`, fontFamily:"'DM Sans',sans-serif" }}>{c}</span>
+              ))}
             </div>
-          </div>
-        </div>
 
-        {/* Category filter */}
-        <div style={{ display:"flex", gap:8, marginBottom:28, flexWrap:"wrap" }}>
-          {["All","Design Tips","Manufacturing","Materials","Basics","Advanced","Case Study"].map(c=>(
-            <span key={c} style={{ padding:"5px 16px", borderRadius:20, background:C.bg2, color:C.text1, fontSize:12, cursor:"pointer", fontWeight:500, border:`1px solid ${C.border}`, fontFamily:"'DM Sans',sans-serif" }}>{c}</span>
-          ))}
-        </div>
-
-        {/* Post grid */}
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:18, marginBottom:32 }}>
-          {BLOG_POSTS.map((p,i)=>(
-            <div key={i} style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:14, padding:"22px", cursor:"pointer", transition:"all 0.2s" }}
-              onMouseEnter={e=>{ e.currentTarget.style.borderColor=C.border2; e.currentTarget.style.transform="translateY(-2px)"; }}
-              onMouseLeave={e=>{ e.currentTarget.style.borderColor=C.border; e.currentTarget.style.transform="none"; }}>
-              <div style={{ height:3, background:[C.accent,C.gold,C.green,C.accent2,"#a78bfa",C.gold][i], borderRadius:2, marginBottom:16 }}/>
-              <Tag color={tagColors[p.tag]||"blue"}>{p.tag}</Tag>
-              <h3 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:15, fontWeight:700, color:C.text0, margin:"12px 0 10px", lineHeight:1.4 }}>{p.title}</h3>
-              <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:C.text3, fontFamily:"'DM Sans',sans-serif" }}>
-                <span>{p.date}</span>
-                <span>{p.mins} min read</span>
-              </div>
+            {/* Post grid */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:18, marginBottom:32 }}>
+              {rest.map((p,i)=>(
+                <a key={p.id} href={`/blog/${p.slug}`} style={{ textDecoration:"none" }}>
+                  <div style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:14, padding:"22px", cursor:"pointer", transition:"all 0.2s", height:"100%" }}
+                    onMouseEnter={e=>{ e.currentTarget.style.borderColor=C.border2; e.currentTarget.style.transform="translateY(-2px)"; }}
+                    onMouseLeave={e=>{ e.currentTarget.style.borderColor=C.border; e.currentTarget.style.transform="none"; }}>
+                    <div style={{ height:3, background:[C.accent,C.gold,C.green,C.accent2,"#a78bfa",C.gold][i%6], borderRadius:2, marginBottom:16 }}/>
+                    <Tag color={tagColors[p.tag]||"blue"}>{p.tag}</Tag>
+                    <h3 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:15, fontWeight:700, color:C.text0, margin:"12px 0 10px", lineHeight:1.4 }}>{p.title}</h3>
+                    <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:C.text3, fontFamily:"'DM Sans',sans-serif" }}>
+                      <span>{new Date(p.createdAt).toLocaleDateString("en-IN",{dateStyle:"medium"})}</span>
+                      <span>{p.readMinutes} min read</span>
+                    </div>
+                  </div>
+                </a>
+              ))}
             </div>
-          ))}
-        </div>
-
-        <div style={{ textAlign:"center" }}>
-          <Btn variant="outline" style={{ fontSize:14, padding:"12px 32px" }}>Load more articles</Btn>
-        </div>
+          </>
+        )}
       </div>
     </div>
   );

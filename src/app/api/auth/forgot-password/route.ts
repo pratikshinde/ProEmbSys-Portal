@@ -20,7 +20,14 @@ export async function POST(req: Request) {
       data: { token, userId: user.id, expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
     })
     const resetUrl = `${process.env.APP_URL ?? "http://localhost:3000"}/reset-password?token=${token}`
-    await sendPasswordResetEmail(user.email, resetUrl)
+    // The reset token must exist regardless of whether the email actually
+    // sends (e.g. RESEND_API_KEY unset in local dev) — never let a failed
+    // send turn into a 500 for the user.
+    try {
+      await sendPasswordResetEmail(user.email, resetUrl)
+    } catch {
+      // Swallowed intentionally — see comment above.
+    }
   }
 
   return NextResponse.json({ ok: true })
