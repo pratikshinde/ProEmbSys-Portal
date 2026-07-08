@@ -6,6 +6,8 @@ import MessageThread from "@/components/messaging/message-thread"
 import { Navbar } from "@/components/portal-main"
 import { asAddressSnapshot, formatAddressSnapshot } from "@/lib/format-address"
 import { SOLDER_MASK_SWATCH } from "@/lib/solder-mask-colors"
+import { OrderStatusBadge } from "@/components/order-status-badge"
+import { OrderTimeline } from "@/components/order-timeline"
 
 export default async function OrderDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -52,10 +54,14 @@ export default async function OrderDetailPage({ params }: { params: Promise<{ id
           </a>
         )}
 
+        <OrderTimeline status={order.status} />
+
         <div className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-card p-5 text-sm">
           <div>
             <span className="text-muted-foreground">Status</span>
-            <div className="font-medium text-foreground">{order.status}</div>
+            <div className="mt-1">
+              <OrderStatusBadge status={order.status} />
+            </div>
           </div>
           <div>
             <span className="text-muted-foreground">Total</span>

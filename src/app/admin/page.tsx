@@ -12,9 +12,9 @@ export default async function AdminDashboardPage() {
     db.testimonial.count(),
   ])
 
-  const stats = [
-    { label: "Total orders", value: totalOrders },
-    { label: "Awaiting review", value: pendingReview },
+  const stats: { label: string; value: number; href?: string }[] = [
+    { label: "Total orders", value: totalOrders, href: "/admin/orders" },
+    { label: "Awaiting review", value: pendingReview, href: "/admin/orders?status=PENDING_REVIEW" },
     { label: "Registered users", value: totalUsers },
   ]
 
@@ -30,12 +30,19 @@ export default async function AdminDashboardPage() {
     <div className="flex flex-col gap-6">
       <h1 className="text-2xl font-bold text-foreground">Dashboard</h1>
       <div className="grid grid-cols-3 gap-4">
-        {stats.map((s) => (
-          <div key={s.label} className="rounded-lg border border-border bg-card p-5">
-            <div className="text-sm text-muted-foreground">{s.label}</div>
-            <div className="mt-1 text-3xl font-bold text-foreground">{s.value}</div>
-          </div>
-        ))}
+        {stats.map((s) =>
+          s.href ? (
+            <Link key={s.label} href={s.href} className="rounded-lg border border-border bg-card p-5 transition-colors hover:border-primary">
+              <div className="text-sm text-muted-foreground">{s.label}</div>
+              <div className="mt-1 text-3xl font-bold text-foreground">{s.value}</div>
+            </Link>
+          ) : (
+            <div key={s.label} className="rounded-lg border border-border bg-card p-5">
+              <div className="text-sm text-muted-foreground">{s.label}</div>
+              <div className="mt-1 text-3xl font-bold text-foreground">{s.value}</div>
+            </div>
+          )
+        )}
       </div>
       <div className="grid grid-cols-3 gap-3">
         {quickLinks.map((l) => (

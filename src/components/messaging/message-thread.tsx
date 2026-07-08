@@ -130,7 +130,7 @@ export default function MessageThread({ threadId }: { threadId: string }) {
         <div className="flex items-center gap-2 rounded-md border border-border bg-muted px-3 py-2 text-xs text-foreground">
           <ImagePlus className="size-4 shrink-0" />
           <span className="flex-1 truncate">{file.name}</span>
-          <button type="button" onClick={() => setFile(null)} className="text-muted-foreground hover:text-foreground">
+          <button type="button" onClick={() => setFile(null)} aria-label="Remove attachment" className="text-muted-foreground hover:text-foreground">
             <X className="size-4" />
           </button>
         </div>
@@ -145,6 +145,7 @@ export default function MessageThread({ threadId }: { threadId: string }) {
           size="icon"
           onClick={() => fileInputRef.current?.click()}
           title="Attach a screenshot"
+          aria-label="Attach a screenshot"
         >
           <ImagePlus className="size-4" />
         </Button>

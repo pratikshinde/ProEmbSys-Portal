@@ -62,7 +62,7 @@ Requires a running Postgres and a populated `.env` (`DATABASE_URL`, `AUTH_SECRET
 
 ### The switcher shell outside real routes
 
-`Navbar` (in `portal-main.tsx`) is exported and reused directly by the standalone routes (`/fab-capabilities`, `/orders`, `/orders/[id]`, `/account`) that sit outside the client-side switcher — it accepts optional `page`/`setPage`; when omitted (standalone usage) it navigates to `/?page=<key>` instead of calling `setPage`, and `App`'s effect reads that query param once on mount to jump straight to the requested section. This mirrors the existing "correct after hydration, client-only" pattern already used for sidebar width — deliberately not `useSearchParams()` + Suspense, to avoid a second SSR-bailout mechanism for something this simple.
+`Navbar` (in `portal-main.tsx`) is exported and reused directly by the standalone routes (`/fab-capabilities`, `/orders`, `/orders/[id]`, `/account`) that sit outside the client-side switcher — it accepts optional `page`/`setPage`; when omitted (standalone usage) it navigates to `/?page=<key>` instead of calling `setPage`. `App`'s `setPage` mirrors every section switch into the URL via `history.pushState` and a `popstate` listener re-reads `?page=` — so back/forward buttons, bookmarks, and middle-click all work even though sections aren't real routes. This is still deliberately not `useSearchParams()` + Suspense (avoids a second SSR-bailout mechanism); the URL read happens client-side only, mirroring the sidebar-width hydration pattern. Nav items render as real `<a href="/?page=…">` anchors with intercepted left-clicks. `Navbar` collapses to a hamburger drawer below 920px (`useIsMobile` hook in `portal-main.tsx`); the shell's layout is otherwise fluid via `clamp()` and `auto-fit` grids since inline styles can't use media queries. The shop cart state lives in `App` (single source — the navbar badge and `ShopPage` mini-cart both read it); there is no online checkout yet, the mini-cart's CTA is a prefilled order-enquiry `mailto:`.
 
 ### Key files
 
@@ -84,6 +84,7 @@ Requires a running Postgres and a populated `.env` (`DATABASE_URL`, `AUTH_SECRET
 | `src/lib/auth.ts` / `auth.config.ts` | Auth.js v5 config (full / Edge-safe split — see "Backend") |
 | `src/lib/pricing-engine.ts` | Pure quote calculation — supersedes `src/lib/pcb-pricing.ts` |
 | `src/lib/email.ts` | Resend wrapper (password reset, staff welcome, lazily instantiated — see below) |
+| `src/lib/order-status.ts` + `src/components/order-status-badge.tsx` / `order-timeline.tsx` | The only sanctioned way to display an `OrderStatus` — humanized labels + colors (never show raw enum strings like `PENDING_REVIEW` to users), plus the pipeline timeline on `/orders/[id]` |
 | `middleware.ts` | Edge-safe route protection for `/admin/**` |
 | `src/app/admin/team/page.tsx` + `src/components/admin/staff-table.tsx` | Staff (Engineer/Admin) account management, ADMIN only |
 | `src/app/admin/blog\|products\|testimonials/page.tsx` + matching `src/components/admin/*-table.tsx` | CMS-style admin CRUD for the three content types, all ADMIN or ENGINEER |

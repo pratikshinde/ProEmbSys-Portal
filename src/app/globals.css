@@ -182,3 +182,13 @@ button,
   transition: all 0.18s ease;
 }
 
+
+/* ─── Keyboard focus visibility ─────────────────────────────────────────────── */
+/* Inline-styled buttons/anchors across the portal shell suppress the UA
+   outline via resets — restore a clear indicator for keyboard users only
+   (mouse clicks don't trigger :focus-visible). */
+:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+  border-radius: 4px;
+}

@@ -121,18 +121,80 @@ function CircuitBg({ opacity=0.04 }) {
 
 // ─── NAVBAR ──────────────────────────────────────────────────────────────────
 
+// SSR-safe media query — false on the server, corrected right after
+// hydration (same client-only pattern as the sidebar width below).
+function useIsMobile(maxWidth = 920) {
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${maxWidth}px)`);
+    const update = () => setIsMobile(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, [maxWidth]);
+  return isMobile;
+}
+
 export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPage?: (p: string) => void; cartCount?: number }) {
   const { data: session, status } = useSession();
   const router = useRouter();
+  // 1080 rather than 920: with nowrap nav labels ("Fab Capabilities" etc.)
+  // the single-line desktop nav needs ~1100px before it crowds the actions.
+  const isMobile = useIsMobile(1080);
+  const [menuOpen, setMenuOpen] = useState(false);
   // Standalone usage (fab-capabilities, orders pages) has no switcher `page`
   // state to flip — navigate to "/" with a ?page= param instead, which App
   // reads on load to jump straight to that section.
-  const goToPage = (key: string) => setPage ? setPage(key) : router.push(key === "home" ? "/" : `/?page=${key}`);
+  const goToPage = (key: string) => {
+    setMenuOpen(false);
+    if (setPage) setPage(key); else router.push(key === "home" ? "/" : `/?page=${key}`);
+  };
+  // Real hrefs so middle-click / open-in-new-tab / bookmarks work; left-click
+  // is intercepted to keep the smooth client-side switch.
+  const hrefFor = (key: string) => (key === "home" ? "/" : `/?page=${key}`);
+
+  const navLinks = NAV_ITEMS.map(({key,label,href}) => href ? (
+    <Link key={key} href={href} onClick={()=>setMenuOpen(false)} style={{ background:"transparent", padding: isMobile?"12px 14px":"7px 14px", borderRadius:8, fontSize: isMobile?15:13.5, textDecoration:"none", fontFamily:"'DM Sans',sans-serif", color:C.text1, fontWeight:400, transition:"all 0.15s", display:"block", whiteSpace:"nowrap" }}
+      onMouseEnter={e=>{ e.currentTarget.style.background=C.bg3; e.currentTarget.style.color=C.text0; }}
+      onMouseLeave={e=>{ e.currentTarget.style.background="transparent"; e.currentTarget.style.color=C.text1; }}>
+      {label}
+    </Link>
+  ) : (
+    <a key={key} href={hrefFor(key)} onClick={e=>{ e.preventDefault(); goToPage(key); }}
+      style={{ background: page===key ? C.accentDim : "transparent", border:"none", padding: isMobile?"12px 14px":"7px 14px", borderRadius:8, fontSize: isMobile?15:13.5, cursor:"pointer", textDecoration:"none", fontFamily:"'DM Sans',sans-serif", color: page===key ? C.accent2 : C.text1, fontWeight: page===key ? 700 : 400, transition:"all 0.15s", display:"block", whiteSpace:"nowrap" }}
+      onMouseEnter={e=>{ if(page!==key){ e.currentTarget.style.background=C.bg3; e.currentTarget.style.color=C.text0; }}}
+      onMouseLeave={e=>{ if(page!==key){ e.currentTarget.style.background="transparent"; e.currentTarget.style.color=C.text1; }}}>
+      {label}
+    </a>
+  ));
+
+  const accountMenu = status === "authenticated" ? (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button style={{ fontSize:13, color:C.text1, fontFamily:"'DM Sans',sans-serif", background:"transparent", border:"none", cursor:"pointer", padding:"6px 4px" }}>
+          {session?.user?.name || session?.user?.email}
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem asChild>
+          <Link href="/account">My Account</Link>
+        </DropdownMenuItem>
+        <DropdownMenuItem asChild>
+          <Link href="/orders">My Orders</Link>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={()=>signOut({ callbackUrl: "/" })}>Sign out</DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  ) : (
+    <Btn variant="ghost" onClick={()=>router.push("/login")} style={{ fontSize:13, padding:"7px 16px" }}>Sign in</Btn>
+  );
+
   return (
     <nav style={{ background:`${C.bg0}ee`, backdropFilter:"blur(16px)", borderBottom:`1px solid ${C.border}`, position:"sticky", top:0, zIndex:200 }}>
-      <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 28px", height:62, display:"flex", alignItems:"center", gap:0 }}>
+      <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 clamp(14px, 3vw, 28px)", height:62, display:"flex", alignItems:"center", gap:0 }}>
         {/* Logo */}
-        <div onClick={()=>goToPage("home")} style={{ display:"flex", alignItems:"center", gap:10, marginRight:36, cursor:"pointer", flexShrink:0 }}>
+        <Link href="/" onClick={e=>{ e.preventDefault(); goToPage("home"); }} style={{ display:"flex", alignItems:"center", gap:10, marginRight: isMobile ? "auto" : 36, cursor:"pointer", flexShrink:0, textDecoration:"none" }}>
           <div style={{ width:36, height:36, background:`linear-gradient(135deg, ${C.accent} 0%, #0369a1 100%)`, borderRadius:9, display:"flex", alignItems:"center", justifyContent:"center", boxShadow:`0 0 14px ${C.accentGlow}` }}>
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
               <polygon points="12,2 20,7 20,17 12,22 4,17 4,7" fill="none" stroke="white" strokeWidth="1.5"/>
@@ -147,56 +209,52 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
             </div>
             <div style={{ fontSize:8.5, color:C.text3, letterSpacing:1.8, fontFamily:"'DM Mono',monospace", marginTop:1 }}>PROEMBSYS TECHNOLOGIES</div>
           </div>
-        </div>
+        </Link>
 
-        {/* Nav links */}
-        <div style={{ display:"flex", gap:2, flex:1 }}>
-          {NAV_ITEMS.map(({key,label,href}) => href ? (
-            <Link key={key} href={href} style={{ background:"transparent", padding:"7px 14px", borderRadius:8, fontSize:13.5, textDecoration:"none", fontFamily:"'DM Sans',sans-serif", color:C.text1, fontWeight:400, transition:"all 0.15s" }}
-              onMouseEnter={e=>{ e.currentTarget.style.background=C.bg3; e.currentTarget.style.color=C.text0; }}
-              onMouseLeave={e=>{ e.currentTarget.style.background="transparent"; e.currentTarget.style.color=C.text1; }}>
-              {label}
-            </Link>
-          ) : (
-            <button key={key} onClick={()=>goToPage(key)} style={{ background: page===key ? C.accentDim : "transparent", border:"none", padding:"7px 14px", borderRadius:8, fontSize:13.5, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", color: page===key ? C.accent2 : C.text1, fontWeight: page===key ? 700 : 400, transition:"all 0.15s" }}
-              onMouseEnter={e=>{ if(page!==key){ e.currentTarget.style.background=C.bg3; e.currentTarget.style.color=C.text0; }}}
-              onMouseLeave={e=>{ if(page!==key){ e.currentTarget.style.background="transparent"; e.currentTarget.style.color=C.text1; }}}>
-              {label}
-            </button>
-          ))}
-        </div>
+        {/* Nav links — desktop only; mobile gets the drawer below */}
+        {!isMobile && <div style={{ display:"flex", gap:2, flex:1, alignItems:"center" }}>{navLinks}</div>}
 
         {/* Right actions */}
         <div style={{ display:"flex", gap:10, alignItems:"center", flexShrink:0 }}>
           {cartCount>0 && (
-            <div onClick={()=>goToPage("shop")} style={{ cursor:"pointer", background:C.accentDim, border:`1px solid ${C.border2}`, borderRadius:8, padding:"7px 14px", fontSize:13, color:C.accent2, fontFamily:"'DM Sans',sans-serif", fontWeight:700 }}>
+            <button onClick={()=>goToPage("shop")} aria-label={`Cart with ${cartCount} items — view in shop`} style={{ cursor:"pointer", background:C.accentDim, border:`1px solid ${C.border2}`, borderRadius:8, padding:"7px 14px", fontSize:13, color:C.accent2, fontFamily:"'DM Sans',sans-serif", fontWeight:700 }}>
               🛒 {cartCount}
-            </div>
+            </button>
           )}
-          {status === "authenticated" ? (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button style={{ fontSize:13, color:C.text1, fontFamily:"'DM Sans',sans-serif", background:"transparent", border:"none", cursor:"pointer", padding:"6px 4px" }}>
-                  {session.user?.name || session.user?.email}
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem asChild>
-                  <Link href="/account">My Account</Link>
-                </DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <Link href="/orders">My Orders</Link>
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={()=>signOut({ callbackUrl: "/" })}>Sign out</DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          ) : (
-            <Btn variant="ghost" onClick={()=>router.push("/login")} style={{ fontSize:13, padding:"7px 16px" }}>Sign in</Btn>
+          {!isMobile && accountMenu}
+          {/* Suppress the quote CTA when the user is already on the order page */}
+          {!isMobile && page !== "order" && (
+            <Btn variant="primary" onClick={()=>goToPage("order")} style={{ fontSize:13, padding:"8px 18px" }}>Get Quote →</Btn>
           )}
-          <Btn variant="primary" onClick={()=>goToPage("order")} style={{ fontSize:13, padding:"8px 18px" }}>Get Quote →</Btn>
+          {isMobile && (
+            <button onClick={()=>setMenuOpen(o=>!o)} aria-label={menuOpen ? "Close menu" : "Open menu"} aria-expanded={menuOpen}
+              style={{ background:"transparent", border:`1px solid ${C.border}`, borderRadius:8, padding:"7px 12px", fontSize:18, lineHeight:1, color:C.text0, cursor:"pointer" }}>
+              {menuOpen ? "✕" : "☰"}
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Mobile drawer */}
+      {isMobile && menuOpen && (
+        <div style={{ borderTop:`1px solid ${C.border}`, background:C.bg0, padding:"10px 16px 16px", display:"flex", flexDirection:"column", gap:2 }}>
+          {navLinks}
+          <div style={{ height:1, background:C.border, margin:"8px 0" }}/>
+          {status === "authenticated" ? (
+            <>
+              <div style={{ fontSize:12, color:C.text2, padding:"4px 14px", fontFamily:"'DM Sans',sans-serif" }}>{session?.user?.name || session?.user?.email}</div>
+              <Link href="/account" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.text1, fontFamily:"'DM Sans',sans-serif" }}>My Account</Link>
+              <Link href="/orders" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.text1, fontFamily:"'DM Sans',sans-serif" }}>My Orders</Link>
+              <button onClick={()=>signOut({ callbackUrl: "/" })} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textAlign:"left", background:"transparent", border:"none", color:C.text1, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>Sign out</button>
+            </>
+          ) : (
+            <Btn variant="ghost" full onClick={()=>{ setMenuOpen(false); router.push("/login"); }} style={{ fontSize:14, padding:"11px 0", marginBottom:8 }}>Sign in</Btn>
+          )}
+          {page !== "order" && (
+            <Btn variant="primary" full onClick={()=>goToPage("order")} style={{ fontSize:14, padding:"11px 0" }}>Get Quote →</Btn>
+          )}
+        </div>
+      )}
     </nav>
   );
 }
@@ -315,6 +373,7 @@ function PCBSchematic() {
 }
 
 function HomePage({ setPage }) {
+  const isMobile = useIsMobile();
   const [activeService, setActiveService] = useState(0);
   const [tick, setTick] = useState(0);
   const [homeBlogPosts, setHomeBlogPosts] = useState<BlogPostSummary[]>([]);
@@ -435,11 +494,11 @@ function HomePage({ setPage }) {
           background:`linear-gradient(135deg, transparent 40%, rgba(14,165,233,0.035) 100%)`,
           borderLeft:`1px solid ${C.border}`, pointerEvents:"none" }}/>
 
-        <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 48px",
-          display:"grid", gridTemplateColumns:"1fr 440px", gap:0, alignItems:"center", minHeight:640 }}>
+        <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 clamp(16px, 5vw, 48px)",
+          display:"grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 440px", gap:0, alignItems:"center", minHeight: isMobile ? "auto" : 640 }}>
 
           {/* LEFT — copy */}
-          <div style={{ paddingTop:72, paddingBottom:72, paddingRight:56, zIndex:2 }}>
+          <div style={{ paddingTop:"clamp(40px, 8vw, 72px)", paddingBottom: isMobile ? 32 : 72, paddingRight: isMobile ? 0 : 56, zIndex:2 }}>
             {/* Company badge */}
             <div style={{ display:"inline-flex", alignItems:"center", gap:10, marginBottom:28,
               background:"rgba(14,165,233,0.08)", border:`1px solid ${C.border2}`,
@@ -451,13 +510,13 @@ function HomePage({ setPage }) {
             </div>
 
             <h1 className="hero-h1" style={{
-              fontSize:60, fontWeight:800, lineHeight:1.05, letterSpacing:"-2px",
+              fontSize:"clamp(34px, 8vw, 60px)", fontWeight:800, lineHeight:1.05, letterSpacing:"-1px",
               color:C.text0, margin:"0 0 10px",
             }}>
               Precision
             </h1>
             <h1 style={{
-              fontSize:60, fontWeight:800, lineHeight:1.05, letterSpacing:"-2px",
+              fontSize:"clamp(34px, 8vw, 60px)", fontWeight:800, lineHeight:1.05, letterSpacing:"-1px",
               margin:"0 0 10px",
               background:`linear-gradient(90deg, ${C.accent} 0%, #7dd3fc 100%)`,
               WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent",
@@ -466,7 +525,7 @@ function HomePage({ setPage }) {
               PCB Manufacturing
             </h1>
             <h1 style={{
-              fontSize:60, fontWeight:800, lineHeight:1.05, letterSpacing:"-2px",
+              fontSize:"clamp(34px, 8vw, 60px)", fontWeight:800, lineHeight:1.05, letterSpacing:"-1px",
               color:C.text0, margin:"0 0 32px",
               animation:"fadeUp 0.7s 0.14s ease both",
             }}>
@@ -514,14 +573,15 @@ function HomePage({ setPage }) {
 
             {/* Micro-trust row */}
             <div style={{ marginTop:36, display:"flex", alignItems:"center", gap:20, flexWrap:"wrap" }}>
-              {[["✓ ISO 9001 Certified"],["✓ 99.4% First-pass Yield"],["✓ GST 29AAHCP7519H1Z0"]].map((t,i)=>(
+              {/* Persuasion markers only — GST/CIN details live in the footer */}
+              {[["✓ ISO 9001 Certified"],["✓ 99.4% First-pass Yield"],["✓ 480 hr Express Turnaround"]].map((t,i)=>(
                 <span key={i} style={{ fontSize:12, color:C.text2, fontFamily:"'DM Mono',monospace", letterSpacing:0.4 }}>{t}</span>
               ))}
             </div>
           </div>
 
           {/* RIGHT — PCB schematic visual */}
-          <div className="hero-board" style={{ position:"relative", height:420, zIndex:2 }}>
+          <div className="hero-board" style={{ position:"relative", height:"clamp(260px, 55vw, 420px)", zIndex:2, marginBottom: isMobile ? 48 : 0 }}>
             {/* Glow halo */}
             <div style={{ position:"absolute", inset:-40,
               background:`radial-gradient(ellipse, rgba(14,165,233,0.12) 0%, transparent 70%)`,
@@ -558,8 +618,8 @@ function HomePage({ setPage }) {
           ANIMATED STAT COUNTERS
       ═══════════════════════════════════════════════════ */}
       <section style={{ background:C.bg1, borderBottom:`1px solid ${C.border}` }}>
-        <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 48px",
-          display:"grid", gridTemplateColumns:"repeat(4,1fr)" }}>
+        <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 clamp(16px, 5vw, 48px)",
+          display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(160px, 1fr))" }}>
           {stats.map((s,i)=>(
             <div key={i} className="stat-card" style={{
               animationDelay:`${i*0.1}s`,
@@ -569,7 +629,7 @@ function HomePage({ setPage }) {
               <div style={{ position:"absolute", top:0, left:0, right:0, height:2,
                 background:i===0?C.accent:i===1?C.green:i===2?C.gold:"#a78bfa",
                 borderRadius:"0 0 2px 2px" }}/>
-              <div style={{ fontFamily:"'DM Mono',monospace", fontSize:38, fontWeight:700,
+              <div style={{ fontFamily:"'DM Mono',monospace", fontSize:"clamp(28px, 5vw, 38px)", fontWeight:700,
                 color:C.text0, lineHeight:1, marginBottom:8, letterSpacing:"-1px" }}>
                 {s.display(s.val * 10)}
               </div>
@@ -582,10 +642,10 @@ function HomePage({ setPage }) {
       {/* ═══════════════════════════════════════════════════
           SERVICES — interactive left-nav + right-detail
       ═══════════════════════════════════════════════════ */}
-      <section style={{ background:C.bg0, borderBottom:`1px solid ${C.border}`, padding:"80px 0" }}>
-        <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 48px" }}>
+      <section style={{ background:C.bg0, borderBottom:`1px solid ${C.border}`, padding:"clamp(48px, 8vw, 80px) 0" }}>
+        <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 clamp(16px, 5vw, 48px)" }}>
           {/* Header */}
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", marginBottom:52 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", flexWrap:"wrap", rowGap:16, marginBottom:52 }}>
             <div>
               <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
                 <div style={{ width:28, height:1.5, background:C.accent }}/>
@@ -593,7 +653,7 @@ function HomePage({ setPage }) {
                   OUR SERVICES
                 </span>
               </div>
-              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:40, fontWeight:800,
+              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"clamp(28px, 5vw, 40px)", fontWeight:800,
                 color:C.text0, margin:0, letterSpacing:"-1px", lineHeight:1.1 }}>
                 End-to-end electronics<br/>manufacturing
               </h2>
@@ -658,7 +718,7 @@ function HomePage({ setPage }) {
                 </p>
 
                 {/* Spec grid */}
-                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:40 }}>
+                <div style={{ display:"grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap:10, marginBottom:40 }}>
                   {sv.specs.map((spec,i)=>(
                     <div key={i} style={{ display:"flex", alignItems:"center", gap:10,
                       padding:"10px 14px", background:C.bg3, borderRadius:8,
@@ -697,12 +757,12 @@ function HomePage({ setPage }) {
               HOW IT WORKS
             </span>
           </div>
-          <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:36, fontWeight:800,
+          <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"clamp(26px, 5vw, 36px)", fontWeight:800,
             color:C.text0, margin:"0 0 56px", letterSpacing:"-0.8px" }}>
             From file to finished board
           </h2>
 
-          <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:0, position:"relative" }}>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(170px, 1fr))", gap:0, position:"relative" }}>
             {/* connector line */}
             <div style={{ position:"absolute", top:28, left:"10%", right:"10%", height:1,
               background:`linear-gradient(90deg, ${C.accent}, ${C.border2}, ${C.accent})`,
@@ -743,7 +803,7 @@ function HomePage({ setPage }) {
       ═══════════════════════════════════════════════════ */}
       <section style={{ background:C.bg0, padding:"80px 48px", borderBottom:`1px solid ${C.border}` }}>
         <div style={{ maxWidth:1100, margin:"0 auto" }}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", marginBottom:40 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", flexWrap:"wrap", rowGap:16, marginBottom:40 }}>
             <div>
               <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
                 <div style={{ width:28, height:1.5, background:"#a78bfa" }}/>
@@ -751,7 +811,7 @@ function HomePage({ setPage }) {
                   ELECTRONICS SHOP
                 </span>
               </div>
-              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:36, fontWeight:800,
+              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"clamp(26px, 5vw, 36px)", fontWeight:800,
                 color:C.text0, margin:0, letterSpacing:"-0.8px" }}>
                 In-house manufactured modules
               </h2>
@@ -767,7 +827,7 @@ function HomePage({ setPage }) {
           </div>
 
           {/* Featured + grid layout */}
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:16 }}>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(210px, 1fr))", gap:16 }}>
             {homeProducts.slice(0,4).map((p,i)=>(
               <div key={p.id} onClick={()=>setPage("shop")}
                 style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:14,
@@ -815,7 +875,7 @@ function HomePage({ setPage }) {
       ═══════════════════════════════════════════════════ */}
       <section style={{ background:C.bg1, padding:"80px 48px", borderBottom:`1px solid ${C.border}` }}>
         <div style={{ maxWidth:1100, margin:"0 auto" }}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", marginBottom:40 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", flexWrap:"wrap", rowGap:16, marginBottom:40 }}>
             <div>
               <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
                 <div style={{ width:28, height:1.5, background:C.gold }}/>
@@ -823,7 +883,7 @@ function HomePage({ setPage }) {
                   TECHNICAL BLOG
                 </span>
               </div>
-              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:36, fontWeight:800,
+              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"clamp(26px, 5vw, 36px)", fontWeight:800,
                 color:C.text0, margin:0, letterSpacing:"-0.8px" }}>
                 Knowledge from the factory floor
               </h2>
@@ -838,7 +898,7 @@ function HomePage({ setPage }) {
             </button>
           </div>
 
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 340px", gap:20 }}>
+          <div style={{ display:"grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 340px", gap:20 }}>
             {/* Featured post */}
             <div style={{ background:C.bg0, border:`1px solid ${C.border2}`, borderRadius:16,
               padding:"36px 40px", position:"relative", overflow:"hidden", cursor:"pointer" }}
@@ -914,7 +974,7 @@ function HomePage({ setPage }) {
       ═══════════════════════════════════════════════════ */}
       <section style={{ background:C.bg0, padding:"48px 48px", borderBottom:`1px solid ${C.border}` }}>
         <div style={{ maxWidth:1100, margin:"0 auto" }}>
-          <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:0 }}>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(170px, 1fr))", gap:0 }}>
             {[
               { icon:"🏭", title:"Bangalore Factory",   desc:"In-house fab & assembly" },
               { icon:"🔬", title:"AOI + X-Ray",          desc:"Automated optical inspection" },
@@ -942,7 +1002,7 @@ function HomePage({ setPage }) {
           <div style={{ maxWidth:1100, margin:"0 auto" }}>
             <div style={{ textAlign:"center", marginBottom:48 }}>
               <SectionLabel>WHAT CUSTOMERS SAY</SectionLabel>
-              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:36, fontWeight:800,
+              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"clamp(26px, 5vw, 36px)", fontWeight:800,
                 color:C.text0, margin:"8px 0 0", letterSpacing:"-0.8px" }}>
                 Trusted by engineers and teams across India
               </h2>
@@ -981,7 +1041,7 @@ function HomePage({ setPage }) {
                 fontFamily:"'DM Mono',monospace", marginBottom:24 }}>
                 READY TO START?
               </div>
-              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:44, fontWeight:800,
+              <h2 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"clamp(30px, 6vw, 44px)", fontWeight:800,
                 color:C.text0, margin:"0 0 16px", letterSpacing:"-1px" }}>
                 Build your next board with ProPCB
               </h2>
@@ -1027,10 +1087,10 @@ function HomePage({ setPage }) {
 // ─── PCB ORDER PAGE ───────────────────────────────────────────────────────────
 
 function PCBOrderPage() {
+  const isMobile = useIsMobile();
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const [specs, setSpecs] = useState({ layers:"2", qty:"10", finish:"HASL (Lead-free)", color:"Green", copper:"1 oz", thickness:"1.6mm" });
-  const [step, setStep] = useState(1);
   const [express, setExpress] = useState(false);
   const [deliveryFormat, setDeliveryFormat] = useState<"INDIVIDUAL" | "PANEL_BY_CUSTOMER" | "PANEL_BY_PROPCB">("INDIVIDUAL");
   const [analyzing, setAnalyzing] = useState(false);
@@ -1045,6 +1105,11 @@ function PCBOrderPage() {
   const widthMm = parseFloat(width) || 0;
   const heightMm = parseFloat(height) || 0;
   const hasValidDims = widthMm > 0 && heightMm > 0;
+
+  // The step indicator is derived, not stored — it always reflects what the
+  // user has actually done (upload/dims → configure → placed), so it can
+  // never disagree with the form state below it.
+  const step = orderRef ? 3 : file || hasValidDims ? 2 : 1;
 
   const [quote, setQuote] = useState<PcbQuoteBreakdownV2 | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
@@ -1102,8 +1167,13 @@ function PCBOrderPage() {
   }
 
   const handleFile = useCallback(async (f: File) => {
+    // Same limit as the server (order-files.ts) — reject at drop time instead
+    // of letting the user configure everything and fail at Place Order.
+    if (f.size > 25 * 1024 * 1024) {
+      toast({ title: "File too large", description: "Gerber uploads are limited to 25 MB — zip only the layers you need." });
+      return;
+    }
     setFile(f);
-    setStep(2);
     setOrderRef(null);
     if (f.name.toLowerCase().endsWith('.rar')) {
       setAnalysis(null);
@@ -1173,6 +1243,47 @@ function PCBOrderPage() {
     return `${a.label ? a.label + " — " : ""}${a.line1}, ${a.city}, ${a.state} ${a.postalCode}`;
   }
 
+  // Inline address creation — first-time customers used to be sent to
+  // /account, a real route that unmounts this page and destroys the uploaded
+  // Gerber + all configured specs. Adding the address in place keeps the
+  // checkout intact.
+  const EMPTY_ADDRESS_FORM = { label:"", line1:"", line2:"", city:"", state:"", postalCode:"", gstNumber:"" };
+  const [addressFormType, setAddressFormType] = useState<"DELIVERY" | "BILLING" | null>(null);
+  const [addressForm, setAddressForm] = useState(EMPTY_ADDRESS_FORM);
+  const [savingAddress, setSavingAddress] = useState(false);
+
+  async function saveInlineAddress() {
+    if (!addressFormType) return;
+    if (!addressForm.line1.trim() || !addressForm.city.trim() || !addressForm.state.trim() || !addressForm.postalCode.trim()) {
+      toast({ title: "Address incomplete", description: "Address line, city, state, and PIN code are required." });
+      return;
+    }
+    setSavingAddress(true);
+    try {
+      const res = await fetch("/api/account/addresses", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: addressFormType, ...addressForm, isDefault: true }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        toast({ title: "Could not save address", description: body?.error ?? "Please try again." });
+        return;
+      }
+      const created: AddressRecord = await res.json();
+      // The API made this the new default — mirror that locally.
+      setAddresses(prev => [...prev.map(a => a.type === created.type ? { ...a, isDefault: false } : a), created]);
+      if (created.type === "DELIVERY") setDeliveryAddressId(created.id); else setBillingAddressId(created.id);
+      setAddressFormType(null);
+      setAddressForm(EMPTY_ADDRESS_FORM);
+      toast({ title: "Address saved", description: "Added to your account and selected for this order." });
+    } finally {
+      setSavingAddress(false);
+    }
+  }
+
+  const addressInputStyle = { width:"100%", padding:"8px 10px", borderRadius:7, border:`1.5px solid ${C.border}`, background:C.bg2, color:C.text0, fontSize:12.5, fontFamily:"'DM Sans',sans-serif", boxSizing:"border-box" as const };
+
   // Reorder: /orders/[id]'s "Reorder this board" button lands here via
   // /?page=order&reorder=<id>. Pre-fills specs from the past order, then
   // re-uploads its stored Gerber file through the normal handleFile() path
@@ -1228,7 +1339,7 @@ function PCBOrderPage() {
   async function submitOrder(placeOrder: boolean) {
     if (sessionStatus !== "authenticated") {
       toast({ title: "Sign in required", description: "Create an account or sign in to save a quote or place an order." });
-      router.push("/login?callbackUrl=/");
+      router.push(`/login?callbackUrl=${encodeURIComponent("/?page=order")}`);
       return null;
     }
     setSubmitting(true);
@@ -1251,7 +1362,10 @@ function PCBOrderPage() {
 
       const res = await fetch("/api/orders", { method: "POST", body: formData });
       if (!res.ok) {
-        toast({ title: "Something went wrong", description: "Could not save your order. Please try again." });
+        // Surface the API's specific message (file too large, missing address,
+        // …) — a generic "something went wrong" leaves the user guessing.
+        const body = await res.json().catch(() => null);
+        toast({ title: "Could not save your order", description: body?.error ?? "Please try again." });
         return null;
       }
       return await res.json();
@@ -1261,6 +1375,10 @@ function PCBOrderPage() {
   }
 
   async function handleSaveQuote() {
+    if (!hasValidDims) {
+      toast({ title: "Board dimensions needed", description: "Enter width and height (or upload Gerbers with an outline layer) to get a quote first." });
+      return;
+    }
     if (!quote) {
       toast({ title: "Quote not ready", description: "Wait for the price to finish calculating before saving." });
       return;
@@ -1271,40 +1389,46 @@ function PCBOrderPage() {
   }
 
   async function handlePlaceOrder() {
-    if (!hasValidDims) {
-      toast({ title: "Board dimensions needed", description: "Enter width and height (or upload Gerbers with an outline layer) before placing an order." });
-      return;
-    }
-    if (!quote) {
-      toast({ title: "Quote not ready", description: "Wait for the price to finish calculating before placing an order." });
-      return;
-    }
-    if (!deliveryAddressId) {
-      toast({ title: "Delivery address needed", description: "Select or add a delivery address before placing an order." });
+    // Guards run in the order the user works through the page: sign-in,
+    // file, dimensions, address, then quote readiness.
+    if (sessionStatus !== "authenticated") {
+      toast({ title: "Sign in required", description: "Create an account or sign in to place an order." });
+      router.push(`/login?callbackUrl=${encodeURIComponent("/?page=order")}`);
       return;
     }
     if (!file) {
       toast({ title: "Gerber file needed", description: "Upload your Gerber files before placing an order." });
       return;
     }
+    if (!hasValidDims) {
+      toast({ title: "Board dimensions needed", description: "Enter width and height (or upload Gerbers with an outline layer) before placing an order." });
+      return;
+    }
+    if (!deliveryAddressId) {
+      toast({ title: "Delivery address needed", description: "Select or add a delivery address in Shipping & Billing before placing an order." });
+      return;
+    }
+    if (!quote) {
+      toast({ title: "Quote not ready", description: "Wait for the price to finish calculating before placing an order." });
+      return;
+    }
     const order = await submitOrder(true);
     if (!order) return;
     setOrderRef(order.reference);
-    setStep(3);
     toast({ title: "Order request received", description: `Reference ${order.reference} — our team will verify DRC and send a payment link.` });
   }
 
   return (
-    <div style={{ minHeight:"100vh", background:C.bg1, padding:"40px" }}>
+    <div style={{ minHeight:"100vh", background:C.bg1, padding:"clamp(16px, 4vw, 40px)" }}>
       <div style={{ maxWidth:960, margin:"0 auto" }}>
         <div style={{ marginBottom:32 }}>
           <SectionLabel>PCB FABRICATION ORDER</SectionLabel>
-          <h1 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:36, fontWeight:800, color:C.text0, margin:"4px 0 8px", letterSpacing:"-0.5px" }}>Order Custom PCBs</h1>
+          <h1 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"clamp(26px, 5vw, 36px)", fontWeight:800, color:C.text0, margin:"4px 0 8px", letterSpacing:"-0.5px" }}>Order Custom PCBs</h1>
           <p style={{ color:C.text1, fontSize:15, margin:0 }}>Upload Gerber files · Configure specs · Get instant quote from ProEmbSys Technologies</p>
         </div>
 
         {/* Step bar */}
-        <div style={{ display:"flex", alignItems:"center", gap:0, marginBottom:36 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:0, marginBottom:36, flexWrap:"wrap", rowGap:10 }}>
           {[["1","Upload Gerbers"],["2","Configure Board"],["3","Review & Pay"]].map(([n,l],i)=>(
             <div key={i} style={{ display:"flex", alignItems:"center" }}>
               <div style={{ display:"flex", alignItems:"center", gap:10 }}>
@@ -1316,7 +1440,7 @@ function PCBOrderPage() {
           ))}
         </div>
 
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 310px", gap:24 }}>
+        <div style={{ display:"grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 310px", gap:24 }}>
           <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
             {/* Upload zone */}
             <Card style={{ padding:0, overflow:"hidden" }}>
@@ -1339,7 +1463,7 @@ function PCBOrderPage() {
                   <div>
                     <div style={{ fontSize:36, marginBottom:10, color:C.text3 }}>⬡</div>
                     <div style={{ fontWeight:700, color:C.text0, fontSize:15, marginBottom:6, fontFamily:"'DM Sans',sans-serif" }}>Drop Gerber files here</div>
-                    <div style={{ fontSize:13, color:C.text2, marginBottom:16 }}>.gbr .zip .rar accepted · up to 200 MB</div>
+                    <div style={{ fontSize:13, color:C.text2, marginBottom:16 }}>.gbr .zip .rar accepted · up to 25 MB</div>
                     <Btn variant="outline" style={{ fontSize:13 }}>Browse files</Btn>
                   </div>
                 )}
@@ -1401,7 +1525,7 @@ function PCBOrderPage() {
                   )}
                 </div>
 
-                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20 }}>
+                <div style={{ display:"grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap:20 }}>
                   {Object.entries(PCB_SPECS).map(([key,opts])=>(
                     <div key={key}>
                       <div style={{ fontSize:11, fontWeight:700, color:C.text2, letterSpacing:1, marginBottom:10, fontFamily:"'DM Mono',monospace" }}>{key.toUpperCase()}</div>
@@ -1485,36 +1609,53 @@ function PCBOrderPage() {
                   <div style={{ marginTop:16, padding:"14px 16px", background:C.bg3, borderRadius:10, border:`1px solid ${C.border}` }}>
                     <div style={{ fontSize:11, fontWeight:700, color:C.text2, letterSpacing:1, marginBottom:10, fontFamily:"'DM Mono',monospace" }}>SHIPPING &amp; BILLING</div>
                     <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
-                      <div>
-                        <div style={{ fontSize:11, color:C.text2, marginBottom:6, fontFamily:"'DM Sans',sans-serif" }}>Delivery address</div>
-                        {deliveryAddresses.length === 0 ? (
-                          <div style={{ fontSize:12, color:C.text2 }}>
-                            No delivery address saved. <Link href="/account" style={{ color:C.accent2 }}>Add one in My Account</Link>
+                      {([
+                        ["DELIVERY", "Delivery address", deliveryAddresses, deliveryAddressId, setDeliveryAddressId],
+                        ["BILLING", "Billing address (optional — for GST invoice)", billingAddresses, billingAddressId, setBillingAddressId],
+                      ] as const).map(([type, label, list, selectedId, setSelectedId]) => (
+                        <div key={type}>
+                          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
+                            <div style={{ fontSize:11, color:C.text2, fontFamily:"'DM Sans',sans-serif" }}>{label}</div>
+                            {addressFormType !== type && (
+                              <button onClick={()=>{ setAddressFormType(type); setAddressForm(EMPTY_ADDRESS_FORM); }}
+                                style={{ background:"transparent", border:"none", color:C.accent2, fontSize:11, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight:700, padding:0 }}>
+                                + Add new
+                              </button>
+                            )}
                           </div>
-                        ) : (
-                          <Select value={deliveryAddressId} onValueChange={setDeliveryAddressId}>
-                            <SelectTrigger className="w-full"><SelectValue placeholder="Select a delivery address"/></SelectTrigger>
-                            <SelectContent>
-                              {deliveryAddresses.map(a => <SelectItem key={a.id} value={a.id}>{formatAddress(a)}</SelectItem>)}
-                            </SelectContent>
-                          </Select>
-                        )}
-                      </div>
-                      <div>
-                        <div style={{ fontSize:11, color:C.text2, marginBottom:6, fontFamily:"'DM Sans',sans-serif" }}>Billing address (optional — for GST invoice)</div>
-                        {billingAddresses.length === 0 ? (
-                          <div style={{ fontSize:12, color:C.text2 }}>
-                            No billing address saved. <Link href="/account" style={{ color:C.accent2 }}>Add one in My Account</Link>
-                          </div>
-                        ) : (
-                          <Select value={billingAddressId} onValueChange={setBillingAddressId}>
-                            <SelectTrigger className="w-full"><SelectValue placeholder="Select a billing address"/></SelectTrigger>
-                            <SelectContent>
-                              {billingAddresses.map(a => <SelectItem key={a.id} value={a.id}>{formatAddress(a)}</SelectItem>)}
-                            </SelectContent>
-                          </Select>
-                        )}
-                      </div>
+                          {list.length === 0 && addressFormType !== type ? (
+                            <div style={{ fontSize:12, color:C.text2 }}>
+                              No {type === "DELIVERY" ? "delivery" : "billing"} address saved yet — add one right here.
+                            </div>
+                          ) : list.length > 0 ? (
+                            <Select value={selectedId} onValueChange={setSelectedId}>
+                              <SelectTrigger className="w-full"><SelectValue placeholder={`Select a ${type === "DELIVERY" ? "delivery" : "billing"} address`}/></SelectTrigger>
+                              <SelectContent>
+                                {list.map(a => <SelectItem key={a.id} value={a.id}>{formatAddress(a)}</SelectItem>)}
+                              </SelectContent>
+                            </Select>
+                          ) : null}
+                          {addressFormType === type && (
+                            <div style={{ marginTop:10, padding:"12px", background:C.bg2, borderRadius:8, border:`1px solid ${C.border}`, display:"flex", flexDirection:"column", gap:8 }}>
+                              <input placeholder="Label (e.g. Office) — optional" value={addressForm.label} onChange={e=>setAddressForm(f=>({...f, label:e.target.value}))} style={addressInputStyle}/>
+                              <input placeholder="Address line 1 *" value={addressForm.line1} onChange={e=>setAddressForm(f=>({...f, line1:e.target.value}))} style={addressInputStyle}/>
+                              <input placeholder="Address line 2 — optional" value={addressForm.line2} onChange={e=>setAddressForm(f=>({...f, line2:e.target.value}))} style={addressInputStyle}/>
+                              <div style={{ display:"flex", gap:8 }}>
+                                <input placeholder="City *" value={addressForm.city} onChange={e=>setAddressForm(f=>({...f, city:e.target.value}))} style={{...addressInputStyle, flex:1}}/>
+                                <input placeholder="State *" value={addressForm.state} onChange={e=>setAddressForm(f=>({...f, state:e.target.value}))} style={{...addressInputStyle, flex:1}}/>
+                              </div>
+                              <input placeholder="PIN code *" value={addressForm.postalCode} onChange={e=>setAddressForm(f=>({...f, postalCode:e.target.value}))} style={addressInputStyle}/>
+                              {type === "BILLING" && (
+                                <input placeholder="GSTIN — optional" value={addressForm.gstNumber} onChange={e=>setAddressForm(f=>({...f, gstNumber:e.target.value}))} style={addressInputStyle}/>
+                              )}
+                              <div style={{ display:"flex", gap:8, marginTop:2 }}>
+                                <Btn variant="primary" disabled={savingAddress} style={{ fontSize:12, padding:"7px 16px" }} onClick={saveInlineAddress}>{savingAddress ? "Saving…" : "Save address"}</Btn>
+                                <Btn variant="ghost" disabled={savingAddress} style={{ fontSize:12, padding:"7px 16px" }} onClick={()=>setAddressFormType(null)}>Cancel</Btn>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      ))}
                     </div>
                   </div>
                 )}
@@ -1574,8 +1715,23 @@ function PCBOrderPage() {
                 </div>
               ) : (
                 <>
-                  <Btn variant="gold" full disabled={!quote || quoteLoading || submitting} style={{ fontSize:15, padding:"13px 0", marginBottom:10 }} onClick={handlePlaceOrder}>{submitting ? "Placing order…" : "Place Order →"}</Btn>
-                  <Btn variant="ghost" full disabled={!quote || quoteLoading || submitting} style={{ fontSize:13, padding:"10px 0", marginBottom:16 }} onClick={handleSaveQuote}>{submitting ? "Saving…" : "Save Quote"}</Btn>
+                  {/* Live readiness checklist — the buttons stay clickable and
+                      explain what's missing via toasts, but this shows it
+                      up-front so nobody has to guess. */}
+                  <div style={{ padding:"10px 14px", background:C.bg3, borderRadius:10, border:`1px solid ${C.border}`, marginBottom:12 }}>
+                    {([
+                      [!!file, "Gerber files uploaded"],
+                      [hasValidDims, "Board dimensions set"],
+                      [sessionStatus === "authenticated" && !!deliveryAddressId, sessionStatus === "authenticated" ? "Delivery address selected" : "Signed in with a delivery address"],
+                    ] as [boolean, string][]).map(([done, label]) => (
+                      <div key={label} style={{ display:"flex", alignItems:"center", gap:8, fontSize:12, color:done?C.green:C.text2, fontFamily:"'DM Sans',sans-serif", marginBottom:4 }}>
+                        <span style={{ width:16, textAlign:"center", fontWeight:700 }}>{done ? "✓" : "○"}</span>
+                        <span style={{ textDecoration:"none" }}>{label}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <Btn variant="gold" full disabled={submitting} style={{ fontSize:15, padding:"13px 0", marginBottom:10 }} onClick={handlePlaceOrder}>{submitting ? "Placing order…" : "Place Order →"}</Btn>
+                  <Btn variant="ghost" full disabled={submitting} style={{ fontSize:13, padding:"10px 0", marginBottom:16 }} onClick={handleSaveQuote}>{submitting ? "Saving…" : "Save Quote"}</Btn>
                 </>
               )}
 
@@ -1763,11 +1919,11 @@ function AssemblyPage() {
   const [files, setFiles] = useState({});
 
   return (
-    <div style={{ minHeight:"100vh", background:C.bg1, padding:"40px" }}>
+    <div style={{ minHeight:"100vh", background:C.bg1, padding:"clamp(16px, 4vw, 40px)" }}>
       <div style={{ maxWidth:960, margin:"0 auto" }}>
         <div style={{ marginBottom:28 }}>
           <SectionLabel>PCB ASSEMBLY SERVICE</SectionLabel>
-          <h1 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:36, fontWeight:800, color:C.text0, margin:"4px 0 8px", letterSpacing:"-0.5px" }}>PCB Assembly (PCBA)</h1>
+          <h1 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"clamp(26px, 5vw, 36px)", fontWeight:800, color:C.text0, margin:"4px 0 8px", letterSpacing:"-0.5px" }}>PCB Assembly (PCBA)</h1>
           <p style={{ color:C.text1, fontSize:15, margin:0 }}>Full turnkey or consignment assembly · SMT + THT · AOI inspection · Functional test</p>
         </div>
 
@@ -1776,7 +1932,7 @@ function AssemblyPage() {
             {/* Service type */}
             <Card style={{ padding:0, overflow:"hidden" }}>
               <div style={{ padding:"14px 20px", borderBottom:`1px solid ${C.border}`, fontSize:13, fontWeight:700, color:C.text0, fontFamily:"'DM Sans',sans-serif" }}>Assembly type</div>
-              <div style={{ padding:20, display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12 }}>
+              <div style={{ padding:20, display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(180px, 1fr))", gap:12 }}>
                 {[
                   ["turnkey","Turnkey","We source all components from verified suppliers","Best value"],
                   ["partial","Partial","You supply some, we source the rest","Flexible"],
@@ -1817,7 +1973,7 @@ function AssemblyPage() {
             {/* Board details */}
             <Card style={{ padding:0, overflow:"hidden" }}>
               <div style={{ padding:"14px 20px", borderBottom:`1px solid ${C.border}`, fontSize:13, fontWeight:700, color:C.text0, fontFamily:"'DM Sans',sans-serif" }}>Board details</div>
-              <div style={{ padding:20, display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:14 }}>
+              <div style={{ padding:20, display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(180px, 1fr))", gap:14 }}>
                 {[["Quantity (boards)","10"],["SMT components","48"],["Through-hole","12"],["Unique parts","18"],["Board size","100×80 mm"],["Test required","Functional"]].map(([l,v])=>(
                   <div key={l}>
                     <div style={{ fontSize:11, color:C.text2, marginBottom:6, fontWeight:700, fontFamily:"'DM Mono',monospace", letterSpacing:0.5 }}>{l.toUpperCase()}</div>
@@ -1882,11 +2038,11 @@ const STOCK_TAG: Record<ProductSummary["stockStatus"], { label: string; color: s
   OUT_OF_STOCK: { label:"Out of Stock", color:"gray" },
 };
 
-function ShopPage() {
-  const [cart, setCart] = useState<Record<string, number>>({});
+function ShopPage({ cart, setCart }: { cart: Record<string, number>; setCart: React.Dispatch<React.SetStateAction<Record<string, number>>> }) {
   const [filter, setFilter] = useState("All");
   const [products, setProducts] = useState<ProductSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  const [cartOpen, setCartOpen] = useState(false);
 
   useEffect(() => {
     fetch("/api/products")
@@ -1898,17 +2054,73 @@ function ShopPage() {
   const cats = ["All", ...Array.from(new Set(products.map(p => p.category)))];
   const visible = products.filter(p=>filter==="All"||p.category===filter);
 
+  const cartCount = Object.values(cart).reduce((a,b)=>a+b,0);
+  const cartItems = Object.entries(cart)
+    .map(([id, qty]) => ({ product: products.find(p => p.id === id), qty }))
+    .filter((x): x is { product: ProductSummary; qty: number } => !!x.product && x.qty > 0);
+  const cartTotal = cartItems.reduce((sum, x) => sum + Number(x.product.price) * x.qty, 0);
+
+  function changeQty(id: string, delta: number) {
+    setCart(c => {
+      const next = { ...c, [id]: (c[id] || 0) + delta };
+      if (next[id] <= 0) delete next[id];
+      return next;
+    });
+  }
+
+  // Online checkout isn't built yet — the honest working flow is a prefilled
+  // order enquiry email, not a cart button that goes nowhere.
+  const enquiryHref = `mailto:proembsys.tech@gmail.com?subject=${encodeURIComponent("Module order enquiry — ProPCB shop")}&body=${encodeURIComponent(
+    `Hi ProEmbSys,\n\nI'd like to order:\n\n${cartItems.map(x => `- ${x.product.name} × ${x.qty} — ₹${(Number(x.product.price) * x.qty).toLocaleString("en-IN")}`).join("\n")}\n\nTotal: ₹${cartTotal.toLocaleString("en-IN")}\n\nName:\nPhone:\nShipping address:\n`
+  )}`;
+
   return (
-    <div style={{ minHeight:"100vh", background:C.bg1, padding:"40px" }}>
+    <div style={{ minHeight:"100vh", background:C.bg1, padding:"clamp(16px, 4vw, 40px)" }}>
       <div style={{ maxWidth:1000, margin:"0 auto" }}>
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", marginBottom:28 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-end", marginBottom:28, flexWrap:"wrap", gap:12 }}>
           <div>
             <SectionLabel>ELECTRONICS SHOP</SectionLabel>
-            <h1 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:36, fontWeight:800, color:C.text0, margin:"4px 0 6px", letterSpacing:"-0.5px" }}>ProEmbSys Modules</h1>
+            <h1 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"clamp(26px, 5vw, 36px)", fontWeight:800, color:C.text0, margin:"4px 0 6px", letterSpacing:"-0.5px" }}>ProEmbSys Modules</h1>
             <p style={{ color:C.text1, fontSize:15, margin:0 }}>Manufactured in-house · Tested · Ready to ship pan-India</p>
           </div>
-          <div style={{ background:C.bg2, border:`1px solid ${C.border2}`, borderRadius:10, padding:"10px 18px", fontFamily:"'DM Sans',sans-serif", fontSize:14, color:C.accent2, fontWeight:700 }}>
-            🛒 Cart ({Object.values(cart).reduce((a,b)=>a+b,0)})
+          <div style={{ position:"relative" }}>
+            <button onClick={()=>setCartOpen(o=>!o)} aria-expanded={cartOpen} aria-label={`Cart with ${cartCount} items`}
+              style={{ background:cartOpen?C.accentDim:C.bg2, border:`1px solid ${C.border2}`, borderRadius:10, padding:"10px 18px", fontFamily:"'DM Sans',sans-serif", fontSize:14, color:C.accent2, fontWeight:700, cursor:"pointer" }}>
+              🛒 Cart ({cartCount}) {cartOpen ? "▴" : "▾"}
+            </button>
+            {cartOpen && (
+              <div style={{ position:"absolute", right:0, top:"calc(100% + 8px)", width:"min(360px, 88vw)", background:C.bg0, border:`1px solid ${C.border2}`, borderRadius:12, padding:16, zIndex:100, boxShadow:"0 12px 40px rgba(0,0,0,0.5)" }}>
+                {cartItems.length === 0 ? (
+                  <div style={{ fontSize:13, color:C.text2, fontFamily:"'DM Sans',sans-serif" }}>Your cart is empty — add some modules below.</div>
+                ) : (
+                  <>
+                    {cartItems.map(({product, qty}) => (
+                      <div key={product.id} style={{ display:"flex", alignItems:"center", gap:10, marginBottom:10 }}>
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ fontSize:13, fontWeight:600, color:C.text0, fontFamily:"'DM Sans',sans-serif", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{product.name}</div>
+                          <div style={{ fontSize:11.5, color:C.text2, fontFamily:"'DM Sans',sans-serif" }}>₹{Number(product.price).toLocaleString("en-IN")} each</div>
+                        </div>
+                        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                          <button onClick={()=>changeQty(product.id, -1)} aria-label={`Remove one ${product.name}`} style={{ width:24, height:24, borderRadius:6, border:`1px solid ${C.border}`, background:C.bg3, color:C.text0, cursor:"pointer", fontSize:14, lineHeight:1 }}>−</button>
+                          <span style={{ fontSize:13, color:C.text0, fontFamily:"'DM Mono',monospace", minWidth:18, textAlign:"center" }}>{qty}</span>
+                          <button onClick={()=>changeQty(product.id, +1)} aria-label={`Add one ${product.name}`} style={{ width:24, height:24, borderRadius:6, border:`1px solid ${C.border}`, background:C.bg3, color:C.text0, cursor:"pointer", fontSize:14, lineHeight:1 }}>+</button>
+                        </div>
+                        <div style={{ fontSize:13, fontWeight:700, color:C.accent2, fontFamily:"'DM Sans',sans-serif", minWidth:60, textAlign:"right" }}>₹{(Number(product.price)*qty).toLocaleString("en-IN")}</div>
+                      </div>
+                    ))}
+                    <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:10, marginTop:4, display:"flex", justifyContent:"space-between", fontSize:14, fontWeight:800, color:C.text0, fontFamily:"'DM Sans',sans-serif" }}>
+                      <span>Total</span><span>₹{cartTotal.toLocaleString("en-IN")}</span>
+                    </div>
+                    <a href={enquiryHref} style={{ display:"block", textAlign:"center", marginTop:12, background:C.accent, color:"#fff", borderRadius:8, padding:"11px 0", fontSize:13.5, fontWeight:700, textDecoration:"none", fontFamily:"'DM Sans',sans-serif" }}>
+                      Email order enquiry →
+                    </a>
+                    <div style={{ fontSize:11, color:C.text2, marginTop:8, textAlign:"center", fontFamily:"'DM Sans',sans-serif" }}>
+                      Online checkout is coming soon — we confirm orders and payment by email within one business day.
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -1998,11 +2210,11 @@ function BlogPage() {
   const [featured, ...rest] = filtered;
 
   return (
-    <div style={{ minHeight:"100vh", background:C.bg1, padding:"40px" }}>
+    <div style={{ minHeight:"100vh", background:C.bg1, padding:"clamp(16px, 4vw, 40px)" }}>
       <div style={{ maxWidth:960, margin:"0 auto" }}>
         <div style={{ marginBottom:36 }}>
           <SectionLabel>TECHNICAL BLOG</SectionLabel>
-          <h1 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:36, fontWeight:800, color:C.text0, margin:"4px 0 8px", letterSpacing:"-0.5px" }}>PCB Knowledge Base</h1>
+          <h1 style={{ fontFamily:"'DM Sans',sans-serif", fontSize:"clamp(26px, 5vw, 36px)", fontWeight:800, color:C.text0, margin:"4px 0 8px", letterSpacing:"-0.5px" }}>PCB Knowledge Base</h1>
           <p style={{ color:C.text1, fontSize:15, margin:0 }}>Design guides · Manufacturing insights · Engineering tips from the ProEmbSys team</p>
         </div>
 
@@ -2048,7 +2260,7 @@ function BlogPage() {
             </div>
 
             {/* Post grid */}
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:18, marginBottom:32 }}>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(250px, 1fr))", gap:18, marginBottom:32 }}>
               {rest.map((p,i)=>(
                 <a key={p.id} href={`/blog/${p.slug}`} style={{ textDecoration:"none" }}>
                   <div style={{ background:C.bg2, border:`1px solid ${C.border}`, borderRadius:14, padding:"22px", cursor:"pointer", transition:"all 0.2s", height:"100%" }}
@@ -2078,7 +2290,7 @@ function Footer({ setPage }) {
   return (
     <footer style={{ background:C.bg0, borderTop:`1px solid ${C.border}`, padding:"48px 40px 28px", fontFamily:"'DM Sans',sans-serif" }}>
       <div style={{ maxWidth:1000, margin:"0 auto" }}>
-        <div style={{ display:"grid", gridTemplateColumns:"2.5fr 1fr 1fr 1fr", gap:32, marginBottom:40 }}>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(200px, 1fr))", gap:32, marginBottom:40 }}>
           <div>
             <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
               <div style={{ width:32, height:32, background:`linear-gradient(135deg, ${C.accent} 0%, #0369a1 100%)`, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center" }}>
@@ -2137,31 +2349,45 @@ function Footer({ setPage }) {
 
 // ─── ROOT APP ─────────────────────────────────────────────────────────────────
 
+const PAGE_KEYS = ["home", "order", "panel", "assembly", "shop", "blog"];
+
 export default function App() {
-  const [page, setPage] = useState("home");
+  const [page, setPageState] = useState("home");
   const [cart, setCart] = useState<Record<string, number>>({});
   const cartCount = Object.values(cart).reduce((a,b)=>a+b,0);
 
+  // Every section switch is mirrored into the URL so back/forward buttons,
+  // bookmarks, and shared links all work — the switcher used to be invisible
+  // to the browser (page state only), which broke the back button.
+  const setPage = useCallback((key: string) => {
+    setPageState(key);
+    window.history.pushState({}, "", key === "home" ? "/" : `/?page=${key}`);
+  }, []);
+
   useEffect(() => { window.scrollTo(0, 0); }, [page]);
 
-  const pages = {
+  // Read ?page= on load (standalone pages link back here that way) and on
+  // every popstate so browser navigation restores the right section.
+  // Client-side only — mirrors the sidebar-width hydration pattern: avoid
+  // touching `window` during SSR.
+  useEffect(() => {
+    const readPage = () => {
+      const requested = new URLSearchParams(window.location.search).get("page");
+      setPageState(requested && PAGE_KEYS.includes(requested) ? requested : "home");
+    };
+    readPage();
+    window.addEventListener("popstate", readPage);
+    return () => window.removeEventListener("popstate", readPage);
+  }, []);
+
+  const pages: Record<string, React.ReactNode> = {
     home:     <HomePage setPage={setPage}/>,
     order:    <PCBOrderPage/>,
     panel:    <PanelizationPage/>,
     assembly: <AssemblyPage/>,
-    shop:     <ShopPage/>,
+    shop:     <ShopPage cart={cart} setCart={setCart}/>,
     blog:     <BlogPage/>,
   };
-
-  // Standalone pages (fab-capabilities, orders) link back here via
-  // /?page=order etc. since they're outside this switcher's state — this
-  // reads that once on mount, client-side only (mirrors the sidebar-width
-  // hydration pattern below: avoid touching `window` during SSR).
-  useEffect(() => {
-    const requested = new URLSearchParams(window.location.search).get("page");
-    if (requested && requested in pages) setPage(requested);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   return (
     <div style={{ fontFamily:"'DM Sans', sans-serif", background:C.bg1, minHeight:"100vh", color:C.text0 }}>
