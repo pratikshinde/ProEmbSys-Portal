@@ -105,6 +105,8 @@ The tracespace renderer emits **Y-down SVG coordinates** (Y=0 at top = Gerber ma
 
 The `OutputFormat` struct controls the `%FS...%` header in exported files. Default is 4.6 mm absolute (handles boards up to 9999mm). `autoDetectIntegerDigits` in `panelization-engine.ts` adjusts the integer digit count if the panel is unusually large.
 
+Panel-overlay apertures (L-shape marks, stroke text, donuts, fiducials) are allocated **dynamically above the customer's max D-code** (`findMaxDCode` in `panelization-engine.ts`, base ≥ 301 rounded to the next century) — never hardcode overlay D-codes like the old D53/D54/D200/D210; customer Gerbers routinely use those ranges and duplicate/conflicting `%ADD` definitions trip CAM tools. The Excellon parser (`excellon-parser.ts`) handles Altium 9+-digit coordinates (5.5 autodetect), Allegro `;Holesize`/`;FILE_FORMAT` comment headers, `M00` tool changes, stepped `R` repeat commands, and explicit-decimal coordinates (KiCad) — ported/adapted from the standalone `pcb-panelization-tool` repo's `font-fix` branch, which is the upstream lineage of this tool.
+
 ### UI layout (Panelization tool)
 
 Collapsible resizable sidebar (280–600px) + full-height SVG canvas. Three sidebar tabs — **Layers**, **Panel Config**, **Info & Export** — controlled by `activeTab` in the store. Panel computation is only triggered by explicit user action (clicking "Create Panel"), not automatically on layer add or config change.

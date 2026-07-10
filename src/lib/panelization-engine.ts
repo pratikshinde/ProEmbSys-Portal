@@ -1129,7 +1129,8 @@ export function generateLShapeGerberCommands(
   pcbWidth: number,
   pcbHeight: number,
   config: PanelConfig,
-  fmt: OutputFormat
+  fmt: OutputFormat,
+  apertureCode: number = 53
 ): string[] {
   if (!config.enableLShapeMarks) return []
 
@@ -1140,13 +1141,14 @@ export function generateLShapeGerberCommands(
   const maxArm = Math.min(pcbWidth / 2, pcbHeight / 2)
   if (arm <= 0 || arm > maxArm) return []
 
-  // Define a line aperture for the L-shapes (reuse aperture code 53 like CAM350)
-  lines.push(`%ADD53C,${config.lShapeLineWidth.toFixed(6)}*%`)
+  // Define a line aperture for the L-shapes. The code must not collide with
+  // any D-code already used in the customer's Gerber — see findMaxDCode().
+  lines.push(`%ADD${apertureCode}C,${config.lShapeLineWidth.toFixed(6)}*%`)
 
   const f = (v: number) => formatCoordinate(v, fmt)
 
   // Bottom-left corner (0, 0): L from (arm, 0) → (0, 0) → (0, arm)
-  lines.push('G54D53*')
+  lines.push(`G54D${apertureCode}*`)
   lines.push(`X${f(arm)}Y${f(0)}D02*`)
   lines.push(`X${f(0)}Y${f(0)}D01*`)
   lines.push(`X${f(0)}Y${f(arm)}D01*`)
@@ -1192,7 +1194,8 @@ export function generatePanelBorderLShapeGerberCommands(
   panelWidth: number,
   panelHeight: number,
   config: PanelConfig,
-  fmt: OutputFormat
+  fmt: OutputFormat,
+  apertureCode: number = 54
 ): string[] {
   if (!config.enablePanelBorderLShape) return []
 
@@ -1203,13 +1206,15 @@ export function generatePanelBorderLShapeGerberCommands(
   const maxArm = Math.min(panelWidth / 2, panelHeight / 2)
   if (arm <= 0 || arm > maxArm) return []
 
-  // Define a line aperture for the panel border L-shapes (use different D-code)
-  lines.push(`%ADD54C,${config.panelBorderLShapeLineWidth.toFixed(6)}*%`)
+  // Define a line aperture for the panel border L-shapes (distinct from the
+  // PCB-corner L-shape code; both are allocated above the customer's max
+  // D-code — see findMaxDCode()).
+  lines.push(`%ADD${apertureCode}C,${config.panelBorderLShapeLineWidth.toFixed(6)}*%`)
 
   const f = (v: number) => formatCoordinate(v, fmt)
 
   // Bottom-left corner (0, 0): L from (arm, 0) → (0, 0) → (0, arm)
-  lines.push('G54D54*')
+  lines.push(`G54D${apertureCode}*`)
   lines.push(`X${f(arm)}Y${f(0)}D02*`)
   lines.push(`X${f(0)}Y${f(0)}D01*`)
   lines.push(`X${f(0)}Y${f(arm)}D01*`)
@@ -1431,6 +1436,40 @@ export interface BaseOffset {
   y: number
 }
 
+/**
+ * Scan raw Gerber content to find the maximum D-code defined or selected.
+ * Matches extended commands %ADD<number> and select commands D<number>* where number >= 10.
+ *
+ * Used to allocate panel-overlay aperture codes (L-shapes, text, donuts,
+ * fiducials) above anything the customer's file already uses — fixed codes
+ * like D53 collide with real-world Gerbers (customer apertures commonly run
+ * D10 and up) and duplicate definitions trip CAM tools.
+ */
+export function findMaxDCode(gerberContent: string): number {
+  let maxD = 9 // Minimum standard D-code starts at 10
+
+  // 1. Match %ADD<number><shape>
+  const addRegex = /%ADD(\d+)/g
+  let match
+  while ((match = addRegex.exec(gerberContent)) !== null) {
+    const code = parseInt(match[1], 10)
+    if (!isNaN(code) && code > maxD) {
+      maxD = code
+    }
+  }
+
+  // 2. Match D<number>* selection commands where number >= 10
+  const selectRegex = /D(\d+)\*/g
+  while ((match = selectRegex.exec(gerberContent)) !== null) {
+    const code = parseInt(match[1], 10)
+    if (!isNaN(code) && code >= 10 && code > maxD) {
+      maxD = code
+    }
+  }
+
+  return maxD
+}
+
 export function generatePanelizedGerber(
   parsedLayer: GerberLayer,
   rawContent: string,
@@ -1443,6 +1482,22 @@ export function generatePanelizedGerber(
 ): string {
   const fmt: OutputFormat = outputFormat || DEFAULT_OUTPUT_FORMAT
   const lines: string[] = []
+
+  // ---- 0. Allocate collision-free D-codes for panel overlay features ----
+  // Scan both the raw content and the parsed aperture table (parsing may have
+  // renumbered or the raw file may select codes the parser normalized away),
+  // then start our codes at the next "century" boundary above the max, and
+  // never below 301.
+  let maxD = findMaxDCode(rawContent)
+  for (const code of parsedLayer.apertures.keys()) {
+    if (code > maxD) maxD = code
+  }
+  const baseCode = Math.max(301, Math.ceil((maxD + 1) / 100) * 100 + 1)
+  const lShapeCornerCode = baseCode
+  const lShapeBorderCode = baseCode + 1
+  const strokeFontApertureCode = baseCode + 2
+  const donutApertureCode = baseCode + 3
+  const fiducialApertureCode = baseCode + 4
 
   // ---- 1. Format header ----
   lines.push(generateFSCommand(fmt))
@@ -1508,10 +1563,14 @@ export function generatePanelizedGerber(
   // L-shapes are added to copper and mask layers only.
   if (config.enableLShapeMarks && layerType && layerNeedsLShapeMarks(layerType)) {
     // Generate L-shape commands relative to PCB origin (0,0)
-    const lShapeBase = generateLShapeGerberCommands(panel.pcbWidth, panel.pcbHeight, config, fmt)
+    const lShapeBase = generateLShapeGerberCommands(panel.pcbWidth, panel.pcbHeight, config, fmt, lShapeCornerCode)
 
     // For each panel position, offset the L-shape coordinates
     if (lShapeBase.length > 0) {
+      // Define the aperture once, not per position — duplicate %ADD blocks
+      // trip warnings in CAM tools.
+      lines.push(`%ADD${lShapeCornerCode}C,${config.lShapeLineWidth.toFixed(6)}*%`)
+
       for (const pos of panel.pcbPositions) {
         const offX = pos.x + baseOffsetX
         const offY = pos.y + baseOffsetY
@@ -1521,13 +1580,10 @@ export function generatePanelizedGerber(
         const w = panel.pcbWidth
         const h = panel.pcbHeight
 
-        // Add aperture definition only once (first occurrence)
-        lines.push(`%ADD53C,${config.lShapeLineWidth.toFixed(6)}*%`)
-
         const f = (v: number) => formatCoordinate(v + offX, fmt)
         const fy = (v: number) => formatCoordinate(v + offY, fmt)
 
-        lines.push('G54D53*')
+        lines.push(`G54D${lShapeCornerCode}*`)
         // Bottom-left: (arm, 0) → (0, 0) → (0, arm)
         lines.push(`X${f(arm)}Y${fy(0)}D02*`)
         lines.push(`X${f(0)}Y${fy(0)}D01*`)
@@ -1555,7 +1611,8 @@ export function generatePanelizedGerber(
       panel.panelWidth,
       panel.panelHeight,
       config,
-      fmt
+      fmt,
+      lShapeBorderCode
     )
     lines.push(...panelBorderLShapes)
   }
@@ -1568,12 +1625,12 @@ export function generatePanelizedGerber(
     if (refHoles.length > 0) {
       const od = config.donutOuterDiameter || 2.25
       const id = config.donutInnerDiameter || 1.25
-      // Add donut aperture definition (use D-code 200 to match industry convention)
-      lines.push(`%ADD200C,${od.toFixed(5)}X${id.toFixed(5)}*%`)
+      // Add donut aperture definition (dynamic code — see findMaxDCode)
+      lines.push(`%ADD${donutApertureCode}C,${od.toFixed(5)}X${id.toFixed(5)}*%`)
 
       const f = (v: number) => formatCoordinate(v, fmt)
 
-      lines.push('G54D200*')
+      lines.push(`G54D${donutApertureCode}*`)
       for (const hole of refHoles) {
         lines.push(`X${f(hole.x)}Y${f(hole.y)}D03*`)
       }
@@ -1587,12 +1644,12 @@ export function generatePanelizedGerber(
 
     if (enabledForSide) {
       const diameter = layerType === 'copper' ? config.fiducialDiameter : config.fiducialClearance
-      // Add circular aperture definition (use D-code 210)
-      lines.push(`%ADD210C,${diameter.toFixed(6)}*%`)
+      // Add circular aperture definition (dynamic code — see findMaxDCode)
+      lines.push(`%ADD${fiducialApertureCode}C,${diameter.toFixed(6)}*%`)
 
       const f = (v: number) => formatCoordinate(v, fmt)
 
-      lines.push('G54D210*')
+      lines.push(`G54D${fiducialApertureCode}*`)
       for (const fid of panel.fiducials) {
         lines.push(`X${f(fid.x)}Y${f(fid.y)}D03*`)
       }
@@ -1638,9 +1695,9 @@ export function generatePanelizedGerber(
 
     if (filteredText.length > 0) {
       console.log(`[Gerber] Adding ${filteredText.length} text items to ${layerType} (${currentLayerSide}) layer using ${isRegionFont ? 'region' : 'stroke'} font`)
-      const textCmds = isRegionFont 
+      const textCmds = isRegionFont
         ? generateRegionTextGerberCommands(filteredText, fmt)
-        : generateStrokeFontGerberCommands(filteredText, fmt)
+        : generateStrokeFontGerberCommands(filteredText, fmt, strokeFontApertureCode)
       lines.push(...textCmds)
     } else {
       console.log(`[Gerber] No text items for ${layerType} (${currentLayerSide}) layer`)

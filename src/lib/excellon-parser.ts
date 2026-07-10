@@ -121,8 +121,23 @@ class ExcellonParserState {
     if (digits.startsWith('+')) {
       digits = digits.substring(1)
     }
-    // Remove any embedded decimal point
-    digits = digits.replace('.', '')
+
+    // A coordinate with an explicit decimal point is self-describing (KiCad
+    // emits "X12.7Y25.4") — running it through zero-suppression padding would
+    // misplace the decimal by orders of magnitude.
+    if (digits.includes('.')) {
+      const direct = parseFloat(digits)
+      return isNaN(direct) ? undefined : negative ? -direct : direct
+    }
+
+    // Autodetect 5.5 metric format for long coordinates if format is default 2.4
+    // (Altium exports drill files with 9+ digit coordinates and no format header,
+    // which would otherwise parse with wildly shifted positions.)
+    if (digits.length >= 9 && this.formatInteger === 2 && this.formatDecimal === 4) {
+      this.formatInteger = 5
+      this.formatDecimal = 5
+      this.units = 'mm'
+    }
 
     const totalDigits = this.totalDigits
     const intDigits = this.formatInteger
@@ -307,8 +322,39 @@ export function parseExcellon(content: string, fileName: string): ExcellonFile {
     const line = lines[lineIdx].trim()
     const upper = line.toUpperCase()
 
-    // Skip empty lines and comments
-    if (line === '' || line.startsWith(';') || line.startsWith('(')) continue
+    // Skip empty lines and (-style comments
+    if (line === '' || line.startsWith('(')) continue
+
+    // Parse comment-based tool definitions (Allegro style) and file format
+    // before skipping ;-comments — Allegro drill files define their tools and
+    // coordinate format ONLY in comments, e.g. ";Holesize 1. = 0.90 MM" and
+    // ";FILE_FORMAT=5:5".
+    if (line.startsWith(';')) {
+      const holeSizeMatch = line.match(/;\s*Holesize\s*(\d+)\.\s*=\s*([\d.]+)/i)
+      if (holeSizeMatch) {
+        const toolNum = parseInt(holeSizeMatch[1], 10)
+        const diameter = parseFloat(holeSizeMatch[2])
+        const isMetric = /MM/i.test(line)
+
+        if (isMetric && state.units === 'inches') {
+          state.units = 'mm'
+        }
+
+        state.tools.set(toolNum, {
+          number: toolNum,
+          shape: 'circle',
+          diameter,
+          length: 0,
+        })
+      }
+
+      const fileFormatMatch = line.match(/;\s*FILE_FORMAT\s*=\s*(\d+)\s*:\s*(\d+)/i)
+      if (fileFormatMatch) {
+        state.formatInteger = parseInt(fileFormatMatch[1], 10)
+        state.formatDecimal = parseInt(fileFormatMatch[2], 10)
+      }
+      continue
+    }
 
     // ---- Program start/end ----
     if (upper.includes('M48')) {
@@ -320,6 +366,17 @@ export function parseExcellon(content: string, fileName: string): ExcellonFile {
       headerFinished = true
       continue
     }
+    // Handle M00 tool changes (Allegro style manual tool change stops) —
+    // must come before the end-of-program check below.
+    if (upper.startsWith('M00') || upper === 'M00') {
+      if (state.currentTool !== null) {
+        state.currentTool++
+      } else {
+        state.currentTool = 1
+      }
+      continue
+    }
+
     if (upper.includes('M30') || upper.includes('M02') || upper.includes('M2')) {
       break
     }
@@ -415,8 +472,8 @@ export function parseExcellon(content: string, fileName: string): ExcellonFile {
       }
     }
 
-    // Coordinate data: X<val>Y<val>
-    if (upper.includes('X') || upper.includes('Y')) {
+    // Coordinate data: X<val>Y<val> or Repeat command R
+    if (upper.includes('X') || upper.includes('Y') || upper.includes('R')) {
       processDrillLine(line, state)
     }
   }
@@ -442,67 +499,109 @@ export function parseExcellon(content: string, fileName: string): ExcellonFile {
  * Process a drill line containing X/Y coordinates.
  */
 function processDrillLine(line: string, state: ExcellonParserState): void {
-  // Extract all X/Y coordinate pairs from the line
-  // Multiple hits can be on one line: X100Y200X300Y400
+  // A line can contain coordinate hits ("X100Y200", possibly several pairs)
+  // and/or an Excellon repeat command ("R03Y0000254000" = repeat the last hit
+  // 3 more times, each stepped by the given offset). The old implementation
+  // stamped the SAME position `repeat` times, which produced overlapping
+  // duplicate hits instead of a stepped row — wrong for Allegro/Altium
+  // step-repeat output.
+  const parts = line.split(/R/i)
+  const coordPart = parts[0].trim()
+  const repeatPart = parts[1] ? parts[1].trim() : null
 
-  const xValues: string[] = []
-  const yValues: string[] = []
+  // 1. Process coordPart (e.g. "X100Y200") if present
+  if (coordPart) {
+    const xValues: string[] = []
+    const yValues: string[] = []
 
-  const regex = /([XY])([+-]?\d*\.?\d*)/gi
-  let match: RegExpExecArray | null
+    const regex = /([XY])([+-]?\d*\.?\d*)/gi
+    let match: RegExpExecArray | null
 
-  while ((match = regex.exec(line)) !== null) {
-    const letter = match[1].toUpperCase()
-    const value = match[2]
-    if (letter === 'X') {
-      xValues.push(value)
-    } else {
-      yValues.push(value)
+    while ((match = regex.exec(coordPart)) !== null) {
+      const letter = match[1].toUpperCase()
+      const value = match[2]
+      if (letter === 'X') {
+        xValues.push(value)
+      } else {
+        yValues.push(value)
+      }
+    }
+
+    if (xValues.length > 0 || yValues.length > 0) {
+      if (state.currentTool === null) {
+        // Some files have coordinates before tool selection
+        // Use T01 as default
+        state.currentTool = 1
+        state.warnings.push('No tool selected before drill command, defaulting to T01')
+      }
+
+      const maxCoords = Math.max(xValues.length, yValues.length)
+
+      for (let ci = 0; ci < maxCoords; ci++) {
+        const rawX = ci < xValues.length ? xValues[ci] : undefined
+        const rawY = ci < yValues.length ? yValues[ci] : undefined
+
+        const newX = state.parseCoordinateValue(rawX, 'x')
+        const newY = state.parseCoordinateValue(rawY, 'y')
+
+        if (state.absoluteMode) {
+          // Absolute: new value becomes current position
+          if (newX !== undefined) state.currentX = newX
+          if (newY !== undefined) state.currentY = newY
+        } else {
+          // Incremental: add to current position
+          if (newX !== undefined) state.currentX = (state.currentX || 0) + newX
+          if (newY !== undefined) state.currentY = (state.currentY || 0) + newY
+        }
+
+        if (state.currentX !== null && state.currentY !== null) {
+          state.hits.push({
+            x: state.currentX,
+            y: state.currentY,
+            toolNumber: state.currentTool!,
+          })
+        }
+      }
     }
   }
 
-  // Extract repeat count
-  const rMatch = line.match(/R\s*(\d+)/i)
-  const repeat = rMatch ? parseInt(rMatch[1], 10) : 1
+  // 2. Process repeatPart (e.g. "03Y0000254000") if present
+  if (repeatPart) {
+    const countMatch = repeatPart.match(/^(\d+)/)
+    if (countMatch) {
+      const count = parseInt(countMatch[1], 10)
+      const rest = repeatPart.substring(countMatch[0].length)
 
-  if (state.currentTool === null) {
-    // Some files have coordinates before tool selection
-    // Use T01 as default
-    state.currentTool = 1
-    state.warnings.push('No tool selected before drill command, defaulting to T01')
-  }
+      let dx = 0
+      let dy = 0
 
-  if (xValues.length === 0 && yValues.length === 0) return
+      const xMatch = rest.match(/X([+-]?\d*\.?\d*)/i)
+      const yMatch = rest.match(/Y([+-]?\d*\.?\d*)/i)
 
-  // If we have one X and one Y, it's a single drill
-  // If we have multiple, pair them up
-  const maxCoords = Math.max(xValues.length, yValues.length)
+      if (xMatch) {
+        const val = state.parseCoordinateValue(xMatch[1], 'x')
+        if (val !== undefined) dx = val
+      }
+      if (yMatch) {
+        const val = state.parseCoordinateValue(yMatch[1], 'y')
+        if (val !== undefined) dy = val
+      }
 
-  for (let ci = 0; ci < maxCoords; ci++) {
-    const rawX = ci < xValues.length ? xValues[ci] : undefined
-    const rawY = ci < yValues.length ? yValues[ci] : undefined
-
-    const newX = state.parseCoordinateValue(rawX, 'x')
-    const newY = state.parseCoordinateValue(rawY, 'y')
-
-    if (state.absoluteMode) {
-      // Absolute: new value becomes current position
-      if (newX !== undefined) state.currentX = newX
-      if (newY !== undefined) state.currentY = newY
-    } else {
-      // Incremental: add to current position
-      if (newX !== undefined) state.currentX = (state.currentX || 0) + newX
-      if (newY !== undefined) state.currentY = (state.currentY || 0) + newY
-    }
-
-    if (state.currentX !== null && state.currentY !== null) {
-      // Apply repeat
-      for (let r = 0; r < repeat; r++) {
-        state.hits.push({
-          x: state.currentX,
-          y: state.currentY,
-          toolNumber: state.currentTool!,
-        })
+      if (state.currentX !== null && state.currentY !== null) {
+        if (state.currentTool === null) {
+          state.currentTool = 1
+        }
+        for (let i = 1; i <= count; i++) {
+          const rx = state.currentX + i * dx
+          const ry = state.currentY + i * dy
+          state.hits.push({
+            x: rx,
+            y: ry,
+            toolNumber: state.currentTool!,
+          })
+        }
+        state.currentX = state.currentX + count * dx
+        state.currentY = state.currentY + count * dy
       }
     }
   }
@@ -616,10 +715,12 @@ export function isExcellonFile(content: string): boolean {
     upper.includes('M48') ||
     upper.includes('M95') ||
     upper.includes('T01C') ||
-    upper.includes('T01C') ||
     upper.includes('FORMAT=') ||
     upper.includes('ICI,') ||
-    (upper.includes('T01') && upper.includes('X') && upper.includes('Y') && !upper.includes('%FSLAX'))
+    upper.includes('M30') ||
+    upper.includes('M00') ||
+    (upper.includes('T01') && upper.includes('X') && upper.includes('Y') && !upper.includes('%FSLAX')) ||
+    (upper.includes('G90') && upper.includes('X') && upper.includes('Y') && !upper.includes('%FSLAX'))
   )
 }
 
