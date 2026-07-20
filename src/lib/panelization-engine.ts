@@ -6,7 +6,7 @@
 
 import { GerberLayer, GerberAperture } from './gerber-parser'
 import { generateStrokeFontGerberCommands, layerNeedsTextShapes } from './stroke-font'
-import { generateRegionTextGerberCommands, layerNeedsRegionText } from './region-font'
+import { generateRegionTextGerberCommands, layerNeedsRegionText, measureRegionText } from './region-font'
 
 // ============================================================================
 // Output Format Configuration
@@ -992,16 +992,10 @@ export function generateTopRibText(
   const ribHeight = config.sideRibTop
   const topRibY = panelHeight - ribHeight / 2  // Center of top rib
 
-  // Calculate text width for positioning using actual region font metrics
-  // Region font uses: (text.length - 1) * ADVANCE_WIDTH + CHAR_WIDTH
-  // Where ADVANCE_WIDTH = 0.76, CHAR_WIDTH = 0.6 (in character-height units)
-  const CHAR_WIDTH_FONT = 0.6
-  const ADVANCE_WIDTH_FONT = 0.76
-  const measureTextWidth = (text: string) => {
-    if (text.length === 0) return 0
-    const normalizedWidth = (text.length - 1) * ADVANCE_WIDTH_FONT + CHAR_WIDTH_FONT
-    return normalizedWidth * fontSize
-  }
+  // Text width for positioning, using the shared region-font metrics so the
+  // rib text lands exactly where the glyphs render (single source of truth —
+  // see measureRegionText in region-font.ts).
+  const measureTextWidth = (text: string) => measureRegionText(text) * fontSize
 
   // Position: 3.5mm right of top left tooling hole (first character position)
   const textOffsetFromHole = 3.5

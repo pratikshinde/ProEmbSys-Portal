@@ -4,6 +4,7 @@ import React, { useRef, useEffect, useLayoutEffect, useCallback, useState, useMe
 import { useAppStore, getLayerZIndex } from '@/lib/store'
 import { mergeLayerBounds, GerberSvgResult } from '@/lib/gerber-svg'
 import { PanelResult } from '@/lib/panelization-engine'
+import { getRegionTextPolygons } from '@/lib/region-font'
 
 /**
  * GerberViewer — SVG-based viewer using tracespace-rendered layers (Web Worker).
@@ -553,17 +554,43 @@ export default function GerberViewer() {
       }
     }
 
-    // Info text — render on side ribs (Y-inverted, rotation negated)
+    // Info text — render on side ribs.
+    // Region-font mode: draw the TRUE glyph polygons so the preview is WYSIWYG
+    // with the exported Gerber. getRegionTextPolygons returns world-space
+    // (Gerber Y-up, mm) outer + counter contours with alignment/rotation/mirror
+    // already baked in — negate Y (screenY = -gerberY) and use fill-rule
+    // evenodd so counters cut out. Stroke-font mode keeps the native <text>.
+    const useRegionGlyphs = panelConfig.textFont === 'region'
     for (const [idx, info] of pr.infoTexts.entries()) {
+      if (useRegionGlyphs) {
+        if (!info.text) continue
+        const { outer, inner } = getRegionTextPolygons(info)
+        if (outer.length === 0 && inner.length === 0) continue
+        const toSub = (poly: { x: number; y: number }[]) =>
+          poly.length ? `M${poly.map(p => `${p.x.toFixed(4)} ${(-p.y).toFixed(4)}`).join('L')}Z` : ''
+        const d = [...outer, ...inner].map(toSub).join('')
+        const fill = info.mirrored
+          ? 'rgba(0,200,255,0.6)'        // dimmer cyan for mirrored (bottom) text
+          : info.location === 'left-rib' || info.location === 'right-rib'
+            ? 'rgba(0,200,255,0.85)'     // cyan for vertical rib text
+            : 'rgba(210,210,210,0.85)'   // light gray for horizontal rib text
+        elements.push(
+          <path key={`info-${idx}-${info.x}-${info.y}`}
+            d={d} fill={fill} fillRule="evenodd" stroke="none" />
+        )
+        continue
+      }
+
+      // --- stroke-font mode: native <text> approximation ---
       const screenInfoY = -info.y
       const rot = -(info.rotation || 0) // Negate rotation for Y-inverted space
       const baseTransform = rot !== 0 ? `rotate(${rot}, ${info.x}, ${screenInfoY})` : undefined
 
-      // Calculate exact text width using the same region-font metrics to align SVG preview with Gerber
+      // Approximate text width for alignment (stroke font uses fixed advance)
       const CHAR_WIDTH_FONT = 0.6
-      const ADVANCE_WIDTH_FONT = 0.76
-      const textWidth = info.text 
-        ? ((info.text.length - 1) * ADVANCE_WIDTH_FONT + CHAR_WIDTH_FONT) * info.fontSize 
+      const ADVANCE_WIDTH_FONT = 0.7
+      const textWidth = info.text
+        ? ((info.text.length - 1) * ADVANCE_WIDTH_FONT + CHAR_WIDTH_FONT) * info.fontSize
         : 0
 
       const textContent = (

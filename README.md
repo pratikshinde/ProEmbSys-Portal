@@ -18,6 +18,11 @@ Actively developed. Core ordering flow, backend, and panelization tool are funct
 
 Reverse-chronological. Each entry is a real commit — see `git log` for full diffs.
 
+### 2026-07-21 — Region-based panel font quality
+- Replaced the hand-authored region-font glyph polygons with **real vector-font outlines** — an embedded Geist Regular subset (OFL-1.1, ~12 KB) parsed via opentype.js, flattened to filled Gerber regions with proper counters. Crisp proportional letterforms (and lowercase, previously missing) instead of rough bespoke polygons.
+- Made the panel preview **WYSIWYG**: it now renders the exact same glyph polygons the Gerber exports (byte-identical coordinates), replacing the old browser-monospace approximation.
+- Centralized region text metrics into one `measureRegionText` shared by the emitter, panel-label positioning, and the preview (was duplicated/hardcoded in three places).
+
 ### 2026-07-20 — Excellon drill parsing fixes + rendering fixes
 - Ported dead-code Excellon robustness fixes into the actual live parser (they'd never been running): Altium 9-digit coords, Allegro comment tool defs, `M00`/`M71`/`M72`, stepped `R` repeats, headerless files.
 - Fixed a tool-definition regex that silently dropped every tool on files like `T1F00S00C0.024` (params before diameter).
