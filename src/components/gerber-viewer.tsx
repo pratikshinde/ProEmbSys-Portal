@@ -710,8 +710,11 @@ export default function GerberViewer() {
               )
             }
 
-            // Dark FR4 substrate background
-            const bgRect = bounds ? (
+            // Dark FR4 substrate background. When the board outline traced
+            // into a closed shape (boardView.shapePathD), clip the substrate
+            // to it so non-rectangular boards (chamfers/cutouts) don't show a
+            // rectangle overlapping the PCB border.
+            const rawBgRect = bounds ? (
               <rect
                 key="pcb-bg"
                 x={bounds.minX - 0.2} y={bounds.minY - 0.2}
@@ -720,6 +723,20 @@ export default function GerberViewer() {
                 fill="#113f1d"
               />
             ) : null
+            const outlineShape = boardView?.shapePathD ?? null
+            const bgRect = rawBgRect && outlineShape ? (
+              <g key="pcb-bg-clipped">
+                <defs>
+                  <clipPath id="board-outline-clip">
+                    <path
+                      d={outlineShape}
+                      transform={boardView!.shapeScale !== 1 ? `scale(${boardView!.shapeScale})` : undefined}
+                    />
+                  </clipPath>
+                </defs>
+                <g clipPath="url(#board-outline-clip)">{rawBgRect}</g>
+              </g>
+            ) : rawBgRect
 
             if ((activeTab === 'panel' || activeTab === 'export') && panelResult && nativeSvgBounds) {
               const pr = panelResult

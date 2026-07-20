@@ -115,6 +115,16 @@ export interface BoardView {
   topFragment: string
   bottomFragment: string
   viewBox: { x: number; y: number; width: number; height: number }
+  /**
+   * SVG path `d` of the traced board outline (Y-down screen space, in the
+   * outline file's native units), or null when the outline didn't trace into
+   * a trustworthy closed shape. Used by the viewer to clip the substrate so
+   * non-rectangular boards (chamfers, cutouts) don't show a rectangle
+   * overlapping the PCB border.
+   */
+  shapePathD: string | null
+  /** Multiply shapePathD coordinates by this to get mm (25.4 for inch files). */
+  shapeScale: number
   error?: string
 }
 
@@ -130,6 +140,8 @@ export async function gerberRenderBoardView(
     topFragment: '',
     bottomFragment: '',
     viewBox: { x: 0, y: 0, width: 0, height: 0 },
+    shapePathD: null,
+    shapeScale: 1,
   }
 
   if (!files || files.length === 0) return { ...empty, error: 'No files' }
@@ -214,7 +226,43 @@ export async function gerberRenderBoardView(
     const viewBoxStr = String(board.top.properties?.viewBox ?? '0 0 0 0')
     const [x, y, width, height] = viewBoxStr.split(/\s+/).map(Number)
 
-    return { topFragment, bottomFragment, viewBox: { x, y, width, height } }
+    // Traced board outline for substrate clipping. Only trusted when the
+    // outline closed into region(s) whose bbox covers a meaningful share of
+    // the overall content — fragmented mechanical layers (dimension ticks,
+    // Protel M1) can "close" a degenerate sliver that would otherwise clip
+    // the whole board away.
+    let shapePathD: string | null = null
+    let shapeScale = 1
+    const bs = plotResult.boardShape
+    if (bs && !bs.failureReason && Array.isArray(bs.regions) && bs.regions.length > 0) {
+      const pathD = renderLayersResult.boardShapeRender?.path?.properties?.d
+      const size: number[] = bs.size ?? []
+      let uMinX = Infinity, uMinY = Infinity, uMaxX = -Infinity, uMaxY = -Infinity
+      for (const tree of Object.values(plotResult.plotTreesById)) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const s = (tree as any)?.size
+        if (!Array.isArray(s) || s.length !== 4) continue
+        uMinX = Math.min(uMinX, s[0]); uMinY = Math.min(uMinY, s[1])
+        uMaxX = Math.max(uMaxX, s[2]); uMaxY = Math.max(uMaxY, s[3])
+      }
+      const shapeW = size[2] - size[0]
+      const shapeH = size[3] - size[1]
+      const contentW = uMaxX - uMinX
+      const contentH = uMaxY - uMinY
+      const covers = contentW > 0 && contentH > 0 && shapeW >= 0.5 * contentW && shapeH >= 0.5 * contentH
+      if (typeof pathD === 'string' && pathD.length > 0 && covers) {
+        shapePathD = pathD
+        const outlineLayer = layers.find(l => l.type === 'outline')
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const units = outlineLayer ? (plotResult.plotTreesById[outlineLayer.id] as any)?.units : 'mm'
+        shapeScale = units === 'in' ? 25.4 : 1
+        console.log('[BoardView] board outline traced — substrate will be clipped', { shapeW, shapeH, shapeScale })
+      } else {
+        console.log('[BoardView] board outline rejected as unreliable', { shapeW, shapeH, contentW, contentH })
+      }
+    }
+
+    return { topFragment, bottomFragment, viewBox: { x, y, width, height }, shapePathD, shapeScale }
   } catch (err) {
     console.error('[BoardView] Outer pipeline failed with error:', err)
     const message = err instanceof Error ? err.message : String(err)

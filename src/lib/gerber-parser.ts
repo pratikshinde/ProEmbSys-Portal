@@ -114,6 +114,8 @@ export interface GerberLayer {
   bounds: GerberBounds | null;
   /** Warnings encountered during parsing */
   warnings: string[];
+  /** Resolved Excellon format + stats. Only set for drill layers. */
+  drillMeta?: DrillMeta;
 }
 
 // ============================================================================
@@ -1273,6 +1275,13 @@ export function isExcellonDrillFile(content: string): boolean {
     return false
   }
 
+  // 3. Hard negative: RS-274X extended commands only ever appear in Gerber.
+  // Checked before the looser positive signals below (M30/M00/G90) so a Gerber
+  // layer can never be misrouted into the drill parser.
+  if (/%FSLAX/i.test(stripped) || /%ADD\d/i.test(stripped) || /%MO(MM|IN)\*%/i.test(stripped)) {
+    return false
+  }
+
   // Most reliable: M48 at the start (Excellon header)
   if (stripped.startsWith('M48') || stripped.startsWith(';') && stripped.includes('M48')) {
     return true
@@ -1292,14 +1301,50 @@ export function isExcellonDrillFile(content: string): boolean {
   if (content.includes('FORMAT=') || content.includes('FMAT,2') || content.includes('ICI,')) {
     return true
   }
+  // Allegro/Altium drill files may omit M48 entirely. These markers are safe
+  // now that the Gerber hard-negative above has run: M30 (Excellon end-of-
+  // program; Gerber uses M02), M00 (manual tool change), and absolute-mode
+  // G90 paired with real coordinates.
+  const upperAll = stripped.toUpperCase()
+  if (/^M30\b/m.test(upperAll) || /^M00\b/m.test(upperAll)) return true
+  if (/^G90\b/m.test(upperAll) && hasCoordinates && hasTools) return true
+  if (/^;\s*(HOLESIZE|FILE_FORMAT)/im.test(stripped)) return true
   return false
 }
+
+/**
+ * How zero suppression is encoded in an Excellon coordinate field.
+ *
+ * - 'leading'  — leading zeros were suppressed; pad left to restore.
+ * - 'trailing' — trailing zeros were suppressed; pad right to restore.
+ * - 'none'     — coordinates are written full fixed-width; nothing to restore.
+ *
+ * NOTE: this is the *parser* convention ("which zeros were removed"). The
+ * exporter's `DrillZeroSuppression` in panelization-engine.ts uses the
+ * OPPOSITE convention on purpose (CAM350 inverts LZ/TZ) — see the comment on
+ * `formatDrillCoordinate`. Do not unify the two without testing in CAM350.
+ */
+export type DrillZeroSuppressionMode = 'none' | 'leading' | 'trailing'
 
 export interface DrillFormatOverride {
   unit: GerberUnit
   integer: number
   decimal: number
-  zeroSuppression: 'leading' | 'trailing'
+  zeroSuppression: DrillZeroSuppressionMode
+}
+
+/** Resolved Excellon format + stats for a parsed drill layer, for display in the UI. */
+export interface DrillMeta {
+  unit: GerberUnit
+  integerDigits: number
+  decimalDigits: number
+  zeroSuppression: DrillZeroSuppressionMode
+  /** Where the format came from. 'auto-detect' is stamped by the store, not the parser. */
+  source: 'header' | 'default' | 'override' | 'auto-detect'
+  toolCount: number
+  hitCount: number
+  /** True when the Eagle TZ→LZ workaround re-interpreted the declared suppression. */
+  eagleTzCorrected?: boolean
 }
 
 /**
@@ -1337,11 +1382,37 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
   let units: GerberUnit = forceFormat ? forceFormat.unit : 'inches'
   let fmtInt = forceFormat ? forceFormat.integer : 2
   let fmtDec = forceFormat ? forceFormat.decimal : 4
-  let declaredZeroSuppression: 'leading' | 'trailing' = forceFormat ? forceFormat.zeroSuppression : 'leading'
+  let declaredZeroSuppression: DrillZeroSuppressionMode = forceFormat ? forceFormat.zeroSuppression : 'leading'
+  /** True once the file's own header declared a unit/format (not just our default). */
+  let formatFromHeader = false
+  /** Whether an M48 header block was ever opened. */
+  let sawM48 = false
+  /** Collect at most one 'none'-mode width warning so a big file can't spam. */
+  let widthWarningIssued = false
+  const warnOnce = (msg: string) => {
+    if (widthWarningIssued) return
+    widthWarningIssued = true
+    warnings.push(msg)
+  }
   let currentTool: number | null = null
   let inBody = false
   let lastDrillX: number | null = null
   let lastDrillY: number | null = null
+
+  // Altium: exports 9+ digit coordinates with no format declaration, which
+  // would otherwise decode against the 2.4 default and land wildly off-board.
+  // Detect the long fields up-front and switch to 5.5 metric. Skipped when the
+  // caller forced a format — an explicit choice always wins.
+  if (!forceFormat) {
+    const longCoord = /[XY][+-]?(\d{9,})(?![\d.])/.exec(normalized)
+    if (longCoord && fmtInt === 2 && fmtDec === 4) {
+      fmtInt = 5
+      fmtDec = 5
+      units = 'mm'
+      formatFromHeader = true
+      warnings.push('Detected 9+ digit coordinates with no format header — assuming 5.5 metric (Altium).')
+    }
+  }
 
   for (const rawLine of lines) {
     const line = rawLine.trim()
@@ -1350,12 +1421,32 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     // Remove trailing * from data blocks
     const clean = line.replace(/\*$/, '').trim()
 
-    // Skip comments
-    if (clean.startsWith(';')) continue
+    // Comments. Allegro puts its tool table and coordinate format ONLY in
+    // comments, so those must be read before the rest are skipped.
+    if (clean.startsWith(';')) {
+      if (!forceFormat) {
+        const holeSizeMatch = clean.match(/;\s*Holesize\s*(\d+)\.\s*=\s*([\d.]+)/i)
+        if (holeSizeMatch) {
+          const code = parseInt(holeSizeMatch[1], 10)
+          const dia = parseFloat(holeSizeMatch[2])
+          if (/MM/i.test(clean)) units = 'mm'
+          if (dia > 0) apertures.set(code, { code, shape: 'circle', width: dia })
+        }
+
+        const fileFormatMatch = clean.match(/;\s*FILE_FORMAT\s*=\s*(\d+)\s*:\s*(\d+)/i)
+        if (fileFormatMatch) {
+          fmtInt = parseInt(fileFormatMatch[1], 10)
+          fmtDec = parseInt(fileFormatMatch[2], 10)
+          formatFromHeader = true
+        }
+      }
+      continue
+    }
 
     // M48 — Start of header
     if (clean.toUpperCase() === 'M48') {
       inBody = false
+      sawM48 = true
       continue
     }
 
@@ -1368,6 +1459,19 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     // M30 — End program
     if (clean.toUpperCase() === 'M30') {
       break
+    }
+
+    // Headerless drill files (Allegro, and Altium's plain .txt) carry no M48/%
+    // pair, so `inBody` would never flip and every coordinate would be swallowed
+    // by the header branch. Once we see a body-only command in a file that never
+    // opened an M48 block, switch to body parsing.
+    if (!inBody && !sawM48 && (
+      /^G9[01]\b/i.test(clean) ||
+      /^[XY][+-]?[\d.]/i.test(clean) ||
+      /^M00\b/i.test(clean) ||
+      /^R\d/i.test(clean)
+    )) {
+      inBody = true
     }
 
     if (!inBody) {
@@ -1384,12 +1488,26 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
       if (clean.toUpperCase() === 'G71') { units = 'mm'; continue }
       if (clean.toUpperCase() === 'G70') { units = 'inches'; continue }
 
+      // M71 / M72 — metric / inch mode (may even precede M48). Declares the
+      // unit only; digits and zero suppression remain assumptions, so this
+      // deliberately does NOT set formatFromHeader (the suppression
+      // plausibility check below must still be allowed to run).
+      if (clean.toUpperCase() === 'M71') {
+        if (!forceFormat) { units = 'mm'; fmtInt = 3; fmtDec = 3 }
+        continue
+      }
+      if (clean.toUpperCase() === 'M72') {
+        if (!forceFormat) { units = 'inches'; fmtInt = 2; fmtDec = 4 }
+        continue
+      }
+
       // FORMAT=/1:4 or FMT /1:4 style
       const fmtMatch = clean.match(/FORMAT\s*=\s*(\d)\s*:\s*(\d)/i) || clean.match(/FMT\s*\/(\d):(\d)/i)
       if (fmtMatch) {
         if (!forceFormat) {
           fmtInt = parseInt(fmtMatch[1], 10)
           fmtDec = parseInt(fmtMatch[2], 10)
+          formatFromHeader = true
         }
         continue
       }
@@ -1398,6 +1516,7 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
       const metMatch = clean.match(/^(METRIC|INCH)\s*,\s*(TZ|LZ)\s*,\s*(0+)\.(0+)/i)
       if (metMatch) {
         if (!forceFormat) {
+          formatFromHeader = true
           units = metMatch[1].toUpperCase() === 'METRIC' ? 'mm' : 'inches'
           declaredZeroSuppression = metMatch[2].toUpperCase() === 'LZ' ? 'leading' : 'trailing'
           fmtInt = metMatch[3].length
@@ -1410,6 +1529,7 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
       const unitMatch = clean.match(/^(METRIC|INCH)\s*,\s*(TZ|LZ)/i)
       if (unitMatch) {
         if (!forceFormat) {
+          formatFromHeader = true
           units = unitMatch[1].toUpperCase() === 'METRIC' ? 'mm' : 'inches'
           declaredZeroSuppression = unitMatch[2].toUpperCase() === 'LZ' ? 'leading' : 'trailing'
           if (units === 'mm') {
@@ -1423,26 +1543,33 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
         continue
       }
 
-      // Bare METRIC or INCH
+      // Bare METRIC or INCH — no suppression suffix means fixed-width coords.
       if (clean.toUpperCase() === 'METRIC') {
         if (!forceFormat) {
+          formatFromHeader = true
           units = 'mm'
           fmtInt = 3
           fmtDec = 3
+          declaredZeroSuppression = 'none'
         }
         continue
       }
       if (clean.toUpperCase() === 'INCH') {
         if (!forceFormat) {
+          formatFromHeader = true
           units = 'inches'
           fmtInt = 2
           fmtDec = 4
+          declaredZeroSuppression = 'none'
         }
         continue
       }
 
-      // Tool definition: T01C0.8 or T01C0.8F200S100
-      const toolMatch = clean.match(/^T(\d{1,2})C([\d.]+)/i)
+      // Tool definition: T01C0.8, T01C0.8F200S100, or T1F00S00C0.024 —
+      // feed (F), speed (S), retract (B) and hit-count (H) parameters may
+      // appear BEFORE the diameter. Requiring C immediately after the tool
+      // number silently dropped every tool in such files (toolCount 0).
+      const toolMatch = clean.match(/^T(\d{1,2})(?:[FSBH][\d.]+)*C([\d.]+)/i)
       if (toolMatch) {
         const code = parseInt(toolMatch[1], 10)
         const dia = parseFloat(toolMatch[2])
@@ -1473,9 +1600,42 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
       if (upperClean === 'G81' || upperClean === 'G82' || upperClean === 'G83') continue // Drill cycles
       if (upperClean === 'G00' || upperClean === 'G01') continue // Position/rate
 
-      // R01 repeat (step repeat in Excellon)
-      if (/^R\d{1,2}/i.test(clean)) {
-        warnings.push(`Repeat command "${clean}" detected — not expanded`)
+      // M00 — manual tool change stop (Allegro). Advances to the next tool.
+      if (upperClean === 'M00' || upperClean.startsWith('M00 ')) {
+        currentTool = currentTool !== null ? currentTool + 1 : 1
+        continue
+      }
+
+      // R<count>[X<dx>][Y<dy>] — Excellon step-and-repeat: stamp `count` more
+      // hits, each offset by (dx, dy) from the previous. Used by Allegro/Altium
+      // for connector rows. Previously this was warned about and skipped.
+      const repeatMatch = clean.match(/^R(\d+)(.*)$/i)
+      if (repeatMatch) {
+        const count = parseInt(repeatMatch[1], 10)
+        const rest = repeatMatch[2] || ''
+        const xMatch = rest.match(/X([+-]?\d*\.?\d*)/i)
+        const yMatch = rest.match(/Y([+-]?\d*\.?\d*)/i)
+
+        const dxRaw = xMatch ? parseExcellonCoord(xMatch[1], fmtInt, fmtDec, declaredZeroSuppression, units, warnOnce) : null
+        const dyRaw = yMatch ? parseExcellonCoord(yMatch[1], fmtInt, fmtDec, declaredZeroSuppression, units, warnOnce) : null
+        const dx = dxRaw === null ? 0 : (units === 'mm' ? dxRaw : dxRaw * 25.4)
+        const dy = dyRaw === null ? 0 : (units === 'mm' ? dyRaw : dyRaw * 25.4)
+
+        if (count > 0 && lastDrillX !== null && lastDrillY !== null && (dx !== 0 || dy !== 0)) {
+          for (let i = 1; i <= count; i++) {
+            commands.push({
+              type: 'flash',
+              coordinate: { x: lastDrillX + i * dx, y: lastDrillY + i * dy },
+              apertureCode: currentTool,
+              regionMode: false,
+              polarity: 'dark',
+            })
+          }
+          lastDrillX += count * dx
+          lastDrillY += count * dy
+        } else {
+          warnings.push(`Repeat command "${clean}" could not be expanded (no prior hit or zero step)`)
+        }
         continue
       }
 
@@ -1488,12 +1648,19 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
 
       // Coordinate hit: X...Y...
       if (clean.includes('X') || clean.includes('Y')) {
+        // Some files (notably Allegro) emit hits before any T-select, relying on
+        // the first tool being implicit. Default to T01 so the hits are attributed
+        // to a real aperture and subsequent M00 tool changes count from there.
+        if (currentTool === null) {
+          currentTool = 1
+          warnings.push('No tool selected before first drill hit — defaulting to T01')
+        }
         const coordMatch = clean.match(/X([+-]?\d*\.?\d*)Y([+-]?\d*\.?\d*)/i)
         if (coordMatch) {
           const xRaw = coordMatch[1] || ''
           const yRaw = coordMatch[2] || ''
-          const x = parseExcellonCoord(xRaw, fmtInt, fmtDec, declaredZeroSuppression, units)
-          const y = parseExcellonCoord(yRaw, fmtInt, fmtDec, declaredZeroSuppression, units)
+          const x = parseExcellonCoord(xRaw, fmtInt, fmtDec, declaredZeroSuppression, units, warnOnce)
+          const y = parseExcellonCoord(yRaw, fmtInt, fmtDec, declaredZeroSuppression, units, warnOnce)
 
           if (x !== null && y !== null) {
             // Convert to mm if needed (we store everything in mm internally)
@@ -1517,7 +1684,7 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
         // Single-axis coordinate (X only or Y only — keep previous value for other axis)
         const singleXMatch = clean.match(/^X([+-]?\d*\.?\d*)$/i)
         if (singleXMatch) {
-          const x = parseExcellonCoord(singleXMatch[1], fmtInt, fmtDec, declaredZeroSuppression, units)
+          const x = parseExcellonCoord(singleXMatch[1], fmtInt, fmtDec, declaredZeroSuppression, units, warnOnce)
           if (x !== null) {
             const xMm = units === 'mm' ? x : x * 25.4
             lastDrillX = xMm
@@ -1534,7 +1701,7 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
 
         const singleYMatch = clean.match(/^Y([+-]?\d*\.?\d*)$/i)
         if (singleYMatch) {
-          const y = parseExcellonCoord(singleYMatch[1], fmtInt, fmtDec, declaredZeroSuppression, units)
+          const y = parseExcellonCoord(singleYMatch[1], fmtInt, fmtDec, declaredZeroSuppression, units, warnOnce)
           if (y !== null) {
             const yMm = units === 'mm' ? y : y * 25.4
             lastDrillY = yMm
@@ -1552,15 +1719,17 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     }
   }
 
-  // Calculate bounds from flash commands
-  const bounds = calculateBounds(commands, apertures)
-
   // Eagle workaround: detect Eagle-generated files that declare TZ but actually use LZ.
   // Eagle has a well-known bug where it writes METRIC,TZ but the coordinate data
   // uses leading zero omission. Detect this by checking if coordinates would be
   // wildly out of range when parsed as TZ — if so, re-parse as LZ.
+  //
+  // Skipped entirely when the caller supplied `forceFormat`: an explicit user
+  // override must win over this heuristic, otherwise picking "trailing" in the
+  // Drill Format Override card would be silently flipped back to "leading".
   let actualZeroSuppression = declaredZeroSuppression
-  if (declaredZeroSuppression === 'trailing' && commands.length > 0) {
+  let eagleTzCorrected = false
+  if (!forceFormat && declaredZeroSuppression === 'trailing' && commands.length > 0) {
     // Check a sample of coordinates to see if TZ interpretation gives values
     // that don't make sense for a typical PCB (anything > 500mm is suspicious).
     // Use a generous threshold to avoid false positives on large panels.
@@ -1580,6 +1749,7 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     if (tzLikelyWrong) {
       // Re-parse all coordinates using LZ instead of TZ
       actualZeroSuppression = 'leading'
+      eagleTzCorrected = true
       warnings.push('Eagle TZ workaround: coordinates declared as TZ but actually use LZ — re-parsed')
       const newCommands: GerberDrawCommand[] = []
       // We need to re-derive from raw content, but since we already parsed once,
@@ -1596,12 +1766,74 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     }
   }
 
-  // Recalculate bounds after possible TZ→LZ correction
+  // Plausibility check for files that never declared zero suppression.
+  // With no LZ/TZ keyword (and no bare METRIC/INCH, which per spec means
+  // fixed-width), we default to 'leading' — but some CAM outputs (Protel /
+  // older Altium inch 2.4 files, e.g. "M72 M48 T1F00S00C0.024 … X0237Y01715")
+  // actually use trailing suppression without saying so. Detect this the same
+  // way a human would: under the leading interpretation the whole board can
+  // come out smaller than its own largest drill bit, which is physically
+  // impossible. In that case re-parse as trailing and keep it if it looks sane.
+  if (!forceFormat && !formatFromHeader && actualZeroSuppression === 'leading' && commands.length > 3) {
+    const unitScale = units === 'inches' ? 25.4 : 1
+    // Only tools actually hit count for the physical checks; the drilled area
+    // is interpretation-independent (same tools, same hit count either way).
+    let maxUsedDiaMm = 0
+    let drilledAreaMm2 = 0
+    for (const cmd of commands) {
+      const apt = cmd.apertureCode !== null ? apertures.get(cmd.apertureCode) : undefined
+      const diaMm = (apt?.width ?? 0) * unitScale
+      if (diaMm > maxUsedDiaMm) maxUsedDiaMm = diaMm
+      drilledAreaMm2 += Math.PI * (diaMm / 2) ** 2
+    }
+    const implausible = (b: GerberBounds | null): boolean => {
+      if (!b) return true
+      const w = b.maxX - b.minX
+      const h = b.maxY - b.minY
+      // Larger than any real panel → decoded garbage
+      if (w > 1000 || h > 1000) return true
+      // Board can't physically contain its own largest drill
+      if (maxUsedDiaMm > 0 && (w < maxUsedDiaMm || h < maxUsedDiaMm)) return true
+      // The holes themselves need more area than the whole board offers —
+      // they'd have to overlap, which no real drill program does
+      if (drilledAreaMm2 > w * h) return true
+      // Hundreds of hits crammed into a degenerate speck
+      if (commands.length > 10 && w < 1 && h < 1) return true
+      return false
+    }
+
+    if (implausible(calculateBounds(commands, apertures))) {
+      const tzCommands = reparseExcellonBody(normalized, fmtInt, fmtDec, 'trailing', units)
+      const tzBounds = calculateBounds(tzCommands, apertures)
+      if (tzCommands.length > 0 && !implausible(tzBounds)) {
+        commands.length = 0
+        commands.push(...tzCommands)
+        actualZeroSuppression = 'trailing'
+        warnings.push(
+          'No zero suppression declared — the default (leading) interpretation produced an implausible board size; re-parsed as trailing.'
+        )
+      }
+    }
+  }
+
+  // Recalculate bounds after possible suppression correction
   const finalBounds = calculateBounds(commands, apertures)
 
   // Default format (3:3 metric) — not critical for drill layers
   const formatX: CoordinateFormat = { integer: 3, decimal: 3 }
   const formatY: CoordinateFormat = { integer: 3, decimal: 3 }
+
+  const drillMeta: DrillMeta = {
+    unit: units,
+    integerDigits: fmtInt,
+    decimalDigits: fmtDec,
+    // Report the suppression actually used to decode, not merely the declared one.
+    zeroSuppression: actualZeroSuppression,
+    source: forceFormat ? 'override' : formatFromHeader ? 'header' : 'default',
+    toolCount: apertures.size,
+    hitCount: commands.length,
+    ...(eagleTzCorrected ? { eagleTzCorrected: true } : {}),
+  }
 
   return {
     fileName,
@@ -1614,6 +1846,7 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     regions: [],
     bounds: finalBounds,
     warnings,
+    drillMeta,
   }
 }
 
@@ -1625,7 +1858,7 @@ function reparseExcellonBody(
   normalized: string,
   fmtInt: number,
   fmtDec: number,
-  zeroSuppression: 'leading' | 'trailing',
+  zeroSuppression: DrillZeroSuppressionMode,
   fileUnits: GerberUnit
 ): GerberDrawCommand[] {
   const lines = normalized.split('\n')
@@ -1646,12 +1879,7 @@ function reparseExcellonBody(
     if (clean.toUpperCase() === 'M30') break
 
     if (!inBody) {
-      // Parse tool definitions for tool code tracking
-      const toolMatch = clean.match(/^T(\d{1,2})C([\d.]+)/i)
-      if (toolMatch) {
-        // Tools already parsed in main pass — just skip
-        continue
-      }
+      // Tools already parsed in main pass — header lines are skipped here
       continue
     }
 
@@ -1745,8 +1973,9 @@ function parseExcellonCoord(
   raw: string,
   intDigits: number,
   decDigits: number,
-  zeroSuppression: 'leading' | 'trailing',
-  units: GerberUnit
+  zeroSuppression: DrillZeroSuppressionMode,
+  units: GerberUnit,
+  warn?: (msg: string) => void
 ): number | null {
   if (!raw || raw.trim() === '') return null
 
@@ -1762,7 +1991,9 @@ function parseExcellonCoord(
     digits = digits.substring(1)
   }
 
-  // Handle embedded decimal point (some files include explicit decimals)
+  // Handle embedded decimal point (some files include explicit decimals).
+  // These are self-describing, so zero suppression and the digit counts are
+  // irrelevant — parse directly. KiCad emits coordinates this way.
   if (digits.includes('.')) {
     const val = parseFloat(digits)
     return negative ? -val : val
@@ -1772,21 +2003,32 @@ function parseExcellonCoord(
 
   // Apply zero suppression: pad accordingly
   let padded: string
-  if (zeroSuppression === 'leading') {
-    // Leading zero suppression: pad with LEADING zeros to fill totalDigits.
-    // e.g. "16500" with 2:4 LZ → pad to 6 digits → "016500" → int=01, dec=6500 → 1.6500
-    padded = digits.padStart(totalDigits, '0')
-  } else {
+  if (zeroSuppression === 'trailing') {
     // Trailing zero suppression: pad with TRAILING zeros to fill totalDigits.
     // e.g. "16500" with 3:3 TZ → pad to 6 digits → "165000" → int=165, dec=000 → 165.000
-    // NOTE: This is the standard Excellon TZ interpretation where trailing zeros
-    // are removed and the remaining digits occupy the leftmost positions.
     padded = digits.padEnd(totalDigits, '0')
+  } else {
+    // 'leading' — leading zeros were suppressed; pad left to restore.
+    //   e.g. "16500" with 2:4 LZ → "016500" → int=01, dec=6500 → 1.6500
+    // 'none'    — coordinates should already be full fixed-width, so padStart is
+    //   a no-op. If the field IS short the file contradicts its own declaration;
+    //   assume dropped leading zeros (the common malformation) and warn.
+    if (zeroSuppression === 'none' && digits.length !== totalDigits) {
+      warn?.(
+        `Coordinate "${raw.trim()}" has ${digits.length} digits but format declares ${intDigits}:${decDigits} ` +
+        `(${totalDigits} fixed-width digits) with no zero suppression — assuming suppressed leading zeros.`
+      )
+    }
+    padded = digits.padStart(totalDigits, '0')
   }
 
-  // Truncate if too many digits (keep most significant digits)
+  // Truncate overflow. Which end to keep depends on where the padding went:
+  // for trailing suppression the leftmost digits are the significant ones;
+  // for leading/none the rightmost digits are.
   if (padded.length > totalDigits) {
-    padded = padded.substring(0, totalDigits)
+    padded = zeroSuppression === 'trailing'
+      ? padded.substring(0, totalDigits)
+      : padded.substring(padded.length - totalDigits)
   }
 
   // Split into integer and decimal parts

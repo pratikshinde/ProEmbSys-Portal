@@ -170,6 +170,15 @@ export function formatCoordinate(valueMm: number, format: OutputFormat): string 
  * @param drillFmt - The drill format configuration
  * @returns A string of digits formatted for Excellon
  */
+/**
+ * WARNING — opposite convention to the parser. `DrillZeroSuppressionMode` in
+ * gerber-parser.ts names *which zeros were removed* from the file. Here
+ * 'leading' (LZ) strips TRAILING zeros and 'trailing' (TZ) strips LEADING
+ * zeros, because CAM350 inverts the meaning of the LZ/TZ header keywords.
+ * The two do not collide today: exported drills carry an explicit header, and
+ * the drill we hand the viewer is normalized to explicit decimals. Do not
+ * "unify" the two conventions without re-testing the output in CAM350.
+ */
 export function formatDrillCoordinate(valueMm: number, drillFmt: DrillFormatConfig): string {
   // Convert mm to the target unit
   let value: number

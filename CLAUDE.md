@@ -35,7 +35,7 @@ Next.js 16 / React 19 / TypeScript, App Router. Two things coexist:
 ### Gerber / Panelization data flow (client-side, no DB)
 
 1. **Import** — User uploads `.gbr`/`.drl` files or a ZIP. `store.ts:addLayer` / `addLayersFromZip` parse each file and call `gerberToSvg()` from `gerber-svg.ts`, which dispatches to a Web Worker.
-2. **Parse** — `gerber-parser.ts` (custom RS-274X parser) and `excellon-parser.ts` produce `GerberLayer` data with bounds and draw commands. Used for panelization + export math.
+2. **Parse** — `gerber-parser.ts` produces `GerberLayer` data with bounds and draw commands, used for panelization + export math. It holds **both** parsers: `parseGerber` (custom RS-274X) and `parseExcellonDrill` (Excellon drill), dispatched on `isExcellonDrillFile`. Drill layers additionally carry a `drillMeta` field (resolved unit / digits / zero suppression / tool + hole counts / where the format came from) which the Layers panel displays.
 3. **SVG render** — `src/workers/gerber-worker.ts` runs `@tracespace/parser` → `@tracespace/plotter` → `@tracespace/renderer` and returns an `svgFragment` + bounds. Fully client-side; no server roundtrip.
 4. **Layer detection** — Layer type and side are inferred from Gerber's `TF.FileFunction` attribute first, then filename heuristics in `gerber-analysis.ts:detectLayerType/detectLayerSide` (re-exported by `store.ts` — the two Gerber consumers, the Panelization tool and the PCB Order quote flow, share this logic rather than duplicating it).
 5. **View** — `gerber-viewer.tsx` is an SVG canvas with pan/zoom. On the **Panel Config** tab it builds a `<defs>` of one geometry per layer and `<use>`s it for every PCB position so panel-mode DOM size stays constant in `rows × cols`.
@@ -70,8 +70,7 @@ Requires a running Postgres and a populated `.env` (`DATABASE_URL`, `AUTH_SECRET
 |---|---|
 | `src/lib/store.ts` | Zustand store — Panelization tool state and layer import logic |
 | `src/lib/gerber-analysis.ts` | Shared Gerber/Excellon layer-type detection + quote-time board analysis (dimensions, layer count, hole count) — used by both `store.ts` and the PCB Order flow |
-| `src/lib/gerber-parser.ts` | RS-274X parser (apertures, coordinates, regions, arcs) |
-| `src/lib/excellon-parser.ts` | Excellon drill file parser |
+| `src/lib/gerber-parser.ts` | RS-274X parser (apertures, coordinates, regions, arcs) **and** the Excellon drill parser (`parseExcellonDrill`, `autoDetectDrillFormat`, `generateNormalizedExcellon`) — the only drill parser in the repo |
 | `src/lib/gerber-svg.ts` | Type definitions + `gerberToSvg()` Comlink client (lazy-instantiates the worker) |
 | `src/workers/gerber-worker.ts` | Web Worker — tracespace parse/plot/render, returns the `GerberSvgResult` shape |
 | `src/lib/panelization-engine.ts` | Panel layout, Gerber output format helpers, V-score/fiducial/tooling geometry |
@@ -97,6 +96,12 @@ Requires a running Postgres and a populated `.env` (`DATABASE_URL`, `AUTH_SECRET
 - Any page using `useSearchParams()` needs a `<Suspense>` boundary or the production build fails (`login`, `reset-password`).
 - Prisma `Decimal` fields (money) must be converted via `Number(...)` at the read boundary before use in the pricing engine or before passing to a Client Component — Decimal is a class instance and isn't a plain serializable prop.
 
+### Tracespace patch + board-view substrate
+
+`patches/@tracespace+plotter+*.patch` (applied by `postinstall` via patch-package) fixes an upstream bug in macro primitive 20 ("vector line"): the width offset was applied *along* the line instead of perpendicular, collapsing the side slabs of KiCad `RoundRect` pad macros into zero-area slivers (pads rendered as a "butterfly" — center box + corner circles, no sides). Don't delete the patch or reinstall without `postinstall` running.
+
+The viewer's Board view composites per-layer worker SVGs itself (not `@tracespace/core` renderBoard). Its FR4 substrate is a bounds rectangle **clipped to the traced board outline** when `BoardView.shapePathD` is set (`gerberRenderBoardView` in `gerber-svg.ts` traces the outline layer via core's `boardShape` and rejects untrustworthy shapes — e.g. Protel Mechanical-1 dimension ticks that close into degenerate slivers — falling back to the plain rectangle). KiCad exports *filled* silkscreen shapes as dense 0.04mm hatch strokes; a solid silk disc on screen is usually real design content, not a rendering bug.
+
 ### Coordinate system
 
 The tracespace renderer emits **Y-down SVG coordinates** (Y=0 at top = Gerber maxY). The viewer works in this native SVG space. When displaying cursor position, gerberY = −screenY. The panelization engine works in **Gerber Y-up mm coordinates** (Y increases upward), and the exporter writes coordinates in that convention.
@@ -105,7 +110,13 @@ The tracespace renderer emits **Y-down SVG coordinates** (Y=0 at top = Gerber ma
 
 The `OutputFormat` struct controls the `%FS...%` header in exported files. Default is 4.6 mm absolute (handles boards up to 9999mm). `autoDetectIntegerDigits` in `panelization-engine.ts` adjusts the integer digit count if the panel is unusually large.
 
-Panel-overlay apertures (L-shape marks, stroke text, donuts, fiducials) are allocated **dynamically above the customer's max D-code** (`findMaxDCode` in `panelization-engine.ts`, base ≥ 301 rounded to the next century) — never hardcode overlay D-codes like the old D53/D54/D200/D210; customer Gerbers routinely use those ranges and duplicate/conflicting `%ADD` definitions trip CAM tools. The Excellon parser (`excellon-parser.ts`) handles Altium 9+-digit coordinates (5.5 autodetect), Allegro `;Holesize`/`;FILE_FORMAT` comment headers, `M00` tool changes, stepped `R` repeat commands, and explicit-decimal coordinates (KiCad) — ported/adapted from the standalone `pcb-panelization-tool` repo's `font-fix` branch, which is the upstream lineage of this tool.
+Panel-overlay apertures (L-shape marks, stroke text, donuts, fiducials) are allocated **dynamically above the customer's max D-code** (`findMaxDCode` in `panelization-engine.ts`, base ≥ 301 rounded to the next century) — never hardcode overlay D-codes like the old D53/D54/D200/D210; customer Gerbers routinely use those ranges and duplicate/conflicting `%ADD` definitions trip CAM tools. `parseExcellonDrill` (in `gerber-parser.ts`) handles Altium 9+-digit coordinates (5.5 autodetect), Allegro `;Holesize`/`;FILE_FORMAT` comment headers, `M00` tool changes, stepped `R` repeat commands, headerless files (no `M48`/`%`), and explicit-decimal coordinates (KiCad) — ported/adapted from the standalone `pcb-panelization-tool` repo's `font-fix` branch, which is the upstream lineage of this tool.
+
+### Drill zero suppression — two opposite conventions
+
+`DrillZeroSuppressionMode` in `gerber-parser.ts` names **which zeros were removed from the file** (`'leading'` → pad left to restore). `DrillZeroSuppression` in `panelization-engine.ts` is the *export* setting and is deliberately **inverted**, because CAM350 reads the LZ/TZ header keywords backwards: exporting `'leading'` strips *trailing* zeros. They don't collide (exports carry an explicit header; the drill handed to the viewer is normalized to explicit decimals) — but never unify them without re-testing in CAM350. `'none'` means fixed-width coordinates in both.
+
+A drill layer keeps its pristine upload in `LayerEntry.originalContent`; `rawContent` is the *normalized* Excellon (explicit decimals) consumed by the exporter and the SVG renderer. Drill format overrides and `autoDetectDrillFormat` must always re-parse from `originalContent` — re-parsing `rawContent` is a silent no-op, since explicit decimals ignore the format entirely.
 
 ### UI layout (Panelization tool)
 

@@ -2,6 +2,7 @@
 
 import React, { useRef, useState, useCallback, useEffect } from 'react'
 import { useAppStore, ZipImportResult, LayerEntry, LayerType, LayerSide, detectOriginMismatch, detectDrillScaleMismatch } from '@/lib/store'
+import type { DrillZeroSuppressionMode } from '@/lib/gerber-parser'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -134,8 +135,27 @@ export default function LayerPanel() {
   const [drillUnit, setDrillUnit] = useState<'mm' | 'inches'>('mm')
   const [drillInt, setDrillInt] = useState(3)
   const [drillDec, setDrillDec] = useState(3)
-  const [drillZero, setDrillZero] = useState<'leading' | 'trailing'>('trailing')
+  const [drillZero, setDrillZero] = useState<DrillZeroSuppressionMode>('trailing')
   const [applyingDrill, setApplyingDrill] = useState(false)
+
+  /** Short label for a suppression mode, matching Excellon header conventions. */
+  const zeroLabel = (z: DrillZeroSuppressionMode) => (z === 'none' ? 'NONE' : z === 'leading' ? 'LZ' : 'TZ')
+
+  /**
+   * Open the override card for a layer, seeding the inputs from the format the
+   * parser actually resolved. Without this the card shows whatever was last
+   * typed for some other layer, which reads as if the override had no effect.
+   */
+  const openDrillFormatCard = (layer: LayerEntry) => {
+    const meta = layer.parsedLayer.drillMeta
+    if (meta) {
+      setDrillUnit(meta.unit === 'mm' ? 'mm' : 'inches')
+      setDrillInt(meta.integerDigits)
+      setDrillDec(meta.decimalDigits)
+      setDrillZero(meta.zeroSuppression)
+    }
+    setDrillFormatLayerId(layer.id)
+  }
 
   const scaleMismatchedIds = detectDrillScaleMismatch(layers)
 
@@ -526,13 +546,7 @@ export default function LayerPanel() {
                         </button>
                       ))}
                       <button
-                        onClick={() => {
-                          setDrillFormatLayerId(layer.id)
-                          setDrillUnit('mm')
-                          setDrillInt(3)
-                          setDrillDec(3)
-                          setDrillZero('trailing')
-                        }}
+                        onClick={() => openDrillFormatCard(layer)}
                         className="px-1.5 py-0.5 text-[9px] font-medium rounded border border-blue-800/40 bg-blue-950/30 text-blue-200 hover:bg-blue-900/40 transition-colors"
                       >
                         Custom Format...
@@ -671,7 +685,7 @@ export default function LayerPanel() {
                             if (drillFormatLayerId === layer.id) {
                               setDrillFormatLayerId(null)
                             } else {
-                              setDrillFormatLayerId(layer.id)
+                              openDrillFormatCard(layer)
                             }
                           }}
                           className={`flex-shrink-0 p-0.5 rounded transition-colors ${
@@ -707,6 +721,44 @@ export default function LayerPanel() {
                       <span className="text-[9px] text-[#4a6f94] w-6 flex-shrink-0 text-right">{Math.round(layer.opacity * 100)}%</span>
                     </div>
 
+                    {/* Row 2b: Resolved Excellon format (drill layers only) */}
+                    {layer.type === 'drill' && layer.parsedLayer.drillMeta && (() => {
+                      const meta = layer.parsedLayer.drillMeta!
+                      const sourceStyle: Record<typeof meta.source, string> = {
+                        header: 'border-[#1a3a5c] bg-[#0a1e38] text-[#4a6f94]',
+                        default: 'border-amber-800/40 bg-amber-950/30 text-amber-300/80',
+                        'auto-detect': 'border-blue-800/40 bg-blue-950/30 text-blue-300',
+                        override: 'border-[#0ea5e9]/50 bg-[#0ea5e9]/20 text-[#0ea5e9]',
+                      }
+                      const sourceLabel: Record<typeof meta.source, string> = {
+                        header: 'from file',
+                        default: 'assumed',
+                        'auto-detect': 'auto',
+                        override: 'override',
+                      }
+                      return (
+                        <div className="flex items-center gap-1.5 px-2 pb-1.5 flex-wrap">
+                          <span className="text-[10px] font-mono text-[#94b8d4] flex-shrink-0">
+                            {meta.unit === 'mm' ? 'mm' : 'in'} {meta.integerDigits}:{meta.decimalDigits} {zeroLabel(meta.zeroSuppression)}
+                          </span>
+                          <span className="text-[10px] text-[#4a6f94] flex-shrink-0">
+                            · {meta.toolCount} tool{meta.toolCount === 1 ? '' : 's'} · {meta.hitCount} hole{meta.hitCount === 1 ? '' : 's'}
+                          </span>
+                          <span className={`px-1 py-px text-[8px] rounded border flex-shrink-0 ${sourceStyle[meta.source]}`}>
+                            {sourceLabel[meta.source]}
+                          </span>
+                          {meta.eagleTzCorrected && (
+                            <span
+                              className="px-1 py-px text-[8px] rounded border border-amber-800/40 bg-amber-950/30 text-amber-300 flex-shrink-0"
+                              title="File declared TZ but the coordinates are LZ (known Eagle bug) — re-parsed as LZ. Use the override to force a different format."
+                            >
+                              TZ→LZ fixed
+                            </span>
+                          )}
+                        </div>
+                      )
+                    })()}
+
                     {/* Row 3: Drill Format Override (only for drill layers) */}
                     {layer.type === 'drill' && drillFormatLayerId === layer.id && (
                       <div className="px-2 pb-2">
@@ -731,10 +783,11 @@ export default function LayerPanel() {
                             <div>
                               <label className="text-[9px] text-[#4a6f94] block mb-0.5">Zero Suppress</label>
                               <select value={drillZero}
-                                onChange={(e) => setDrillZero(e.target.value as 'leading' | 'trailing')}
+                                onChange={(e) => setDrillZero(e.target.value as DrillZeroSuppressionMode)}
                                 className="w-full h-6 text-[10px] bg-[#0a1e38] border border-[#1a3a5c] text-[#f0f8ff] rounded px-1">
-                                <option value="trailing">Trailing</option>
-                                <option value="leading">Leading</option>
+                                <option value="trailing">Trailing (TZ)</option>
+                                <option value="leading">Leading (LZ)</option>
+                                <option value="none">None (fixed width)</option>
                               </select>
                             </div>
                             <div>
@@ -763,6 +816,7 @@ export default function LayerPanel() {
                             {[
                               { label: 'mm 3:3 TZ', u: 'mm' as const, i: 3, d: 3, z: 'trailing' as const },
                               { label: 'mm 3:3 LZ', u: 'mm' as const, i: 3, d: 3, z: 'leading' as const },
+                              { label: 'mm 3:3 NONE', u: 'mm' as const, i: 3, d: 3, z: 'none' as const },
                               { label: 'in 2:4 LZ', u: 'inches' as const, i: 2, d: 4, z: 'leading' as const },
                               { label: 'in 2:4 TZ', u: 'inches' as const, i: 2, d: 4, z: 'trailing' as const },
                             ].map(p => (
@@ -787,7 +841,7 @@ export default function LayerPanel() {
                             disabled={applyingDrill}
                             className="w-full h-6 text-[10px] font-medium rounded bg-[#0ea5e9] hover:bg-[#0284c7] disabled:opacity-50 text-white transition-colors"
                           >
-                            {applyingDrill ? 'Applying...' : `Apply ${drillUnit === 'mm' ? 'mm' : 'in'} ${drillInt}:${drillDec} ${drillZero === 'trailing' ? 'TZ' : 'LZ'}`}
+                            {applyingDrill ? 'Applying...' : `Apply ${drillUnit === 'mm' ? 'mm' : 'in'} ${drillInt}:${drillDec} ${zeroLabel(drillZero)}`}
                           </button>
                         </div>
                       </div>

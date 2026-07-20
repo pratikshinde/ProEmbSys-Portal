@@ -4,7 +4,7 @@
 
 import { create } from 'zustand'
 import JSZip from 'jszip'
-import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon } from './gerber-parser'
+import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode } from './gerber-parser'
 import { gerberToSvg, gerberRenderBoardView, BoardView, GerberSvgResult } from './gerber-svg'
 import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber } from './panelization-engine'
 import { LayerType, LayerSide, detectLayerType, detectLayerSide } from './gerber-analysis'
@@ -15,7 +15,19 @@ export interface LayerEntry {
   id: string
   name: string
   fileName: string
+  /**
+   * Content handed to the exporter and the SVG renderer. For drill layers this
+   * is the *normalized* Excellon (explicit decimal coords, bare METRIC header)
+   * so downstream consumers never have to guess a format.
+   */
   rawContent: string
+  /**
+   * The pristine bytes as uploaded, never rewritten. Drill format overrides and
+   * auto-detect must always re-parse from this — re-parsing `rawContent` is a
+   * no-op once it has been normalized to explicit decimals, which silently
+   * froze the format after the first override.
+   */
+  originalContent: string
   parsedLayer: GerberLayer
   svgData: GerberSvgResult | null
   color: string
@@ -43,7 +55,7 @@ interface AppState {
   removeLayer: (id: string) => void
   toggleLayerVisibility: (id: string) => void
   setAllLayersVisibility: (visible: boolean) => void
-  reapplyDrillFormat: (layerId: string, unit: 'mm' | 'inches', integer: number, decimal: number, zeroSuppression: 'leading' | 'trailing') => Promise<void>
+  reapplyDrillFormat: (layerId: string, unit: 'mm' | 'inches', integer: number, decimal: number, zeroSuppression: DrillZeroSuppressionMode) => Promise<void>
   updateLayerColor: (id: string, color: string) => void
   updateLayerType: (id: string, type: LayerType, side: LayerSide) => void
   setLayerOpacity: (id: string, opacity: number) => void
@@ -306,6 +318,7 @@ export const useAppStore = create<AppState>((set, get) => ({
               console.log(`[Drill Auto-Detect] ${fileName}: detected ${detected.format.unit} ${detected.format.integer}:${detected.format.decimal} ${detected.format.zeroSuppression}`)
               finalContent = generateNormalizedExcellon(content, detected.format)
               finalParsed = detected.parsed
+              if (finalParsed.drillMeta) finalParsed.drillMeta.source = 'auto-detect'
               convertLayerUnits(finalParsed, targetUnit)
               try {
                 finalSvg = await gerberToSvg(finalContent)
@@ -325,6 +338,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         name: fileName.replace(/\.[^.]+$/, ''),
         fileName,
         rawContent: finalContent,
+        originalContent: content,
         parsedLayer: finalParsed,
         svgData: finalSvg,
         color,
@@ -363,17 +377,20 @@ export const useAppStore = create<AppState>((set, get) => ({
     }))
   },
 
-  reapplyDrillFormat: async (layerId: string, unit: 'mm' | 'inches', integer: number, decimal: number, zeroSuppression: 'leading' | 'trailing') => {
+  reapplyDrillFormat: async (layerId: string, unit: 'mm' | 'inches', integer: number, decimal: number, zeroSuppression: DrillZeroSuppressionMode) => {
     const { layers, targetUnit } = get()
     const layer = layers.find(l => l.id === layerId)
     if (!layer || layer.type !== 'drill') return
 
     const format: import('./gerber-parser').DrillFormatOverride = { unit: unit === 'mm' ? 'mm' : 'inches', integer, decimal, zeroSuppression }
     try {
-      const reparsed = parseExcellonDrill(layer.rawContent, layer.fileName, format)
+      // Always re-parse from the pristine upload. `rawContent` has already been
+      // normalized to explicit decimal coordinates, which ignore the format.
+      const source = layer.originalContent
+      const reparsed = parseExcellonDrill(source, layer.fileName, format)
       convertLayerUnits(reparsed, targetUnit)
 
-      const normalizedContent = generateNormalizedExcellon(layer.rawContent, format)
+      const normalizedContent = generateNormalizedExcellon(source, format)
 
       let newSvgData: import('./gerber-svg').GerberSvgResult | null = null
       try {
@@ -655,6 +672,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             name: fileName.replace(/\.[^.]+$/, ''),
             fileName,
             rawContent: content,
+            originalContent: content,
             parsedLayer,
             svgData,
             color,
@@ -704,12 +722,13 @@ export const useAppStore = create<AppState>((set, get) => ({
             if (sizeRatioX > 0.4 || sizeRatioY > 0.4) {
               console.log(`[Drill Auto-Detect ZIP] ${layer.fileName}: drill (${drillWidth.toFixed(1)}x${drillHeight.toFixed(1)}) vs board (${boardWidth.toFixed(1)}x${boardHeight.toFixed(1)}) — attempting format detection`)
 
-              const detected = autoDetectDrillFormat(layer.rawContent, layer.fileName, boardWidth, boardHeight)
+              const detected = autoDetectDrillFormat(layer.originalContent, layer.fileName, boardWidth, boardHeight)
               if (detected) {
                 console.log(`[Drill Auto-Detect ZIP] ${layer.fileName}: detected ${detected.format.unit} ${detected.format.integer}:${detected.format.decimal} ${detected.format.zeroSuppression}`)
 
-                const normalizedContent = generateNormalizedExcellon(layer.rawContent, detected.format)
+                const normalizedContent = generateNormalizedExcellon(layer.originalContent, detected.format)
                 const correctedParsed = detected.parsed
+                if (correctedParsed.drillMeta) correctedParsed.drillMeta.source = 'auto-detect'
                 convertLayerUnits(correctedParsed, targetUnit)
 
                 let newSvgData: GerberSvgResult | null = null
@@ -856,6 +875,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             name: fileName.replace(/\.[^.]+$/, ''),
             fileName,
             rawContent: content,
+            originalContent: content,
             parsedLayer,
             svgData,
             color,
@@ -907,15 +927,16 @@ export const useAppStore = create<AppState>((set, get) => ({
             if (sizeRatioX > 0.4 || sizeRatioY > 0.4) {
               console.log(`[Drill Auto-Detect] ${layer.fileName}: drill (${drillWidth.toFixed(1)}x${drillHeight.toFixed(1)}) vs board (${boardWidth.toFixed(1)}x${boardHeight.toFixed(1)}) — attempting format detection`)
 
-              const detected = autoDetectDrillFormat(layer.rawContent, layer.fileName, boardWidth, boardHeight)
+              const detected = autoDetectDrillFormat(layer.originalContent, layer.fileName, boardWidth, boardHeight)
               if (detected) {
                 console.log(`[Drill Auto-Detect] ${layer.fileName}: detected ${detected.format.unit} ${detected.format.integer}:${detected.format.decimal} ${detected.format.zeroSuppression}`)
 
                 // Re-generate normalized Excellon with explicit decimal points
-                const normalizedContent = generateNormalizedExcellon(layer.rawContent, detected.format)
+                const normalizedContent = generateNormalizedExcellon(layer.originalContent, detected.format)
 
                 // Re-parse with our parser using the correct format
                 const correctedParsed = detected.parsed
+                if (correctedParsed.drillMeta) correctedParsed.drillMeta.source = 'auto-detect'
                 convertLayerUnits(correctedParsed, targetUnit)
 
                 // Re-generate SVG using normalized content (tracespace will parse decimals correctly)
@@ -1000,10 +1021,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (Math.abs(drillWidth - boardWidth) / boardWidth > 0.4 || Math.abs(drillHeight - boardHeight) / boardHeight > 0.4) {
         console.log(`[Drill Align] ${dl.fileName}: drill (${drillWidth.toFixed(2)}x${drillHeight.toFixed(2)}) vs board (${boardWidth.toFixed(2)}x${boardHeight.toFixed(2)}). Auto-detecting format...`)
         
-        const detected = autoDetectDrillFormat(dl.rawContent, dl.fileName, boardWidth, boardHeight)
+        const detected = autoDetectDrillFormat(dl.originalContent, dl.fileName, boardWidth, boardHeight)
         if (detected) {
           console.log(`[Drill Align] Detected format: ${detected.format.unit} ${detected.format.integer}:${detected.format.decimal} ${detected.format.zeroSuppression}`)
           parsed = detected.parsed
+          if (parsed.drillMeta) parsed.drillMeta.source = 'auto-detect'
           b = parsed.bounds!
         } else {
           console.log(`[Drill Align] No suitable format found. Keeping original.`)

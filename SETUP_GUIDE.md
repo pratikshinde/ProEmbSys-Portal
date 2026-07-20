@@ -63,8 +63,8 @@ node -e "require('@prisma/client').PrismaClient.prototype; const{PrismaClient}=r
 ## How It Works
 
 **Gerber / Panelization tool** (client-side, no DB):
-- **Parsing:** `src/lib/gerber-parser.ts` (RS-274X) and `src/lib/excellon-parser.ts` (drill files) — custom TypeScript parsers, no external dependency.
-- **Rendering:** `src/workers/gerber-worker.ts` runs `@tracespace/parser` → `@tracespace/plotter` → `@tracespace/renderer` in a Web Worker (via Comlink) and returns an SVG fragment + bounds. No server roundtrip.
+- **Parsing:** `src/lib/gerber-parser.ts` — a single custom TypeScript module holding both the RS-274X Gerber parser and the Excellon drill parser (`parseExcellonDrill`), no external dependency.
+- **Rendering:** `src/workers/gerber-worker.ts` runs `@tracespace/parser` → `@tracespace/plotter` → `@tracespace/renderer` in a Web Worker (via Comlink) and returns an SVG fragment + bounds. No server roundtrip. A `patch-package` patch fixes an upstream rounded-rectangle rendering bug in `@tracespace/plotter` (applied automatically via `postinstall`).
 - **Import methods:** single Gerber/drill files, or a ZIP archive containing multiple layers.
 - **State management:** Zustand (`src/lib/store.ts`).
 
