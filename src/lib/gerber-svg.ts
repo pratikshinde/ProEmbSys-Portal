@@ -9,6 +9,7 @@
 
 import * as Comlink from 'comlink'
 import type { GerberWorkerApi } from '@/workers/gerber-worker'
+import { normalizeGerberMacroPrimitives, scalePlotTreeToMm, scaleBoardShapeToMm } from './gerber-preprocess'
 
 export interface GerberSvgResult {
   /** SVG fragment string — to be embedded in a parent SVG */
@@ -180,7 +181,7 @@ export async function gerberRenderBoardView(
       try {
         const id = `layer-${idCounter++}`
         console.log(`[BoardView] Parsing content for ${f.filename}...`)
-        const parseTree = parse(f.contents)
+        const parseTree = parse(normalizeGerberMacroPrimitives(f.contents))
         const tsType = f.type ? (tsTypeMap[f.type] ?? 'copper') : 'copper'
         const tsSide = f.side ? (tsSideMap[f.side] ?? 'all') : 'all'
         layers.push({ id, filename: f.filename, type: tsType, side: tsSide })
@@ -202,7 +203,26 @@ export async function gerberRenderBoardView(
     const readResult = { layers, parseTreesById } as any
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const plotResult = corePlot(readResult) as any
-    console.log('[BoardView] corePlot done. Running coreRenderLayers...')
+    console.log('[BoardView] corePlot done.')
+
+    // tracespace's compositor merges layers in raw native numbers with no
+    // unit conversion, so a mixed-unit set (inch-native Gerbers + a drill our
+    // Excellon pipeline re-serialized in METRIC) misaligns by 25.4×. Scale
+    // every inch-native plot tree to mm BEFORE any render step so the whole
+    // downstream pipeline (layer fragments, boardShape clip, viewBox) shares
+    // one mm coordinate space. The boardShape inherits the outline layer's
+    // native units, so scale it iff that layer's tree was inch-native.
+    const outlineLayerId = layers.find(l => l.type === 'outline')?.id
+    const outlineWasInches = outlineLayerId
+      ? plotResult.plotTreesById[outlineLayerId]?.units === 'in'
+      : false
+    let scaledCount = 0
+    for (const tree of Object.values(plotResult.plotTreesById)) {
+      if (scalePlotTreeToMm(tree)) scaledCount++
+    }
+    if (outlineWasInches) scaleBoardShapeToMm(plotResult.boardShape)
+    if (scaledCount > 0) console.log(`[BoardView] scaled ${scaledCount} inch-native layer(s) to mm`)
+    console.log('[BoardView] Running coreRenderLayers...')
     
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const renderLayersResult = coreRenderLayers(plotResult) as any
@@ -223,43 +243,65 @@ export async function gerberRenderBoardView(
 
     console.log(`[BoardView] Stack-up output top=${topFragment.length} bottom=${bottomFragment.length}`)
 
-    const viewBoxStr = String(board.top.properties?.viewBox ?? '0 0 0 0')
-    const [x, y, width, height] = viewBoxStr.split(/\s+/).map(Number)
+    // Union of every layer's own plotted bounds (Gerber-native Y-up mm) —
+    // used both to sanity-check the traced board outline below and as a
+    // fallback viewBox when that outline can't be trusted.
+    let uMinX = Infinity, uMinY = Infinity, uMaxX = -Infinity, uMaxY = -Infinity
+    for (const tree of Object.values(plotResult.plotTreesById)) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const s = (tree as any)?.size
+      if (!Array.isArray(s) || s.length !== 4) continue
+      uMinX = Math.min(uMinX, s[0]); uMinY = Math.min(uMinY, s[1])
+      uMaxX = Math.max(uMaxX, s[2]); uMaxY = Math.max(uMaxY, s[3])
+    }
+    const contentW = uMaxX - uMinX
+    const contentH = uMaxY - uMinY
 
-    // Traced board outline for substrate clipping. Only trusted when the
-    // outline closed into region(s) whose bbox covers a meaningful share of
-    // the overall content — fragmented mechanical layers (dimension ticks,
-    // Protel M1) can "close" a degenerate sliver that would otherwise clip
-    // the whole board away.
+    // Traced board outline for substrate clipping AND the composited
+    // viewBox. Only trusted when the outline closed into region(s) whose
+    // bbox covers a meaningful share of the overall content — fragmented
+    // mechanical layers (dimension ticks, Protel M1) can "close" a
+    // degenerate sliver. tracespace's renderBoard() viewBox is derived from
+    // this same boardShape, so an untrusted shape means an untrusted
+    // viewBox too: real per-layer geometry then renders inside an
+    // effectively zero-area SVG viewport and nothing is visible, even
+    // though nothing actually failed to parse.
     let shapePathD: string | null = null
-    let shapeScale = 1
+    const shapeScale = 1
+    let useTrustedShape = false
     const bs = plotResult.boardShape
     if (bs && !bs.failureReason && Array.isArray(bs.regions) && bs.regions.length > 0) {
       const pathD = renderLayersResult.boardShapeRender?.path?.properties?.d
       const size: number[] = bs.size ?? []
-      let uMinX = Infinity, uMinY = Infinity, uMaxX = -Infinity, uMaxY = -Infinity
-      for (const tree of Object.values(plotResult.plotTreesById)) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const s = (tree as any)?.size
-        if (!Array.isArray(s) || s.length !== 4) continue
-        uMinX = Math.min(uMinX, s[0]); uMinY = Math.min(uMinY, s[1])
-        uMaxX = Math.max(uMaxX, s[2]); uMaxY = Math.max(uMaxY, s[3])
-      }
       const shapeW = size[2] - size[0]
       const shapeH = size[3] - size[1]
-      const contentW = uMaxX - uMinX
-      const contentH = uMaxY - uMinY
       const covers = contentW > 0 && contentH > 0 && shapeW >= 0.5 * contentW && shapeH >= 0.5 * contentH
       if (typeof pathD === 'string' && pathD.length > 0 && covers) {
         shapePathD = pathD
-        const outlineLayer = layers.find(l => l.type === 'outline')
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const units = outlineLayer ? (plotResult.plotTreesById[outlineLayer.id] as any)?.units : 'mm'
-        shapeScale = units === 'in' ? 25.4 : 1
-        console.log('[BoardView] board outline traced — substrate will be clipped', { shapeW, shapeH, shapeScale })
+        useTrustedShape = true
+        // shapeScale stays 1: the boardShape (and thus this path d) was
+        // already scaled to mm above, right after corePlot.
+        console.log('[BoardView] board outline traced — substrate will be clipped', { shapeW, shapeH })
       } else {
         console.log('[BoardView] board outline rejected as unreliable', { shapeW, shapeH, contentW, contentH })
       }
+    }
+
+    let x: number, y: number, width: number, height: number
+    if (useTrustedShape) {
+      const viewBoxStr = String(board.top.properties?.viewBox ?? '0 0 0 0')
+      ;[x, y, width, height] = viewBoxStr.split(/\s+/).map(Number)
+    } else if (contentW > 0 && contentH > 0) {
+      // Fall back to the real content bounds, converted from Gerber-native
+      // Y-up to the Y-down screen-space the viewer expects (screenY = -gerberY).
+      x = uMinX
+      y = -uMaxY
+      width = contentW
+      height = contentH
+      console.log('[BoardView] using per-layer content bounds for viewBox (traced outline unusable)', { x, y, width, height })
+    } else {
+      const viewBoxStr = String(board.top.properties?.viewBox ?? '0 0 0 0')
+      ;[x, y, width, height] = viewBoxStr.split(/\s+/).map(Number)
     }
 
     return { topFragment, bottomFragment, viewBox: { x, y, width, height }, shapePathD, shapeScale }

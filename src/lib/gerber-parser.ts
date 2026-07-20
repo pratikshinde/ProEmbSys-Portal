@@ -1816,6 +1816,24 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     }
   }
 
+  // Tool diameters were stored raw in the file's units, but the returned
+  // layer declares `units: 'mm'` (coordinates are converted during body
+  // parsing) — so downstream `convertLayerUnits` no-ops and would leave inch
+  // diameters behind forever. Convert them here to keep the whole layer in
+  // one unit. Leaving them raw silently corrupted every consumer that
+  // serializes apertures back out: serializeParsedDrillToExcellon (drill
+  // align / rotate) wrote `T01C0.0240` under a METRIC header — 25.4×-too-
+  // small holes rendered as barely-visible uniform dots. Must run AFTER the
+  // plausibility block above, which still expects raw units (it applies its
+  // own unitScale).
+  if (units === 'inches') {
+    for (const apt of Array.from(apertures.values())) {
+      if (apt.width !== undefined) apt.width *= 25.4
+      if (apt.height !== undefined) apt.height *= 25.4
+      if (apt.holeDiameter !== undefined) apt.holeDiameter *= 25.4
+    }
+  }
+
   // Recalculate bounds after possible suppression correction
   const finalBounds = calculateBounds(commands, apertures)
 
@@ -2140,6 +2158,25 @@ export function generateNormalizedExcellon(
   const output: string[] = []
 
   let inBody = false
+  // The coordinate rewriter below unconditionally converts every X/Y value
+  // to millimetres (see `valueMm` further down) — so the header this
+  // function emits must ALWAYS declare METRIC, exactly once, regardless of
+  // what unit the source file declared. Getting this wrong produces a
+  // self-contradictory Excellon file (mm-valued coordinates under a stale
+  // inch-mode header) that any compliant reader — including the exporter's
+  // downstream CAM tooling — will scale by another 25.4x. Track whether
+  // we've emitted it yet so every unit-declaration variant in the source
+  // (bare METRIC/INCH, METRIC/INCH,LZ/TZ, or Excellon's M71/M72 codes) maps
+  // to that single canonical declaration instead of passing through
+  // untouched or being silently dropped.
+  let metricDeclared = false
+  // Whether we've emitted 'M48' yet. Some exporters (Protel) put a unit
+  // code before M48 (e.g. "M72\nM48\n..."). Standard Excellon expects
+  // METRIC right after M48, so a unit token seen before M48 is absorbed
+  // silently rather than emitted early — the M48 handler below always
+  // declares METRIC itself when it hasn't been declared yet, so it still
+  // ends up in the output, just in the conventional position.
+  let sawM48 = false
 
   for (const rawLine of lines) {
     const line = rawLine.trim()
@@ -2153,6 +2190,8 @@ export function generateNormalizedExcellon(
     // M48 header start
     if (clean.toUpperCase() === 'M48') {
       output.push('M48')
+      if (!metricDeclared) { output.push('METRIC'); metricDeclared = true }
+      sawM48 = true
       continue
     }
 
@@ -2160,21 +2199,32 @@ export function generateNormalizedExcellon(
     if (!inBody) {
       const upper = clean.toUpperCase()
 
-      // Replace any unit/format declaration with our explicit one
-      if (upper === 'METRIC' || upper === 'INCH' ||
-          /^(METRIC|INCH)\s*,\s*(TZ|LZ)/i.test(upper) ||
-          /^(METRIC|INCH)\s*,\s*(TZ|LZ)\s*,/i.test(upper)) {
-        output.push('METRIC')
+      // Replace any unit/format declaration — bare METRIC/INCH, with a
+      // TZ/LZ suffix, or Excellon's M71 (metric)/M72 (inch) mode codes —
+      // with our own canonical declaration. Only the first occurrence
+      // after M48 actually emits a line; later ones (a file redeclaring
+      // units mid-header, which does happen) are absorbed since we've
+      // already committed to millimetres for every coordinate in this
+      // output. A unit token seen before M48 is absorbed too — see sawM48.
+      if (upper === 'METRIC' || upper === 'INCH' || upper === 'M71' || upper === 'M72' ||
+          /^(METRIC|INCH)\s*,\s*(TZ|LZ)/i.test(upper)) {
+        if (!metricDeclared && sawM48) { output.push('METRIC'); metricDeclared = true }
         continue
       }
 
-      // Keep tool definitions, VER, FMAT, DETECT, ATC, etc. as-is
-      // Tool diameters are always in the declared unit — since the file says
-      // METRIC, tool diameters are already in mm (e.g. T01C0.85 = 0.85mm)
-      if (/^T\d+C/i.test(upper)) {
-        // Tool definition — keep exactly as original (diameter is in file's
-        // declared unit, which is the unit we'll declare in the output)
-        output.push(clean)
+      // Tool definition — keep the line structure but convert the
+      // diameter to mm too, so it isn't left mismatched against the
+      // METRIC header when the source format was inches (e.g. an inch
+      // file's "T1C0.024" is a 0.024" bit, not 0.024mm). Feed/speed
+      // params (F/S/B/H) may appear before OR after the diameter — e.g.
+      // "T1F00S00C0.024" (this exact file) — and are preserved verbatim;
+      // only the diameter itself needs unit conversion.
+      const toolMatch = clean.match(/^(T\d+)((?:[FSBH][\d.]+)*)C([\d.]+)(.*)$/i)
+      if (toolMatch) {
+        const [, toolCode, preParams, diaStr, rest] = toolMatch
+        const dia = parseFloat(diaStr)
+        const diaMm = format.unit === 'mm' || isNaN(dia) ? dia : dia * 25.4
+        output.push(`${toolCode}${preParams}C${diaMm.toFixed(4)}${rest}`)
         continue
       }
 
@@ -2188,8 +2238,12 @@ export function generateNormalizedExcellon(
       }
     }
 
-    // % — end of header
+    // % — end of header. If nothing in the header ever declared a unit
+    // (a legitimate but rare bare M48...% with no METRIC/INCH/M71/M72 at
+    // all), still emit our canonical declaration — every coordinate past
+    // this point is unconditionally mm, so the header must say so too.
     if (clean === '%') {
+      if (!metricDeclared) { output.push('METRIC'); metricDeclared = true }
       inBody = true
       output.push('%')
       continue

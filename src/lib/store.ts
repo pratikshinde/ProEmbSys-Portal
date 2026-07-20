@@ -6,6 +6,7 @@ import { create } from 'zustand'
 import JSZip from 'jszip'
 import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode } from './gerber-parser'
 import { gerberToSvg, gerberRenderBoardView, BoardView, GerberSvgResult } from './gerber-svg'
+import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
 import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber } from './panelization-engine'
 import { LayerType, LayerSide, detectLayerType, detectLayerSide } from './gerber-analysis'
 
@@ -978,12 +979,25 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { layers, outputFormat } = get()
     const drillLayers = layers.filter(l => l.type === 'drill' && l.parsedLayer?.bounds)
     const boardLayers = layers.filter(l => l.type !== 'drill' && l.type !== 'fab' && l.type !== 'other' && l.parsedLayer?.bounds)
-    
+
     if (drillLayers.length === 0 || boardLayers.length === 0) return
+
+    // Drills register to pads, which live on copper — silkscreen or outline
+    // content extending past the copper (e.g. text below the board edge)
+    // would skew a whole-board bounding box and shift every hole off its
+    // pad. Center on the copper layers when any exist.
+    const copperLayers = boardLayers.filter(l => l.type === 'copper')
+    const referenceLayers = copperLayers.length > 0 ? copperLayers : boardLayers
+
+    // Copper pad centres (every flash on a copper layer), for exact offset
+    // recovery: plated holes are concentric with their pads, so matching the
+    // hole pattern against the pad pattern recovers the true origin offset
+    // rather than approximating it from bounding-box centres.
+    const padCenters = copperLayers.flatMap(cl => resolvedFlashCenters(cl.parsedLayer.commands))
 
     // Calculate combined board bounds
     let boardMinX = Infinity, boardMinY = Infinity, boardMaxX = -Infinity, boardMaxY = -Infinity
-    for (const bl of boardLayers) {
+    for (const bl of referenceLayers) {
       const b = bl.parsedLayer.bounds!
       boardMinX = Math.min(boardMinX, b.minX)
       boardMinY = Math.min(boardMinY, b.minY)
@@ -1032,11 +1046,25 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
       }
 
-      const drillCenterX = (b.minX + b.maxX) / 2
-      const drillCenterY = (b.minY + b.maxY) / 2
+      // Exact offset first: vote the hole pattern against the copper pad
+      // pattern (see drill-alignment.ts). Falls back to bounding-box centre
+      // alignment only when no translation earns enough support (e.g. an
+      // NPTH-only drill whose holes have no matching pads).
+      const holes = resolvedFlashCenters(parsed.commands)
+      const exact = recoverDrillOffset(holes, padCenters)
 
-      const dx = boardCenterX - drillCenterX
-      const dy = boardCenterY - drillCenterY
+      let dx: number, dy: number
+      if (exact) {
+        dx = exact.offsetX
+        dy = exact.offsetY
+        console.log(`[Drill Align] ${dl.fileName}: exact offset recovered (${dx.toFixed(3)}, ${dy.toFixed(3)}) mm — ${exact.matchedHoles}/${exact.totalHoles} holes matched to copper pads`)
+      } else {
+        const drillCenterX = (b.minX + b.maxX) / 2
+        const drillCenterY = (b.minY + b.maxY) / 2
+        dx = boardCenterX - drillCenterX
+        dy = boardCenterY - drillCenterY
+        console.log(`[Drill Align] ${dl.fileName}: no exact pad match — falling back to copper-bounds centre alignment (${dx.toFixed(3)}, ${dy.toFixed(3)}) mm`)
+      }
 
       // Shift commands
       parsed.commands = parsed.commands.map(cmd => {

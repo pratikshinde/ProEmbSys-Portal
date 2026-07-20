@@ -25,6 +25,7 @@ import {
   renderBoard as coreRenderBoard,
 } from '@tracespace/core'
 import { toHtml } from 'hast-util-to-html'
+import { normalizeGerberMacroPrimitives } from '../lib/gerber-preprocess'
 
 export interface GerberWorkerResult {
   svgFragment: string
@@ -91,7 +92,7 @@ function parseGerber(content: string): GerberWorkerResult {
   let tree
   let image
   try {
-    tree = parse(content)
+    tree = parse(normalizeGerberMacroPrimitives(content))
     image = plot(tree)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -229,7 +230,7 @@ async function renderBoardView(files: BoardViewInput[]): Promise<BoardViewResult
 
     for (const f of boardFiles) {
       const id = `layer-${idCounter++}`
-      const parseTree = parse(f.contents)
+      const parseTree = parse(normalizeGerberMacroPrimitives(f.contents))
 
       // Determine tracespace type: use store metadata, fall back to parser's filetype
       let tsType: string
