@@ -18,6 +18,13 @@ Actively developed. Core ordering flow, backend, and panelization tool are funct
 
 Reverse-chronological. Each entry is a real commit — see `git log` for full diffs.
 
+### 2026-07-21 — Part-number-based export filenames
+- ZIP archive is now named `PartNumber_CustomerName_Version_Date_Panel.zip` instead of a generic `panelized_<N>up_<date>.zip`.
+- Every file inside follows `PartNumber_LayerName.gerber` (drill files keep `.drl`). All four PanelInfo fields are sanitized first since they're free-text user input.
+
+### 2026-07-21 — Silkscreen renders black on white soldermask preview
+- White ink is invisible on a white mask, so the Board view's silk color now flips to black whenever the White soldermask swatch is selected — matching how real white-soldermask boards are actually printed.
+
 ### 2026-07-21 — Configurable rib text size, hover-isolate layers, soldermask color preview
 - Rib text size is now user-configurable: `topRibFontSize` / `bottomRibFontSize` (both default 2.8mm) with number inputs in the Export tab, replacing hardcoded constants.
 - Hovering a layer row in the Layers panel isolates it in the viewer's "Layers" overlay mode (matching a feature from deltaproto's open-source Gerber viewer); moving the pointer away restores the normal view.
