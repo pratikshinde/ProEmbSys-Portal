@@ -242,6 +242,26 @@ export default function ExportPanel() {
               ? 'Solid vector shapes — robust, highly readable on all CAM tools.'
               : 'Single-stroke pen paths — thinner appearance, compatible with plotters.'}
           </p>
+          <div className="grid grid-cols-2 gap-2 mt-2">
+            <div>
+              <Label className="text-[10px] text-[#4a6f94]">Top Rib Text Size (mm)</Label>
+              <Input
+                type="number" min={0.5} max={10} step={0.1}
+                value={panelConfig.topRibFontSize}
+                onChange={(e) => updatePanelConfig({ topRibFontSize: Math.max(0.5, parseFloat(e.target.value) || 2.8) })}
+                className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]"
+              />
+            </div>
+            <div>
+              <Label className="text-[10px] text-[#4a6f94]">Bottom Rib Text Size (mm)</Label>
+              <Input
+                type="number" min={0.5} max={10} step={0.1}
+                value={panelConfig.bottomRibFontSize}
+                onChange={(e) => updatePanelConfig({ bottomRibFontSize: Math.max(0.5, parseFloat(e.target.value) || 2.8) })}
+                className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]"
+              />
+            </div>
+          </div>
         </div>
 
         <Separator className="bg-[#1a3a5c]" />

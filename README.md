@@ -18,6 +18,11 @@ Actively developed. Core ordering flow, backend, and panelization tool are funct
 
 Reverse-chronological. Each entry is a real commit — see `git log` for full diffs.
 
+### 2026-07-21 — Configurable rib text size, hover-isolate layers, soldermask color preview
+- Rib text size is now user-configurable: `topRibFontSize` / `bottomRibFontSize` (both default 2.8mm) with number inputs in the Export tab, replacing hardcoded constants.
+- Hovering a layer row in the Layers panel isolates it in the viewer's "Layers" overlay mode (matching a feature from deltaproto's open-source Gerber viewer); moving the pointer away restores the normal view.
+- Added a 7-color soldermask preview (Green/Red/Blue/Purple/Yellow/Black/White) for the Board view — cosmetic only, doesn't touch exported Gerbers. Pad-finish gold stays constant across colors, matching real boards.
+
 ### 2026-07-21 — Fix aperture-macro corruption in exported Gerber files
 - Root-caused reports of "missing D-codes" and broken RoundRect pad rendering (confirmed via tracespace.io, delta-gerber, and CAM350) to three bugs in the export path — none in tracespace, which export never touches.
 - `gerber-parser.ts`: stopped uppercasing custom aperture macro names (`RoundRect` was becoming `ROUNDRECT`, so the exported `%ADD` reference no longer matched the verbatim-copied `%AM` definition — "aperture selected but never defined" in every tool). Also fixed the shape-identifier regex truncating digit-suffixed macro names like KiCad's `FreePoly0` to `FreePoly`, which spilled the trailing digit into and corrupted the first parameter.

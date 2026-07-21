@@ -5,6 +5,7 @@ import { useAppStore, getLayerZIndex } from '@/lib/store'
 import { mergeLayerBounds, GerberSvgResult } from '@/lib/gerber-svg'
 import { PanelResult } from '@/lib/panelization-engine'
 import { getRegionTextPolygons } from '@/lib/region-font'
+import { BOARD_COLOR_NAMES, BOARD_COLOR_PALETTE } from '@/lib/board-colors'
 
 /**
  * GerberViewer — SVG-based viewer using tracespace-rendered layers (Web Worker).
@@ -76,6 +77,9 @@ export default function GerberViewer() {
   const viewMode = useAppStore(s => s.viewMode)
   const setViewMode = useAppStore(s => s.setViewMode)
   const setBoardViewSide = useAppStore(s => s.setBoardViewSide)
+  const hoveredLayerId = useAppStore(s => s.hoveredLayerId)
+  const boardColor = useAppStore(s => s.boardColor)
+  const setBoardColor = useAppStore(s => s.setBoardColor)
 
   const [viewState, setViewState] = useState<ViewState>({ viewBox: '0 0 200 200', zoom: 1 })
   const [cursorPos, setCursorPos] = useState<{ gx: number; gy: number } | null>(null)
@@ -372,18 +376,29 @@ export default function GerberViewer() {
 
   // Filter visible layers and sort them by PCB stack-up Z-order so silk
   // renders on top of mask, mask on top of copper, drill on top, etc.
+  // In Layers overlay mode, hovering a row in the Layers panel isolates that
+  // one layer (regardless of its own visibility toggle) so it's easy to see
+  // what a single layer contributes; moving the pointer away restores the
+  // normal visible-layers view. Board mode composites everything into one
+  // substrate render and isn't affected by hover.
   const visibleLayers = useMemo(() => {
+    if (viewMode === 'layers' && hoveredLayerId) {
+      return layers.filter(l => l.id === hoveredLayerId && l.svgData && !l.svgData.isEmpty)
+    }
     return layers
       .filter(l => l.visible && l.svgData && !l.svgData.isEmpty)
       .slice()
       .sort((a, b) => getLayerZIndex(a.type) - getLayerZIndex(b.type))
-  }, [layers])
+  }, [layers, viewMode, hoveredLayerId])
 
-  // PCB-realistic colors for board mode compositing (replaces user-configurable colors)
+  // PCB-realistic colors for board mode compositing (replaces user-configurable colors).
+  // Copper tint follows the selected soldermask color (copper as seen through the
+  // mask); pad-finish gold stays constant across all mask colors, like a real board.
+  const copperTint = BOARD_COLOR_PALETTE[boardColor].copperTint
   const PCB_COLORS: Record<string, string> = {
-    'copper-top':    '#2e9e4f',  // mid-green copper traces under mask
-    'copper-bottom': '#2e9e4f',
-    'copper-none':   '#2e9e4f',
+    'copper-top':    copperTint,
+    'copper-bottom': copperTint,
+    'copper-none':   copperTint,
     'mask-top':      '#d4af37',  // gold exposed pads
     'mask-bottom':   '#d4af37',
     'mask-none':     '#d4af37',
@@ -747,7 +762,7 @@ export default function GerberViewer() {
                 x={bounds.minX - 0.2} y={bounds.minY - 0.2}
                 width={bounds.maxX - bounds.minX + 0.4}
                 height={bounds.maxY - bounds.minY + 0.4}
-                fill="#113f1d"
+                fill={BOARD_COLOR_PALETTE[boardColor].substrate}
               />
             ) : null
             const outlineShape = boardView?.shapePathD ?? null
@@ -970,6 +985,22 @@ export default function GerberViewer() {
                 </>
               )}
             </div>
+            {/* Soldermask color swatches — Board view only (cosmetic preview, no effect on export) */}
+            {viewMode === 'board' && (
+              <div className="absolute top-11 left-2 flex gap-1 bg-[#020d1f]/85 rounded border border-[#1a3a5c] p-1">
+                {BOARD_COLOR_NAMES.map(name => (
+                  <button
+                    key={name}
+                    onClick={() => setBoardColor(name)}
+                    title={`${name} soldermask`}
+                    className={`w-4 h-4 rounded-full border transition-all ${
+                      boardColor === name ? 'border-white scale-110' : 'border-[#1a3a5c] hover:border-[#4a6f94]'
+                    }`}
+                    style={{ backgroundColor: BOARD_COLOR_PALETTE[name].swatch }}
+                  />
+                ))}
+              </div>
+            )}
             {/* Warn when viewing a side with no copper data */}
             {isBoardMode && currentSideEmpty && (
               <div className="absolute top-10 left-1/2 -translate-x-1/2 bg-[#1a1a00]/90 border border-yellow-500/50 text-yellow-300 text-xs px-3 py-1.5 rounded-lg pointer-events-none">

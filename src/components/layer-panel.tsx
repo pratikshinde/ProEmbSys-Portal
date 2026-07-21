@@ -125,6 +125,7 @@ export default function LayerPanel() {
   const rotateAllLayers = useAppStore(s => s.rotateAllLayers)
   const setAllLayersVisibility = useAppStore(s => s.setAllLayersVisibility)
   const reapplyDrillFormat = useAppStore(s => s.reapplyDrillFormat)
+  const setHoveredLayerId = useAppStore(s => s.setHoveredLayerId)
 
   // Import & Rotate state
   const [importing, setImporting] = useState(false)
@@ -628,6 +629,8 @@ export default function LayerPanel() {
                 return (
                   <div
                     key={layer.id}
+                    onMouseEnter={() => setHoveredLayerId(layer.id)}
+                    onMouseLeave={() => setHoveredLayerId(null)}
                     className={`rounded-md transition-colors ${
                       layer.visible ? 'bg-[#0f2848]/50' : 'bg-[#061628]/30 opacity-60'
                     }`}

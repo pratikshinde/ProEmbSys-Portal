@@ -467,6 +467,9 @@ export interface PanelConfig {
   xyOverrides?: Record<string, { x?: number; y?: number }>
   // Font type for panel text
   textFont: 'stroke' | 'region'
+  // Font sizes for rib text (mm, cap height)
+  topRibFontSize: number // customer/PCB reference text on the top rib
+  bottomRibFontSize: number // per-layer labels on the bottom rib
 }
 
 export interface PanelInfo {
@@ -546,6 +549,8 @@ export const DEFAULT_PANEL_CONFIG: PanelConfig = {
   layerNamingConvention: 'top-bottom',
   xyOverrides: {},
   textFont: 'region',
+  topRibFontSize: 2.8,
+  bottomRibFontSize: 2.8,
 }
 
 // ============================================================================
@@ -883,7 +888,7 @@ export function generateLayerLabels(
   //   Bottom rib Y range: [0, sideRibBottom]
   //   Right side X: panelWidth - margin
 
-  const fontSize = 1.8
+  const fontSize = config.bottomRibFontSize ?? 1.8
 
   // Apply naming convention based on config
   const namingConvention = config.layerNamingConvention || 'top-bottom'
@@ -1032,7 +1037,7 @@ export function generateTopRibText(
     `${info.customerRef || 'Customer Name'} : ${info.pcbName || 'PCB-001'}`
   ]
 
-  const fontSize = 2.8 // Height approx 3mm (normalized height 1.0 * 2.8)
+  const fontSize = config.topRibFontSize ?? 2.8
   const lineSpacing = 0 // Only one line
 
   for (let i = 0; i < linesOfText.length; i++) {

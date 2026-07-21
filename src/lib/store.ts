@@ -9,6 +9,7 @@ import { gerberToSvg, gerberRenderBoardView, BoardView, GerberSvgResult } from '
 import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
 import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber } from './panelization-engine'
 import { LayerType, LayerSide, detectLayerType, detectLayerSide } from './gerber-analysis'
+import { BoardColorName } from './board-colors'
 
 export type { LayerType, LayerSide }
 
@@ -93,6 +94,15 @@ interface AppState {
   setViewMode: (mode: 'board' | 'layers') => void
   setBoardViewSide: (side: 'top' | 'bottom') => void
   rebuildBoardView: () => Promise<void>
+
+  // Layer isolation on hover (Layers overlay mode only) — id of the layer
+  // row currently hovered in the Layers panel, or null when not hovering.
+  hoveredLayerId: string | null
+  setHoveredLayerId: (id: string | null) => void
+
+  // Soldermask color for the Board-view preview (cosmetic only — see board-colors.ts)
+  boardColor: BoardColorName
+  setBoardColor: (color: BoardColorName) => void
 
   // UI state
   activeTab: 'layers' | 'panel' | 'info' | 'export'
@@ -1325,6 +1335,12 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     set({ boardView: board, boardViewSide: newSide })
   },
+
+  hoveredLayerId: null,
+  setHoveredLayerId: (id) => set({ hoveredLayerId: id }),
+
+  boardColor: 'Green',
+  setBoardColor: (color) => set({ boardColor: color }),
 
   // UI state
   activeTab: 'layers',
