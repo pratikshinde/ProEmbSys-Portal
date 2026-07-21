@@ -395,6 +395,9 @@ export default function GerberViewer() {
   // Copper tint follows the selected soldermask color (copper as seen through the
   // mask); pad-finish gold stays constant across all mask colors, like a real board.
   const copperTint = BOARD_COLOR_PALETTE[boardColor].copperTint
+  // White silkscreen is invisible on a white mask, so print it black instead —
+  // matching how real white-soldermask boards are actually silkscreened.
+  const silkColor = boardColor === 'White' ? '#1a1a1a' : '#e8e8e8'
   const PCB_COLORS: Record<string, string> = {
     'copper-top':    copperTint,
     'copper-bottom': copperTint,
@@ -402,9 +405,9 @@ export default function GerberViewer() {
     'mask-top':      '#d4af37',  // gold exposed pads
     'mask-bottom':   '#d4af37',
     'mask-none':     '#d4af37',
-    'silk-top':      '#e8e8e8',  // white silkscreen
-    'silk-bottom':   '#e8e8e8',
-    'silk-none':     '#e8e8e8',
+    'silk-top':      silkColor,
+    'silk-bottom':   silkColor,
+    'silk-none':     silkColor,
     'outline-none':  '#1a1a1a',
     'outline-top':   '#1a1a1a',
     'outline-bottom':'#1a1a1a',
