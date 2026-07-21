@@ -75,7 +75,7 @@ Requires a running Postgres and a populated `.env` (`DATABASE_URL`, `AUTH_SECRET
 | `src/workers/gerber-worker.ts` | Web Worker — tracespace parse/plot/render, returns the `GerberSvgResult` shape |
 | `src/lib/drill-alignment.ts` | Exact drill↔Gerber origin-offset recovery (pad-pattern voting, ported from delta-gerber) + modal-coordinate flash-center resolution |
 | `src/lib/panelization-engine.ts` | Panel layout, Gerber output format helpers, V-score/fiducial/tooling geometry |
-| `src/lib/gerber-exporter.ts` | ZIP export — panelized Gerber files per layer |
+| `src/lib/gerber-exporter.ts` | ZIP export — panelized Gerber files per layer. Naming: archive is `PartNumber_CustomerName_Version_Date_Panel.zip`, each file inside is `PartNumber_LayerName.gerber` (drill stays `.drl`) — all four `PanelInfo` fields go through `sanitizeForFilename` first, since they're free-text user input |
 | `src/lib/stroke-font.ts` | Single-stroke (polyline) font for `textFont: 'stroke'` panel text |
 | `src/lib/region-font.ts` / `region-font-data.ts` | Filled-region font for `textFont: 'region'` (default) — real glyph outlines from an embedded Geist subset via opentype.js |
 | `src/lib/board-colors.ts` | Soldermask color palette for the Board-view preview (Green/Red/Blue/Purple/Yellow/Black/White) — cosmetic only, never affects exported Gerbers |

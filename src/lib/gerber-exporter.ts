@@ -36,6 +36,16 @@ export interface LayerFile {
 }
 
 /**
+ * Sanitize a user-entered PanelInfo field (part number, customer name, etc.)
+ * for safe use inside a filename — strips characters invalid on Windows/macOS
+ * filesystems and collapses whitespace/repeated separators to a single "_".
+ */
+function sanitizeForFilename(value: string | undefined, fallback: string): string {
+  const cleaned = (value || '').trim().replace(/[<>:"/\\|?*\s]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '')
+  return cleaned || fallback
+}
+
+/**
  * Generate a descriptive layer name based on type and side.
  * This ensures exported Gerber files have readable names instead of standard abbreviations.
  */
@@ -122,9 +132,16 @@ export async function exportPanelizedGerbers(
   const folder = zip.folder('panelized_gerbers')
   if (!folder) throw new Error('Failed to create ZIP folder')
 
+  // File-naming fields: PartNumber_CustomerName_Version_Date_Panel.zip for the
+  // archive, PartNumber_LayerName.gerber for each file inside it.
+  const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
+  const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
+  const version = sanitizeForFilename(info?.revision, 'v1')
+  const dateStr = sanitizeForFilename(info?.date, new Date().toISOString().slice(0, 10))
+
   // Generate panel outline with 0.1mm width
   const outlineGerber = generatePanelOutlineGerber(panel, { ...config, panelBorderWidth: 0.1 }, fmt)
-  folder.file('panel_border.gerber', outlineGerber)
+  folder.file(`${partNumber}_Panel_Border.gerber`, outlineGerber)
 
 
 
@@ -134,13 +151,13 @@ export async function exportPanelizedGerbers(
   if (drillLayers.length > 0 || config.enableToolingHoles) {
     // Pass the Gerber output unit so drill format auto-syncs to prevent CAM350 scale mismatch
     const drillContent = generatePanelizedDrill(drillLayers, panel, config, globalBaseOffset, fmt.unit)
-    folder.file('panel_drill.drl', drillContent)
+    folder.file(`${partNumber}_Drill.drl`, drillContent)
   }
 
   // Generate PINN.drl file with only tooling and reference holes
   if (config.enableToolingHoles) {
     const pinnContent = generatePINNDrill(panel, config, fmt.unit)
-    folder.file('PINN.drl', pinnContent)
+    folder.file(`${partNumber}_PINN.drl`, pinnContent)
   }
 
   // Panelize each layer using PARSED layer data
@@ -160,10 +177,9 @@ export async function exportPanelizedGerbers(
         layerFile.type,
         layerFile.side
       )
-      // Use a clean filename with descriptive layer name
-      const ext = layerFile.fileName.endsWith('.gbr') ? '.gbr' : '.gerber'
+      // PartNumber_LayerName.gerber
       const descriptiveName = generateDescriptiveLayerName(layerFile)
-      const outName = `panel_${descriptiveName}${ext}`
+      const outName = `${partNumber}_${descriptiveName}.gerber`
       folder.file(outName, panelized)
     } catch (e) {
       console.warn(`Failed to panelize ${layerFile.name}:`, e)
@@ -177,7 +193,7 @@ export async function exportPanelizedGerbers(
 
   // Generate and download ZIP
   const blob = await zip.generateAsync({ type: 'blob' })
-  saveAs(blob, `panelized_${panel.totalPCBs}up_${new Date().toISOString().slice(0, 10)}.zip`)
+  saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_Panel.zip`)
 }
 
 
@@ -234,15 +250,16 @@ function generateReadme(
   }
 
   if (layers && layers.length > 0) {
+    const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
     lines.push('--- Files ---')
-    lines.push('panel_border.gerber - Panel outline (border only)')
+    lines.push(`${partNumber}_Panel_Border.gerber - Panel outline (border only)`)
     const hasDrills = layers.some(l => l.type === 'drill')
     if (hasDrills) {
-      lines.push('panel_drill.drl - Panelized drill file (Excellon)')
+      lines.push(`${partNumber}_Drill.drl - Panelized drill file (Excellon)`)
     }
     for (const layer of layers) {
       const descriptiveName = generateDescriptiveLayerName(layer)
-      lines.push(`panel_${descriptiveName}.gerber - Panelized ${descriptiveName}`)
+      lines.push(`${partNumber}_${descriptiveName}.gerber - Panelized ${descriptiveName}`)
     }
     lines.push('')
   }
