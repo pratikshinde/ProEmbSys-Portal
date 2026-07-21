@@ -357,13 +357,17 @@ function parseApertureDefinition(data: string, state: ParserState): void {
   // Extended shapes: CIRCLE, RECT, RECTANGLE, ROUNDED, OBROUND, POLYGON, etc.
   // Macro apertures: AM<name> or any other identifier not matching above
 
-  const shapeMatch = body.match(/^([A-Za-z]+)/);
+  // Aperture macro names may contain digits/underscores after the first letter
+  // (e.g. KiCad's "FreePoly0") — a letters-only match truncates the name and
+  // spills the trailing digit into the parameter string, corrupting $1.
+  const shapeMatch = body.match(/^([A-Za-z][A-Za-z0-9_]*)/);
   if (!shapeMatch) {
     state.warnings.push(`Malformed aperture definition: missing shape in "${data}"`);
     return;
   }
 
-  const shapeStr = shapeMatch[1].toUpperCase();
+  const shapeStrRaw = shapeMatch[1];
+  const shapeStr = shapeStrRaw.toUpperCase();
   body = body.substring(shapeMatch[1].length);
 
   // Skip optional comma separator (some files use it, some don't)
@@ -399,10 +403,14 @@ function parseApertureDefinition(data: string, state: ParserState): void {
       shape = 'polygon';
       break;
     default:
-      // Anything else is treated as an aperture macro reference
+      // Anything else is treated as an aperture macro reference. Macro names are
+      // case-sensitive (must match the %AM definition's name exactly) — preserve
+      // the original casing here, or exported %ADD lines referencing this macro
+      // silently fail to resolve in strict parsers (tracespace, CAM350) even
+      // though our own AM-block extraction copies the definition verbatim.
       shape = 'macro';
       isMacro = true;
-      macroName = shapeStr;
+      macroName = shapeStrRaw;
       break;
   }
 

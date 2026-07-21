@@ -366,8 +366,15 @@ function generateApertureDefinitions(apertures: Map<number, GerberAperture>): st
         const name = ap.macroName || 'UNKNOWN'
         const paramParts: string[] = []
         if (ap.parameters) {
-          // Parameters are stored as $1, $2, etc.
-          const keys = Object.keys(ap.parameters).sort()
+          // Parameters are stored as $1, $2, ..., $10, ... — a plain string sort
+          // orders "$10" before "$2" (lexicographic), silently shifting every
+          // parameter after $9 by one position for any macro with 10+ params
+          // (e.g. KiCad's RoundRect: radius + 8 corner coords + trailing $10).
+          // That corrupts the box-body polygon and every vector-line endpoint
+          // derived from it, even though the parser captured the values correctly.
+          const keys = Object.keys(ap.parameters).sort(
+            (a, b) => parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10)
+          )
           for (const key of keys) {
             paramParts.push(ap.parameters[key].toFixed(6))
           }
