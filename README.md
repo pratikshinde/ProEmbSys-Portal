@@ -18,6 +18,11 @@ Actively developed. Core ordering flow, backend, and panelization tool are funct
 
 Reverse-chronological. Each entry is a real commit — see `git log` for full diffs.
 
+### 2026-07-21 — Fix aperture-macro corruption in exported Gerber files
+- Root-caused reports of "missing D-codes" and broken RoundRect pad rendering (confirmed via tracespace.io, delta-gerber, and CAM350) to three bugs in the export path — none in tracespace, which export never touches.
+- `gerber-parser.ts`: stopped uppercasing custom aperture macro names (`RoundRect` was becoming `ROUNDRECT`, so the exported `%ADD` reference no longer matched the verbatim-copied `%AM` definition — "aperture selected but never defined" in every tool). Also fixed the shape-identifier regex truncating digit-suffixed macro names like KiCad's `FreePoly0` to `FreePoly`, which spilled the trailing digit into and corrupted the first parameter.
+- `panelization-engine.ts`: fixed `generateApertureDefinitions` sorting macro parameter keys (`$1`..`$10`) lexicographically instead of numerically — `"$10"` sorted before `"$2"`, shifting every corner coordinate of KiCad's RoundRect macro (10 params: radius + 8 corners + a trailing unused rotation) by one position on the way out, even though the parser had captured them correctly. Explains why CAM350 — spec-correct, no tracespace quirks — rendered the same corrupted geometry as the web viewers.
+
 ### 2026-07-21 — Region-based panel font quality
 - Replaced the hand-authored region-font glyph polygons with **real vector-font outlines** — an embedded Geist Regular subset (OFL-1.1, ~12 KB) parsed via opentype.js, flattened to filled Gerber regions with proper counters. Crisp proportional letterforms (and lowercase, previously missing) instead of rough bespoke polygons.
 - Made the panel preview **WYSIWYG**: it now renders the exact same glyph polygons the Gerber exports (byte-identical coordinates), replacing the old browser-monospace approximation.
