@@ -8,6 +8,7 @@ import { asAddressSnapshot, formatAddressSnapshot } from "@/lib/format-address"
 import { SOLDER_MASK_SWATCH } from "@/lib/solder-mask-colors"
 import { OrderStatusBadge } from "@/components/order-status-badge"
 import { OrderTimeline } from "@/components/order-timeline"
+import PayNowButton from "@/components/pay-now-button"
 
 export default async function OrderDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -55,6 +56,10 @@ export default async function OrderDetailPage({ params }: { params: Promise<{ id
         )}
 
         <OrderTimeline status={order.status} />
+
+        {order.status === "AWAITING_PAYMENT" && order.userId === session.user.id && (
+          <PayNowButton orderId={order.id} amount={Number(order.total)} reference={order.reference} />
+        )}
 
         <div className="grid grid-cols-2 gap-3 rounded-lg border border-border bg-card p-5 text-sm">
           <div>

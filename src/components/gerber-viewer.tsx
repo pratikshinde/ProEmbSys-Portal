@@ -5,7 +5,8 @@ import { useAppStore, getLayerZIndex } from '@/lib/store'
 import { mergeLayerBounds, GerberSvgResult } from '@/lib/gerber-svg'
 import { PanelResult } from '@/lib/panelization-engine'
 import { getRegionTextPolygons } from '@/lib/region-font'
-import { BOARD_COLOR_NAMES, BOARD_COLOR_PALETTE } from '@/lib/board-colors'
+import { BOARD_COLOR_NAMES, BOARD_COLOR_PALETTE, getPcbColor, PCB_OPACITY, silkColorFor, getMaskClipPairs } from '@/lib/board-colors'
+import { RawSvgGroup, RawSvgMask } from './raw-svg-group'
 
 /**
  * GerberViewer — SVG-based viewer using tracespace-rendered layers (Web Worker).
@@ -21,31 +22,6 @@ interface ViewState {
   viewBox: string
   zoom: number
 }
-
-/**
- * Inject a raw SVG fragment string as the children of a <g> element.
- * Uses an imperative innerHTML assignment via a ref so we avoid React's
- * raw-html prop. The injected content comes from our own worker (tracespace),
- * never from user-supplied HTML, so XSS is not in scope here.
- */
-const RawSvgGroup = React.forwardRef<
-  SVGGElement,
-  { html: string } & Omit<React.SVGAttributes<SVGGElement>, 'dangerouslySetInnerHTML'>
->(function RawSvgGroup({ html, ...rest }, externalRef) {
-  const innerRef = useRef<SVGGElement>(null)
-  // useLayoutEffect (not useEffect) so innerHTML lands synchronously before the
-  // browser paints — critical when the parent is referenced by <use>, since
-  // <use> needs to see the populated content on the same paint frame.
-  useLayoutEffect(() => {
-    const el = innerRef.current
-    if (el && el.innerHTML !== html) el.innerHTML = html
-  }, [html])
-  useEffect(() => {
-    if (typeof externalRef === 'function') externalRef(innerRef.current)
-    else if (externalRef) externalRef.current = innerRef.current
-  })
-  return <g ref={innerRef} {...rest} />
-})
 
 /**
  * Same as RawSvgGroup but emits a <symbol> — used inside <defs> as the target
@@ -394,43 +370,10 @@ export default function GerberViewer() {
   // PCB-realistic colors for board mode compositing (replaces user-configurable colors).
   // Copper tint follows the selected soldermask color (copper as seen through the
   // mask); pad-finish gold stays constant across all mask colors, like a real board.
+  // Shared with the PCB Order page's preview via board-colors.ts so the two never drift.
   const copperTint = BOARD_COLOR_PALETTE[boardColor].copperTint
-  // White silkscreen is invisible on a white mask, so print it black instead —
-  // matching how real white-soldermask boards are actually silkscreened.
-  const silkColor = boardColor === 'White' ? '#1a1a1a' : '#e8e8e8'
-  const PCB_COLORS: Record<string, string> = {
-    'copper-top':    copperTint,
-    'copper-bottom': copperTint,
-    'copper-none':   copperTint,
-    'mask-top':      '#d4af37',  // gold exposed pads
-    'mask-bottom':   '#d4af37',
-    'mask-none':     '#d4af37',
-    'silk-top':      silkColor,
-    'silk-bottom':   silkColor,
-    'silk-none':     silkColor,
-    'outline-none':  '#1a1a1a',
-    'outline-top':   '#1a1a1a',
-    'outline-bottom':'#1a1a1a',
-    'paste-top':     '#aaaaaa',
-    'paste-bottom':  '#aaaaaa',
-    'drill-none':    '#1a1a1a',  // dark grey drill hole interior
-    'drill-top':     '#1a1a1a',
-    'drill-bottom':  '#1a1a1a',
-    'other-none':    '#888888',
-  }
-  const getPcbColor = (type: string, side: string) =>
-    PCB_COLORS[`${type}-${side}`] ?? PCB_COLORS[`${type}-none`] ?? '#888888'
-
-  // PCB opacity for board mode
-  const PCB_OPACITY: Record<string, number> = {
-    copper: 1.0,
-    mask:   1.0,  // set to 1.0 so exposed gold pads render opaque on top of green copper traces
-    silk:   1.0,
-    outline: 1.0,
-    paste:  0.7,
-    drill:  1.0,
-    other:  0.5,
-  }
+  const silkColor = silkColorFor(boardColor)
+  const getBoardLayerColor = (type: string, side: string) => getPcbColor(type, side, copperTint, silkColor)
 
   // Layers for board mode: filter by selected side, apply PCB colors
   const boardModeLayers = useMemo(() => {
@@ -786,6 +729,8 @@ export default function GerberViewer() {
             if ((activeTab === 'panel' || activeTab === 'export') && panelResult && nativeSvgBounds) {
               const pr = panelResult
               const refBounds = nativeSvgBounds
+              const maskClipPairs = getMaskClipPairs(bLayers)
+              const maskClipByMaskId = new Map(maskClipPairs.map(p => [p.maskLayerId, p]))
               return (
                 <>
                   <defs>
@@ -797,6 +742,11 @@ export default function GerberViewer() {
                           html={layer.svgData.svgFragment}
                         />
                       ) : null
+                    ))}
+                    {maskClipPairs.map(pair => (
+                      <mask key={`mask-mask-${pair.maskLayerId}`} id={`mask-mask-${pair.maskLayerId}`}>
+                        <use href={`#layer-def-${pair.maskLayerId}`} style={{ color: '#fff' }} />
+                      </mask>
                     ))}
                     {pr.pcbPositions.map((pos, idx) => (
                       <clipPath key={`pcb-clip-${idx}`} id={`pcb-clip-${idx}`}>
@@ -816,14 +766,28 @@ export default function GerberViewer() {
                       <g key={`panel-pos-${posIdx}`} clipPath={`url(#pcb-clip-${posIdx})`}>
                         <g transform={`translate(${tx.toFixed(6)}, ${ty.toFixed(6)})`}>
                           {bgRect}
-                          {bLayers.map(layer => (
-                            <use
-                              key={layer.id}
-                              href={`#layer-def-${layer.id}`}
-                              data-layer={layer.id}
-                              style={{ color: getPcbColor(layer.type, layer.side), opacity: PCB_OPACITY[layer.type] ?? 1 }}
-                            />
-                          ))}
+                          {bLayers.map(layer => {
+                            const clipPair = maskClipByMaskId.get(layer.id)
+                            if (clipPair) {
+                              return (
+                                <use
+                                  key={layer.id}
+                                  href={`#layer-def-${clipPair.copperLayerId}`}
+                                  data-layer={layer.id}
+                                  mask={`url(#mask-mask-${layer.id})`}
+                                  style={{ color: getBoardLayerColor('mask', layer.side), opacity: PCB_OPACITY.copper ?? 1 }}
+                                />
+                              )
+                            }
+                            return (
+                              <use
+                                key={layer.id}
+                                href={`#layer-def-${layer.id}`}
+                                data-layer={layer.id}
+                                style={{ color: getBoardLayerColor(layer.type, layer.side), opacity: PCB_OPACITY[layer.type] ?? 1 }}
+                              />
+                            )
+                          })}
                         </g>
                       </g>
                     )
@@ -833,17 +797,39 @@ export default function GerberViewer() {
             }
 
             // Single-PCB board view
+            const maskClipPairs = getMaskClipPairs(bLayers)
+            const bLayerById = new Map(bLayers.map(l => [l.id, l]))
             return (
               <>
                 {bgRect}
-                {bLayers.map(layer => (
-                  <RawSvgGroup
-                    key={layer.id}
-                    data-layer={layer.id}
-                    style={{ color: getPcbColor(layer.type, layer.side), opacity: PCB_OPACITY[layer.type] ?? 1 }}
-                    html={layer.svgData!.svgFragment}
-                  />
-                ))}
+                {bLayers.map(layer => {
+                  const clipPair = maskClipPairs.find(p => p.maskLayerId === layer.id)
+                  if (clipPair) {
+                    const copperLayer = bLayerById.get(clipPair.copperLayerId)
+                    if (!copperLayer?.svgData) return null
+                    const maskId = `board-mask-mask-${layer.id}`
+                    return (
+                      <React.Fragment key={layer.id}>
+                        <RawSvgMask id={maskId} html={layer.svgData!.svgFragment} />
+                        <g mask={`url(#${maskId})`}>
+                          <RawSvgGroup
+                            data-layer={layer.id}
+                            style={{ color: getBoardLayerColor('mask', layer.side), opacity: PCB_OPACITY.copper ?? 1 }}
+                            html={copperLayer.svgData.svgFragment}
+                          />
+                        </g>
+                      </React.Fragment>
+                    )
+                  }
+                  return (
+                    <RawSvgGroup
+                      key={layer.id}
+                      data-layer={layer.id}
+                      style={{ color: getBoardLayerColor(layer.type, layer.side), opacity: PCB_OPACITY[layer.type] ?? 1 }}
+                      html={layer.svgData!.svgFragment}
+                    />
+                  )
+                })}
               </>
             )
           })() : (activeTab === 'panel' || activeTab === 'export') && panelResult && nativeSvgBounds ? (() => {

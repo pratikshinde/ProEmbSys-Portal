@@ -18,6 +18,27 @@ Actively developed. Core ordering flow, backend, and panelization tool are funct
 
 Reverse-chronological. Each entry is a real commit — see `git log` for full diffs.
 
+### 2026-07-21 — Razorpay payment integration for PCB orders and the Shop
+- PCB orders: payment happens after staff DRC review — once an order is flipped to `AWAITING_PAYMENT`, the customer sees a "Pay Now" card on their order detail page, pays via Razorpay Checkout, and the order automatically advances to `IN_PRODUCTION`.
+- Shop: the mini-cart's old `mailto:` enquiry link is now a real checkout — sign in, pick a saved delivery address, pay. Shop purchases are persisted for the first time (`ShopOrder`/`ShopOrderItem`), with server-recomputed pricing from live `Product` rows, mirroring how PCB orders never trust client-sent prices.
+- A Razorpay webhook (`/api/webhooks/razorpay`) is a reliability fallback alongside the client-side payment-verify calls, so a payment still gets marked paid even if the customer closes the tab right after paying. Both paths funnel through the same idempotent "mark paid" helpers.
+- New admin "Shop Orders" list (`/admin/shop-orders`) with an inline status control, alongside the existing Orders page.
+- Requires real Razorpay test keys in `.env` (`RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`/`RAZORPAY_WEBHOOK_SECRET`) before a live checkout can be tested end-to-end — verified in-browser up through Razorpay order creation, which cleanly errors with placeholder keys instead of crashing.
+
+### 2026-07-21 — Fix fiducials rendering as flat oversized gold dots in Board view
+- Fiducials commonly have a soldermask opening larger than the copper pad beneath them (clearance for optical recognition) — the Board view was painting the entire opening flat gold instead of just the copper, hiding the ring of bare substrate other viewers (tracespace.io, delta-gerber) correctly show, which read as "fiducial missing" even though the source Gerbers were fine.
+- The mask layer's geometry is no longer painted directly — it's used to reveal a second gold-colored copy of the matching copper layer, so gold only appears where copper actually is. Ordinary SMD pads (mask ≈ copper size) render identically to before. Fixed in both the CAM tool's Board view (single-PCB and panelized) and the PCB Order page's board preview.
+- First attempt used an SVG `<clipPath>` and looked correct on a small test file, but silently rendered nothing on the real board that motivated the fix — a populated board's mask layer has 1000+ shapes (one opening per pad), and this renderer's `<clipPath>` breaks down past a few hundred. Switched to an SVG `<mask>` (raster/luminance-based), verified against the real file this time.
+
+### 2026-07-21 — Export drill format defaults to match the uploaded Gerber
+- The Drill Output Format in Panel Config → Drill & Marks used to always start at a hardcoded default (Excellon 2:4 inch) no matter what the customer's drill file actually used.
+- It now auto-populates from the imported drill layer's detected format (unit/digits/zero-suppression) the moment a drill file loads, across all three import paths (single file, ZIP, RAR). Manually picking a different format in the UI is still fully respected — the auto-sync only fires while the config is still untouched, so a deliberate user choice is never overwritten by a later import.
+
+### 2026-07-21 — Board preview on the PCB Order page
+- After a Gerber upload, the PCB Order page now shows a composited board preview (FR4 substrate + gold pads + soldermask + silkscreen) in the soldermask color the customer is actually ordering — the existing Color spec buttons drive it live, no separate preview-only control.
+- New `board-preview.tsx`: deliberately store-independent (doesn't touch the Panelization tool's Zustand store), classifies layers with the same 3-tier priority as the CAM tool (drill content-sniff → TF.FileFunction → filename heuristic) and renders via the same worker pipeline. Static + fit-to-view with a Top/Bottom toggle.
+- Extracted the CAM tool's board-color/opacity/z-order tables and its `RawSvgGroup` SVG-injection helper into shared files (`board-colors.ts`, `raw-svg-group.tsx`) so the order-page preview and the CAM tool's Board view can never drift apart. Pure refactor — verified the CAM tool's Board view renders byte-identically after.
+
 ### 2026-07-21 — Part-number-based export filenames
 - ZIP archive is now named `PartNumber_CustomerName_Version_Date_Panel.zip` instead of a generic `panelized_<N>up_<date>.zip`.
 - Every file inside follows `PartNumber_LayerName.gerber` (drill files keep `.drl`). All four PanelInfo fields are sanitized first since they're free-text user input.

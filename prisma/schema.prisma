@@ -37,6 +37,7 @@ model User {
   pricingRateEdits    PricingRate[] @relation("PricingRateEditedBy")
   addresses           Address[]
   blogPosts           BlogPost[]
+  shopOrders          ShopOrder[]
 
   @@map("users")
 }
@@ -223,6 +224,15 @@ model Order {
   deliveryAddress Json? // required to place an order (not to save a quote); null for quotes and pre-existing orders
   billingAddress  Json? // optional — not every customer needs a GST invoice
 
+  // Razorpay payment fields. `status` itself is the source of truth for
+  // "is this paid" (AWAITING_PAYMENT -> IN_PRODUCTION is the paid
+  // transition) — these are just the Razorpay identifiers for reference/
+  // reconciliation, not a second state machine. razorpayOrderId is
+  // overwritten if the customer retries a failed/abandoned payment attempt.
+  razorpayOrderId   String?   @unique
+  razorpayPaymentId String?
+  paidAt            DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -315,8 +325,68 @@ model Product {
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
 
+  orderItems ShopOrderItem[]
+
   @@index([isActive])
   @@map("products")
+}
+
+enum ShopOrderStatus {
+  PENDING_PAYMENT
+  PAID
+  SHIPPED
+  COMPLETED
+  CANCELLED
+}
+
+// Shop (module store) purchases — a separate order concept from the PCB
+// fabrication `Order` model above. Payment happens immediately at checkout
+// (no DRC-equivalent review step for off-the-shelf modules), unlike PCB
+// orders which only reach a payable state after staff review.
+model ShopOrder {
+  id     String          @id @default(cuid())
+  reference String       @unique // SHOP-YYYYMMDD-NNNN, see src/lib/order-reference.ts
+  userId String
+  status ShopOrderStatus @default(PENDING_PAYMENT)
+
+  // Denormalized total for cheap sort/filter, same reasoning as Order.total.
+  total Decimal @db.Decimal(10, 2)
+
+  // Snapshot of the chosen Address row at checkout time — same reasoning as
+  // Order.deliveryAddress (Address is editable/deletable by the customer).
+  deliveryAddress Json
+
+  // Razorpay payment fields — same shape/reasoning as on Order.
+  razorpayOrderId   String?   @unique
+  razorpayPaymentId String?
+  paidAt            DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user  User            @relation(fields: [userId], references: [id], onDelete: Restrict)
+  items ShopOrderItem[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("shop_orders")
+}
+
+model ShopOrderItem {
+  id          String  @id @default(cuid())
+  shopOrderId String
+  productId   String?
+  // Snapshot at purchase time — a Product can be edited/deactivated/deleted
+  // later without changing what a past order says the customer bought.
+  name  String
+  price Decimal @db.Decimal(10, 2) // unit price snapshot
+  qty   Int
+
+  shopOrder ShopOrder @relation(fields: [shopOrderId], references: [id], onDelete: Cascade)
+  product   Product?  @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([shopOrderId])
+  @@map("shop_order_items")
 }
 
 model Testimonial {

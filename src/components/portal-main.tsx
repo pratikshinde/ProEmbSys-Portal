@@ -19,6 +19,9 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuIte
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import type { AddressRecord } from '@/components/account/account-client';
 import { SOLDER_MASK_SWATCH } from '@/lib/solder-mask-colors';
+import BoardPreview from './board-preview';
+import type { BoardColorName } from '@/lib/board-colors';
+import { loadRazorpayScript } from '@/lib/load-razorpay-script';
 
 
 // ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
@@ -1096,6 +1099,7 @@ function PCBOrderPage() {
   const [analyzing, setAnalyzing] = useState(false);
   const [analysis, setAnalysis] = useState<GerberQuoteAnalysis | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [previewEntries, setPreviewEntries] = useState<{ name: string; content: string }[]>([]);
   const [width, setWidth] = useState("");
   const [height, setHeight] = useState("");
   const [dimsAutoFilled, setDimsAutoFilled] = useState(false);
@@ -1175,6 +1179,7 @@ function PCBOrderPage() {
     }
     setFile(f);
     setOrderRef(null);
+    setPreviewEntries([]);
     if (f.name.toLowerCase().endsWith('.rar')) {
       setAnalysis(null);
       setAnalysisError("RAR archives aren't analyzed automatically yet — enter board dimensions manually below.");
@@ -1184,6 +1189,7 @@ function PCBOrderPage() {
     setAnalysisError(null);
     try {
       const entries = await extractEntries(f);
+      setPreviewEntries(entries);
       const result = analyzeGerberSet(entries);
       setAnalysis(result);
       if (result.boardWidthMm && result.boardHeightMm) {
@@ -1491,6 +1497,17 @@ function PCBOrderPage() {
                 </div>
               )}
             </Card>
+
+            {/* Board preview — renders in the soldermask color being ordered */}
+            {previewEntries.length > 0 && (
+              <Card style={{ padding:0, overflow:"hidden" }}>
+                <div style={{ padding:"14px 20px", borderBottom:`1px solid ${C.border}`, display:"flex", alignItems:"center", gap:8 }}>
+                  <span style={{ fontSize:13, fontWeight:700, color:C.text0, fontFamily:"'DM Sans',sans-serif" }}>Board Preview</span>
+                  <span style={{ fontSize:11, color:C.text2, fontFamily:"'DM Sans',sans-serif" }}>— {specs.color} soldermask</span>
+                </div>
+                <BoardPreview entries={previewEntries} maskColor={specs.color as BoardColorName} className="p-4" />
+              </Card>
+            )}
 
             {/* Specs */}
             <Card style={{ padding:0, overflow:"hidden" }}>
@@ -2043,6 +2060,13 @@ function ShopPage({ cart, setCart }: { cart: Record<string, number>; setCart: Re
   const [products, setProducts] = useState<ProductSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [cartOpen, setCartOpen] = useState(false);
+  const { status: sessionStatus } = useSession();
+  const router = useRouter();
+
+  const [deliveryAddresses, setDeliveryAddresses] = useState<AddressRecord[]>([]);
+  const [deliveryAddressId, setDeliveryAddressId] = useState<string>("");
+  const [checkingOut, setCheckingOut] = useState(false);
+  const [checkoutSuccess, setCheckoutSuccess] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/products")
@@ -2050,6 +2074,18 @@ function ShopPage({ cart, setCart }: { cart: Record<string, number>; setCart: Re
       .then(setProducts)
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    if (sessionStatus !== "authenticated") return;
+    fetch("/api/account/addresses")
+      .then(res => res.ok ? res.json() : [])
+      .then((all: AddressRecord[]) => {
+        const delivery = all.filter(a => a.type === "DELIVERY");
+        setDeliveryAddresses(delivery);
+        const def = delivery.find(a => a.isDefault) ?? delivery[0];
+        if (def) setDeliveryAddressId(def.id);
+      });
+  }, [sessionStatus]);
 
   const cats = ["All", ...Array.from(new Set(products.map(p => p.category)))];
   const visible = products.filter(p=>filter==="All"||p.category===filter);
@@ -2068,11 +2104,60 @@ function ShopPage({ cart, setCart }: { cart: Record<string, number>; setCart: Re
     });
   }
 
-  // Online checkout isn't built yet — the honest working flow is a prefilled
-  // order enquiry email, not a cart button that goes nowhere.
-  const enquiryHref = `mailto:proembsys.tech@gmail.com?subject=${encodeURIComponent("Module order enquiry — ProPCB shop")}&body=${encodeURIComponent(
-    `Hi ProEmbSys,\n\nI'd like to order:\n\n${cartItems.map(x => `- ${x.product.name} × ${x.qty} — ₹${(Number(x.product.price) * x.qty).toLocaleString("en-IN")}`).join("\n")}\n\nTotal: ₹${cartTotal.toLocaleString("en-IN")}\n\nName:\nPhone:\nShipping address:\n`
-  )}`;
+  function formatShopAddress(a: AddressRecord) {
+    return `${a.label ? a.label + " — " : ""}${a.line1}, ${a.city}, ${a.state} ${a.postalCode}`;
+  }
+
+  async function handleShopCheckout() {
+    if (!deliveryAddressId) return;
+    setCheckingOut(true);
+    try {
+      const scriptLoaded = await loadRazorpayScript();
+      if (!scriptLoaded) {
+        toast({ title: "Could not load payment gateway", description: "Please check your connection and try again." });
+        return;
+      }
+      const res = await fetch("/api/shop/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: cartItems.map(x => ({ productId: x.product.id, qty: x.qty })),
+          deliveryAddressId,
+        }),
+      });
+      const created = await res.json();
+      if (!res.ok) {
+        toast({ title: "Could not start checkout", description: created.error ?? "Please try again." });
+        return;
+      }
+      const razorpay = new window.Razorpay({
+        key: created.keyId,
+        amount: created.amount,
+        currency: created.currency,
+        name: created.name,
+        description: created.description,
+        order_id: created.razorpayOrderId,
+        prefill: created.prefill,
+        handler: async (response: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) => {
+          const verifyRes = await fetch(`/api/shop/orders/${created.shopOrderId}/verify`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(response),
+          });
+          if (!verifyRes.ok) {
+            toast({ title: "Payment could not be verified", description: "Please contact us with your payment ID." });
+            return;
+          }
+          setCart({});
+          setCheckoutSuccess(created.reference);
+          toast({ title: "Order placed!", description: `Reference ${created.reference}` });
+        },
+      });
+      razorpay.open();
+    } finally {
+      setCheckingOut(false);
+    }
+  }
 
   return (
     <div style={{ minHeight:"100vh", background:C.bg1, padding:"clamp(16px, 4vw, 40px)" }}>
@@ -2090,7 +2175,17 @@ function ShopPage({ cart, setCart }: { cart: Record<string, number>; setCart: Re
             </button>
             {cartOpen && (
               <div style={{ position:"absolute", right:0, top:"calc(100% + 8px)", width:"min(360px, 88vw)", background:C.bg0, border:`1px solid ${C.border2}`, borderRadius:12, padding:16, zIndex:100, boxShadow:"0 12px 40px rgba(0,0,0,0.5)" }}>
-                {cartItems.length === 0 ? (
+                {checkoutSuccess ? (
+                  <div style={{ textAlign:"center", padding:"8px 0" }}>
+                    <div style={{ fontSize:24, marginBottom:8 }}>✅</div>
+                    <div style={{ fontSize:13.5, fontWeight:700, color:C.text0, fontFamily:"'DM Sans',sans-serif", marginBottom:4 }}>Order placed!</div>
+                    <div style={{ fontSize:12, color:C.text2, fontFamily:"'DM Sans',sans-serif" }}>Reference {checkoutSuccess}</div>
+                    <button onClick={()=>{ setCheckoutSuccess(null); setCartOpen(false); }}
+                      style={{ marginTop:12, background:"transparent", border:`1px solid ${C.border2}`, borderRadius:8, padding:"7px 16px", fontSize:12.5, color:C.text1, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>
+                      Close
+                    </button>
+                  </div>
+                ) : cartItems.length === 0 ? (
                   <div style={{ fontSize:13, color:C.text2, fontFamily:"'DM Sans',sans-serif" }}>Your cart is empty — add some modules below.</div>
                 ) : (
                   <>
@@ -2111,12 +2206,37 @@ function ShopPage({ cart, setCart }: { cart: Record<string, number>; setCart: Re
                     <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:10, marginTop:4, display:"flex", justifyContent:"space-between", fontSize:14, fontWeight:800, color:C.text0, fontFamily:"'DM Sans',sans-serif" }}>
                       <span>Total</span><span>₹{cartTotal.toLocaleString("en-IN")}</span>
                     </div>
-                    <a href={enquiryHref} style={{ display:"block", textAlign:"center", marginTop:12, background:C.accent, color:"#fff", borderRadius:8, padding:"11px 0", fontSize:13.5, fontWeight:700, textDecoration:"none", fontFamily:"'DM Sans',sans-serif" }}>
-                      Email order enquiry →
-                    </a>
-                    <div style={{ fontSize:11, color:C.text2, marginTop:8, textAlign:"center", fontFamily:"'DM Sans',sans-serif" }}>
-                      Online checkout is coming soon — we confirm orders and payment by email within one business day.
-                    </div>
+
+                    {sessionStatus !== "authenticated" ? (
+                      <button
+                        onClick={()=>router.push(`/login?callbackUrl=${encodeURIComponent("/?page=shop")}`)}
+                        style={{ display:"block", width:"100%", textAlign:"center", marginTop:12, background:C.accent, color:"#fff", border:"none", borderRadius:8, padding:"11px 0", fontSize:13.5, fontWeight:700, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>
+                        Sign in to checkout →
+                      </button>
+                    ) : deliveryAddresses.length === 0 ? (
+                      <div style={{ marginTop:12, fontSize:12, color:C.text2, fontFamily:"'DM Sans',sans-serif", textAlign:"center" }}>
+                        Add a delivery address in your{" "}
+                        <a href="/account" style={{ color:C.accent2, fontWeight:700 }}>Account settings</a>{" "}
+                        to check out.
+                      </div>
+                    ) : (
+                      <>
+                        <div style={{ marginTop:12 }}>
+                          <Select value={deliveryAddressId} onValueChange={setDeliveryAddressId}>
+                            <SelectTrigger className="w-full"><SelectValue placeholder="Select a delivery address"/></SelectTrigger>
+                            <SelectContent>
+                              {deliveryAddresses.map(a => <SelectItem key={a.id} value={a.id}>{formatShopAddress(a)}</SelectItem>)}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <button
+                          onClick={handleShopCheckout}
+                          disabled={checkingOut || !deliveryAddressId}
+                          style={{ display:"block", width:"100%", textAlign:"center", marginTop:10, background:C.accent, color:"#fff", border:"none", borderRadius:8, padding:"11px 0", fontSize:13.5, fontWeight:700, cursor:checkingOut?"default":"pointer", opacity:checkingOut?0.7:1, fontFamily:"'DM Sans',sans-serif" }}>
+                          {checkingOut ? "Opening payment…" : `Pay ₹${cartTotal.toLocaleString("en-IN")}`}
+                        </button>
+                      </>
+                    )}
                   </>
                 )}
               </div>

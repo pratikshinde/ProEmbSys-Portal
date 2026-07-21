@@ -5,6 +5,7 @@ import { db } from "@/lib/db"
 import { buildRatesMap, calculatePcbQuoteV2 } from "@/lib/pricing-engine"
 import { generateOrderReference } from "@/lib/order-reference"
 import { saveOrderFile, type SavedOrderFile } from "@/lib/order-files"
+import { loadAddressSnapshot } from "@/lib/address-snapshot"
 
 export async function GET() {
   const session = await auth()
@@ -74,19 +75,11 @@ export async function POST(req: Request) {
   // Snapshot the chosen addresses now — Address rows are editable/deletable
   // by the customer, so a live foreign key would let a placed order's
   // shipping details silently change or break later.
-  async function loadAddressSnapshot(addressId: string | undefined, type: "DELIVERY" | "BILLING") {
-    if (!addressId) return null
-    const address = await db.address.findUnique({ where: { id: addressId } })
-    if (!address || address.userId !== userId || address.type !== type) return undefined
-    const { label, line1, line2, city, state, postalCode, country, gstNumber } = address
-    return { label, line1, line2, city, state, postalCode, country, gstNumber }
-  }
-
-  const deliveryAddress = await loadAddressSnapshot(deliveryAddressId, "DELIVERY")
+  const deliveryAddress = await loadAddressSnapshot(userId, deliveryAddressId, "DELIVERY")
   if (deliveryAddress === undefined) {
     return NextResponse.json({ error: "Invalid delivery address." }, { status: 400 })
   }
-  const billingAddress = await loadAddressSnapshot(billingAddressId, "BILLING")
+  const billingAddress = await loadAddressSnapshot(userId, billingAddressId, "BILLING")
   if (billingAddress === undefined) {
     return NextResponse.json({ error: "Invalid billing address." }, { status: 400 })
   }

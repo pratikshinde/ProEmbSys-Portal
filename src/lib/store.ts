@@ -4,10 +4,10 @@
 
 import { create } from 'zustand'
 import JSZip from 'jszip'
-import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode } from './gerber-parser'
+import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode, DrillMeta } from './gerber-parser'
 import { gerberToSvg, gerberRenderBoardView, BoardView, GerberSvgResult } from './gerber-svg'
 import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
-import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber } from './panelization-engine'
+import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DrillZeroSuppression, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber } from './panelization-engine'
 import { LayerType, LayerSide, detectLayerType, detectLayerSide } from './gerber-analysis'
 import { BoardColorName } from './board-colors'
 
@@ -165,20 +165,7 @@ function getDefaultOpacityByType(type: LayerType): number {
   }
 }
 
-/** Z-order rank used in the Layers view so silk lands on top of mask lands
- *  on top of copper, regardless of import order. Lower = bottom of the stack. */
-export function getLayerZIndex(type: LayerType): number {
-  switch (type) {
-    case 'outline': return 0
-    case 'copper': return 1
-    case 'mask': return 2
-    case 'paste': return 3
-    case 'silk': return 4
-    case 'drill': return 5
-    case 'fab': return 6
-    default: return 1
-  }
-}
+export { getLayerZIndex } from './board-colors'
 
 /**
  * Create a fallback SVG from parsed Gerber data when Python generation fails.
@@ -246,6 +233,53 @@ function createFallbackSvg(parsedLayer: GerberLayer, fileName: string): GerberSv
 
 function generateId(): string {
   return Math.random().toString(36).substring(2, 9)
+}
+
+/** Structural equality on the fields that actually affect export output (ignores `preset`, which is just a UI label). */
+function sameDrillFormat(a: Omit<DrillFormatConfig, 'preset'>, b: Omit<DrillFormatConfig, 'preset'>): boolean {
+  return a.integerDigits === b.integerDigits && a.decimalDigits === b.decimalDigits
+    && a.unit === b.unit && a.zeroSuppression === b.zeroSuppression
+}
+
+/**
+ * Map an imported drill layer's resolved format to the export DrillFormatConfig
+ * shape. DrillMeta.zeroSuppression names which zeros were REMOVED FROM THE FILE
+ * (import side); the export config is deliberately INVERTED (CAM350 reads the
+ * LZ/TZ header keywords backwards — see panelization-engine.ts's
+ * DrillZeroSuppression doc comment), so leading/trailing must be swapped here.
+ * 'none' means fixed-width in both conventions and needs no swap.
+ */
+function drillFormatFromMeta(meta: DrillMeta): DrillFormatConfig {
+  const zeroSuppression: DrillZeroSuppression =
+    meta.zeroSuppression === 'leading' ? 'trailing'
+      : meta.zeroSuppression === 'trailing' ? 'leading'
+        : 'none'
+  const format: Omit<DrillFormatConfig, 'preset'> = {
+    integerDigits: meta.integerDigits,
+    decimalDigits: meta.decimalDigits,
+    unit: meta.unit,
+    zeroSuppression,
+  }
+  const matchedPreset = (Object.keys(DRILL_FORMAT_PRESETS) as DrillFormatPreset[])
+    .find(p => p !== 'custom' && sameDrillFormat(DRILL_FORMAT_PRESETS[p], format))
+  return { preset: matchedPreset ?? 'custom', ...format }
+}
+
+/**
+ * Auto-populate the export drill format (Info & Export tab) from a
+ * newly-imported drill layer's detected format — "export should default to
+ * match the uploaded Gerber" — but only while the config is still untouched
+ * (equal to DEFAULT_DRILL_FORMAT), so we never clobber a deliberate choice
+ * the user already made there. Called from all three import entry points
+ * (addLayer / addLayersFromZip / addLayersFromRar).
+ */
+function maybeSyncExportDrillFormat(get: () => AppState, set: (fn: (state: AppState) => Partial<AppState>) => void, meta: DrillMeta | undefined) {
+  if (!meta) return
+  const current = get().panelConfig.drillFormat
+  if (!sameDrillFormat(current, DEFAULT_DRILL_FORMAT)) return // user (or an earlier sync) already set something
+  const detected = drillFormatFromMeta(meta)
+  if (sameDrillFormat(detected, current)) return
+  set(state => ({ panelConfig: { ...state.panelConfig, drillFormat: detected } }))
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -360,6 +394,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
 
       set(state => ({ layers: [...state.layers, entry] }))
+      if (type === 'drill') maybeSyncExportDrillFormat(get, set, finalParsed.drillMeta)
       void get().rebuildBoardView()
       // NOTE: Panel computation is now only triggered when user clicks "Panel Config" button
       // Not automatically when layers are added
@@ -764,6 +799,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
 
         set(state => ({ layers: [...state.layers, ...newLayers] }))
+        const firstDrillLayer = newLayers.find(l => l.type === 'drill')
+        if (firstDrillLayer) maybeSyncExportDrillFormat(get, set, firstDrillLayer.parsedLayer?.drillMeta)
         void get().rebuildBoardView()
         // NOTE: Panel computation is now only triggered when user clicks "Panel Config" button
         // Not automatically when layers are added from zip
@@ -975,6 +1012,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
 
         set(state => ({ layers: [...state.layers, ...newLayers] }))
+        const firstDrillLayer = newLayers.find(l => l.type === 'drill')
+        if (firstDrillLayer) maybeSyncExportDrillFormat(get, set, firstDrillLayer.parsedLayer?.drillMeta)
         void get().rebuildBoardView()
       }
     } catch (err) {
