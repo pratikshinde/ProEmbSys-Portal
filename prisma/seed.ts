@@ -5,9 +5,15 @@
  * never had — seeded at 0 so they don't change existing prices until an
  * admin configures real values.
  */
-import { PrismaClient, PricingCategory } from "@prisma/client"
+import { PrismaClient, PricingCategory, Prisma } from "@prisma/client"
+import { DEFAULT_DFM_RULES } from "../src/lib/dfm/types"
 
 const db = new PrismaClient()
+
+/** Fixed id so re-seeding updates the baseline template in place rather than
+ *  creating duplicates, and so it stays referentially stable for users who
+ *  selected it. */
+const BASELINE_DFM_TEMPLATE_ID = "dfm-tpl-proembsys-standard"
 
 type SeedRow = { category: PricingCategory; key: string; label: string; value: number; unit: string; sortOrder: number }
 
@@ -76,6 +82,30 @@ async function main() {
     })
   }
   console.log(`Seeded ${rows.length} pricing rates.`)
+
+  // The SHARED baseline DFM template, built from the same FAB_CAPABILITIES
+  // constant that renders /fab-capabilities — so the public spec page and the
+  // default DFM ruleset can't drift. `isSystem` keeps it undeletable, which
+  // guarantees every user (including logged-out ones) always has at least one
+  // selectable template. `rules` is refreshed on every seed so editing the
+  // constant and re-seeding propagates the change.
+  await db.dfmTemplate.upsert({
+    where: { id: BASELINE_DFM_TEMPLATE_ID },
+    create: {
+      id: BASELINE_DFM_TEMPLATE_ID,
+      scope: "SHARED",
+      name: "ProEmbSys Standard",
+      rules: DEFAULT_DFM_RULES as unknown as Prisma.InputJsonValue,
+      isDefault: true,
+      isSystem: true,
+    },
+    update: {
+      name: "ProEmbSys Standard",
+      rules: DEFAULT_DFM_RULES as unknown as Prisma.InputJsonValue,
+      isSystem: true,
+    },
+  })
+  console.log("Seeded the ProEmbSys Standard DFM template.")
 }
 
 main()

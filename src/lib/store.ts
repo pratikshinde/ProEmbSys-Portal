@@ -7,6 +7,8 @@ import JSZip from 'jszip'
 import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode, DrillMeta } from './gerber-parser'
 import { gerberToSvg, gerberRenderBoardView, BoardView, GerberSvgResult } from './gerber-svg'
 import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
+import { runDfm } from './dfm/run-dfm'
+import type { DfmContext, DfmLayerInput, DfmReport, DfmRules } from './dfm/types'
 import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DrillZeroSuppression, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber } from './panelization-engine'
 import { LayerType, LayerSide, detectLayerType, detectLayerSide } from './gerber-analysis'
 import { BoardColorName } from './board-colors'
@@ -104,9 +106,18 @@ interface AppState {
   boardColor: BoardColorName
   setBoardColor: (color: BoardColorName) => void
 
+  // DFM
+  dfmReport: DfmReport | null
+  dfmTemplateId: string | null
+  setDfmTemplateId: (id: string | null) => void
+  dfmContext: DfmContext
+  updateDfmContext: (updates: Partial<DfmContext>) => void
+  runDfmCheck: (rules: DfmRules) => void
+  clearDfmReport: () => void
+
   // UI state
-  activeTab: 'layers' | 'panel' | 'info' | 'export'
-  setActiveTab: (tab: 'layers' | 'panel' | 'info' | 'export') => void
+  activeTab: 'layers' | 'panel' | 'info' | 'export' | 'dfm'
+  setActiveTab: (tab: 'layers' | 'panel' | 'info' | 'export' | 'dfm') => void
   showGrid: boolean
   toggleGrid: () => void
   showCrosshair: boolean
@@ -1380,6 +1391,39 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   boardColor: 'Green',
   setBoardColor: (color) => set({ boardColor: color }),
+
+  // DFM — the report lives in the store (like panelResult) so it survives tab
+  // switches. Deliberately only recomputed on an explicit runDfmCheck() call,
+  // never automatically on layer/config change, matching how panel computation
+  // is only triggered by "Create Panel".
+  dfmReport: null,
+  dfmTemplateId: null,
+  setDfmTemplateId: (id) => set({ dfmTemplateId: id }),
+  dfmContext: { boardThicknessMm: 1.6 },
+  updateDfmContext: (updates) => set(state => ({ dfmContext: { ...state.dfmContext, ...updates } })),
+
+  runDfmCheck: (rules) => {
+    const { layers, panelResult, dfmContext } = get()
+    // LayerEntry already carries exactly the four fields DfmLayerInput needs,
+    // so no adapter is required (the order flow's DetectedLayer matches too).
+    const input: DfmLayerInput[] = layers.map(l => ({
+      fileName: l.fileName,
+      type: l.type,
+      side: l.side,
+      parsedLayer: l.parsedLayer,
+    }))
+    // Panel outer size is only meaningful once a panel has been computed; a
+    // panel can legitimately exceed single-board limits, so it's checked
+    // separately rather than folded into the board-size check.
+    const context: DfmContext = {
+      ...dfmContext,
+      ...(panelResult
+        ? { panelWidthMm: panelResult.panelWidth, panelHeightMm: panelResult.panelHeight }
+        : {}),
+    }
+    set({ dfmReport: runDfm(input, context, rules) })
+  },
+  clearDfmReport: () => set({ dfmReport: null }),
 
   // UI state
   activeTab: 'layers',

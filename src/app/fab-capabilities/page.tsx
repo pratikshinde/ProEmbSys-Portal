@@ -1,4 +1,5 @@
 import { Navbar } from "@/components/portal-main"
+import { FAB_CAPABILITIES as CAP } from "@/lib/fab-capabilities"
 
 interface Spec {
   label: string
@@ -11,20 +12,28 @@ interface SpecGroup {
   specs: Spec[]
 }
 
+// Numbers come from src/lib/fab-capabilities.ts so this page and the DFM
+// engine's baseline template can't drift apart. Labels/formatting stay here
+// (presentation), as do the prose-only rows (tolerances, finish list,
+// panelization support) that no automated rule evaluates.
 const SPEC_GROUPS: SpecGroup[] = [
   {
     title: "General",
     specs: [
-      { label: "Layer count", standard: "1–8 layers" },
-      { label: "Max board size (single piece)", standard: "500mm × 500mm" },
-      { label: "Board thickness", standard: "0.4mm – 3.2mm" },
+      { label: "Layer count", standard: `${CAP.layerRange[0]}–${CAP.layerRange[1]} layers` },
+      { label: "Max board size (single piece)", standard: `${CAP.maxBoardMm}mm × ${CAP.maxBoardMm}mm` },
+      { label: "Board thickness", standard: `${CAP.boardThicknessMm[0]}mm – ${CAP.boardThicknessMm[1]}mm` },
       { label: "Board outline tolerance", standard: "±0.15mm" },
     ],
   },
   {
     title: "Copper & Traces",
     specs: [
-      { label: "Min track width / spacing", standard: "0.1mm (4 mil)", advanced: "0.09mm (3.5 mil)" },
+      {
+        label: "Min track width / spacing",
+        standard: `${CAP.minTraceWidthMm.standard}mm (4 mil)`,
+        advanced: `${CAP.minTraceWidthMm.advanced}mm (3.5 mil)`,
+      },
       { label: "Copper weight (outer layers)", standard: "1 oz – 3 oz" },
       { label: "Impedance control tolerance", standard: "±10%" },
     ],
@@ -32,18 +41,26 @@ const SPEC_GROUPS: SpecGroup[] = [
   {
     title: "Drilling",
     specs: [
-      { label: "Min mechanical drill size", standard: "0.3mm", advanced: "0.2mm" },
-      { label: "Min annular ring", standard: "0.15mm", advanced: "0.13mm" },
+      {
+        label: "Min mechanical drill size",
+        standard: `${CAP.minDrillMm.standard}mm`,
+        advanced: `${CAP.minDrillMm.advanced}mm`,
+      },
+      {
+        label: "Min annular ring",
+        standard: `${CAP.minAnnularRingMm.standard}mm`,
+        advanced: `${CAP.minAnnularRingMm.advanced}mm`,
+      },
       { label: "Hole position tolerance", standard: "±0.075mm" },
-      { label: "Max aspect ratio (board thickness : drill dia.)", standard: "10:1" },
+      { label: "Max aspect ratio (board thickness : drill dia.)", standard: `${CAP.maxAspectRatio}:1` },
     ],
   },
   {
     title: "Solder Mask & Silkscreen",
     specs: [
-      { label: "Min solder mask clearance", standard: "0.05mm" },
-      { label: "Min silkscreen line width", standard: "0.15mm" },
-      { label: "Min silkscreen text height", standard: "0.8mm" },
+      { label: "Min solder mask clearance", standard: `${CAP.minMaskClearanceMm.standard}mm` },
+      { label: "Min silkscreen line width", standard: `${CAP.minSilkLineWidthMm.standard}mm` },
+      { label: "Min silkscreen text height", standard: `${CAP.minSilkTextHeightMm.standard}mm` },
     ],
   },
   {

@@ -5,8 +5,9 @@ import GerberViewer from './gerber-viewer';
 import LayerPanel from './layer-panel';
 import PanelConfigPanel from './panel-config';
 import ExportPanel from './export-panel';
+import DfmPanel from './dfm-panel';
 import { Button } from './ui/button';
-import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck } from 'lucide-react';
 import { useAppStore } from '../lib/store';
 import JSZip from 'jszip';
 import { analyzeGerberSet, GerberQuoteAnalysis } from '../lib/gerber-analysis';
@@ -1860,6 +1861,7 @@ function PanelizationPage() {
           {[
             { key: 'layers' as const, icon: Layers, label: 'Layers' },
             { key: 'panel' as const, icon: LayoutGrid, label: 'Panel Config' },
+            { key: 'dfm' as const, icon: ShieldCheck, label: 'DFM Check' },
             { key: 'export' as const, icon: Download, label: 'Info & Export' },
           ].map(({ key, icon: Icon, label }) => (
             <button
@@ -1906,6 +1908,7 @@ function PanelizationPage() {
               <div style={{ padding:12, height:"100%" }}>
                 {activeTab === 'layers' && <LayerPanel />}
                 {activeTab === 'panel' && <PanelConfigPanel />}
+                {activeTab === 'dfm' && <DfmPanel />}
                 {activeTab === 'export' && <ExportPanel />}
               </div>
             </div>

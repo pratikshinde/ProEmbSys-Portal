@@ -33,6 +33,9 @@ export default async function AdminLayout({ children }: { children: React.ReactN
             <Link href="/admin/testimonials" className="text-muted-foreground hover:text-primary">
               Testimonials
             </Link>
+            <Link href="/admin/dfm-templates" className="text-muted-foreground hover:text-primary">
+              DFM
+            </Link>
             {session.user.role === "ADMIN" && (
               <>
                 <Link href="/admin/team" className="text-muted-foreground hover:text-primary">

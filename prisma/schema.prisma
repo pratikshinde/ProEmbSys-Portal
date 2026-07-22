@@ -38,6 +38,7 @@ model User {
   addresses           Address[]
   blogPosts           BlogPost[]
   shopOrders          ShopOrder[]
+  dfmTemplates        DfmTemplate[]
 
   @@map("users")
 }
@@ -402,4 +403,46 @@ model Testimonial {
 
   @@index([isActive])
   @@map("testimonials")
+}
+
+// PRIVATE — owned by one user, only they can see/edit it (Address-book pattern).
+// SHARED  — published by staff, readable by everyone (incl. logged-out users),
+//           writable only by ADMIN/ENGINEER (Blog/Product pattern).
+enum DfmTemplateScope {
+  PRIVATE
+  SHARED
+}
+
+// A named set of manufacturing rule thresholds a Gerber set can be checked
+// against. Deliberately NOT a single global capability table: users maintain
+// several of their own (e.g. one per target fab), on top of the staff-published
+// SHARED ones. See DFM_DRC_ROADMAP.md §4.
+model DfmTemplate {
+  id     String           @id @default(cuid())
+  scope  DfmTemplateScope @default(PRIVATE)
+  userId String? // owner of a PRIVATE template; null for the seeded system one
+  name   String
+
+  // The DfmRules object (src/lib/dfm/types.ts). A JSON blob rather than
+  // normalized rows because the rule set is small and *closed* (~10 known
+  // keys) — unlike PricingRate's open-ended slabs — so this avoids a migration
+  // every time a rule is added, matching how priceBreakdown/address snapshots
+  // are already stored. Always validated through parseDfmRules() before use.
+  rules Json
+
+  // PRIVATE: the owner's default pick (unique per userId).
+  // SHARED:  the single global default used when a user has no preference.
+  isDefault Boolean @default(false)
+  // The seeded "ProEmbSys Standard" baseline — cannot be deleted, so there is
+  // always at least one selectable template.
+  isSystem  Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([scope])
+  @@map("dfm_templates")
 }

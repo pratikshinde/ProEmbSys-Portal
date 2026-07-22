@@ -18,6 +18,13 @@ Actively developed. Core ordering flow, backend, and panelization tool are funct
 
 Reverse-chronological. Each entry is a real commit — see `git log` for full diffs.
 
+### 2026-07-22 — DFM checks in the CAM tool, with user-editable rule templates
+- New **DFM Check** tab in the Panelization tool: checks an imported Gerber set against manufacturing limits — board/panel size, layer count, thickness, minimum drill, drill aspect ratio, minimum trace width and silkscreen line width — and reports graded findings. Advisory only; nothing blocks an order. Runs on an explicit "Run check" click, matching how panel computation only happens on "Create Panel".
+- Limits live in **editable, named DFM templates**, several per user, rather than one hardcoded set: customers save their own (private), staff publish shared ones at `/admin/dfm-templates`, and visitors who aren't signed in can still run checks against the shared ones. A built-in "ProEmbSys Standard" template is generated from our published fab capabilities and can't be deleted.
+- The public Fab Capabilities page and the DFM baseline are now generated from one constant, so the numbers we advertise and the numbers we check against can't drift apart.
+- Validated against real boards: correctly reads 0.4mm drills, 0.45mm tracks and 83×116mm outlines, and flags KiCad's default 0.12mm silkscreen as a warning (cosmetic, so deliberately not an error). Unit handling is verified by re-running a check with the tool switched to inches and confirming an identical report.
+- Groundwork only for the deeper checks: annular ring and copper-to-copper spacing aren't evaluated yet (they need pad↔hole matching and a geometry engine respectively) — see `DFM_DRC_ROADMAP.md`. The PCB Order page reuses this engine unchanged in the next slice.
+
 ### 2026-07-21 — Razorpay payment integration for PCB orders and the Shop
 - PCB orders: payment happens after staff DRC review — once an order is flipped to `AWAITING_PAYMENT`, the customer sees a "Pay Now" card on their order detail page, pays via Razorpay Checkout, and the order automatically advances to `IN_PRODUCTION`.
 - Shop: the mini-cart's old `mailto:` enquiry link is now a real checkout — sign in, pick a saved delivery address, pay. Shop purchases are persisted for the first time (`ShopOrder`/`ShopOrderItem`), with server-recomputed pricing from live `Product` rows, mirroring how PCB orders never trust client-sent prices.
