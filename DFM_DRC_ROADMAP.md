@@ -161,7 +161,7 @@ All derivable from `analyzeGerberSet` output + order specs:
 Deliverable: `runDfm` returns a real report for these; unit tests with the
 `Sample/` fixtures and the Downloads test sets (SBTH, WLC_Indicator).
 
-### Phase 2 — Tier B checks (point-set / concentric)
+### Phase 2 — Tier B checks (point-set / concentric)  ✅ SHIPPED
 - **Annular ring** — for each plated hole, find its concentric copper pad
   (reuse `resolvedFlashCenters` + the matching approach in `recoverDrillOffset`),
   compute `(padØ − holeØ)/2`, flag `< 0.15 mm` (adv `0.13`). This is the single
@@ -212,7 +212,39 @@ the selected `DfmTemplate`; only the rendering differs.
 
 ---
 
-## 7. The hard problem: geometric DRC (Phase 3 options)
+## 7. Geometric DRC — copper spacing SHIPPED (this section is now history)
+
+**What actually happened, and why the recommendation below was wrong.** The
+options were weighed on the assumption that we'd have to build filled polygons
+from our own draw commands, where aperture macros are unresolved — which is why
+raster looked attractive. That assumption was false: `gerber-worker.ts` already
+runs `parse()` → `plot()` and *discards* the resulting tracespace plot tree,
+which is post-macro-resolution geometry. Working from that tree made an exact
+vector check the cheaper option, and copper-to-copper spacing now ships (option
+2 in spirit, without needing a clipping library).
+
+Implementation notes worth keeping:
+- The whole plot-tree grammar collapses onto one primitive, a **capsule**
+  (segment + radius), so clearance is a single distance function. See
+  `src/lib/dfm/capsules.ts`.
+- **Net grouping is mandatory** — a track meets its own pad at distance 0, so
+  without union-find every board reports thousands of false violations.
+- Two non-obvious corrections, both found by testing against real boards rather
+  than synthetic ones:
+  1. A **touch tolerance** (0.1 µm) is required. Shapes meant to meet exactly
+     land a hair apart from 4.6-format quantisation, leaving them in different
+     nets — a real board reported 200 violations at "0.0000mm" before this.
+  2. **Filled regions need containment testing**, not just boundary distance. A
+     pad flooded by the pour it connects to never *touches* the outline, so it
+     read as a separate net microns away. Even-odd ray casting fixes it (and
+     correctly still treats a pad inside an anti-pad void as separate).
+- Validation: all four copper layers of two real boards report **zero**
+  violations, and SBTH's measured minimum is **exactly 0.2000 mm** — the
+  designer's KiCad clearance setting, recovered from geometry alone.
+- Still unshipped from Tier C: solder-mask slivers, silkscreen-over-pad, acid
+  traps, drill-to-copper.
+
+### Original options (kept for context)
 
 Copper-to-copper spacing is the classic expensive check — it needs polygon
 offset + intersection over potentially thousands of features per layer. Options,

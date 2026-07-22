@@ -37,9 +37,10 @@ const SEVERITY_META = {
  *  such rather than silently implying they're being checked. */
 const LIMIT_FIELDS: { key: keyof DfmRules; label: string; pending?: boolean }[] = [
   { key: 'minTraceWidthMm', label: 'Min trace width (mm)' },
+  { key: 'minCopperSpacingMm', label: 'Min copper spacing (mm)' },
   { key: 'minDrillMm', label: 'Min drill diameter (mm)' },
   { key: 'minSilkLineWidthMm', label: 'Min silkscreen line (mm)' },
-  { key: 'minAnnularRingMm', label: 'Min annular ring (mm)', pending: true },
+  { key: 'minAnnularRingMm', label: 'Min annular ring (mm)' },
   { key: 'minMaskClearanceMm', label: 'Min mask clearance (mm)', pending: true },
 ]
 
@@ -47,7 +48,9 @@ export default function DfmPanel() {
   const { status: sessionStatus } = useSession()
   const layers = useAppStore(s => s.layers)
   const dfmReport = useAppStore(s => s.dfmReport)
+  const dfmRunning = useAppStore(s => s.dfmRunning)
   const runDfmCheck = useAppStore(s => s.runDfmCheck)
+  const setDfmFocus = useAppStore(s => s.setDfmFocus)
   const dfmTemplateId = useAppStore(s => s.dfmTemplateId)
   const setDfmTemplateId = useAppStore(s => s.setDfmTemplateId)
   const dfmContext = useAppStore(s => s.dfmContext)
@@ -206,12 +209,20 @@ export default function DfmPanel() {
           </p>
 
           <Button
-            onClick={() => runDfmCheck(activeRules)}
-            disabled={layers.length === 0}
+            onClick={() => void runDfmCheck(activeRules)}
+            disabled={layers.length === 0 || dfmRunning}
             className="w-full"
           >
-            <Play className="mr-2 h-4 w-4" />
-            {layers.length === 0 ? 'Import layers to check' : 'Run check'}
+            {dfmRunning ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <Play className="mr-2 h-4 w-4" />
+            )}
+            {dfmRunning
+              ? 'Checking…'
+              : layers.length === 0
+                ? 'Import layers to check'
+                : 'Run check'}
           </Button>
         </CardContent>
       </Card>
@@ -253,12 +264,32 @@ export default function DfmPanel() {
                       style={{ backgroundColor: meta.bg }}
                     >
                       <Icon className="mt-0.5 h-4 w-4 shrink-0" style={{ color: meta.color }} />
-                      <div className="min-w-0">
+                      <div className="min-w-0 flex-1">
                         <div className="text-xs font-semibold text-foreground">{f.title}</div>
                         <div className="text-[11px] text-muted-foreground">{f.detail}</div>
                         {f.layerName && (
                           <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
                             {f.layerName}
+                          </div>
+                        )}
+                        {f.locations && f.locations.length > 0 && (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {f.locations.slice(0, 12).map((loc, i) => (
+                              <button
+                                key={`${loc.x},${loc.y},${i}`}
+                                type="button"
+                                onClick={() => setDfmFocus({ x: loc.x, y: loc.y })}
+                                title={`Zoom to ${loc.x.toFixed(2)}, ${loc.y.toFixed(2)} mm`}
+                                className="rounded border border-border bg-background/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:border-primary hover:text-primary"
+                              >
+                                {loc.x.toFixed(1)}, {loc.y.toFixed(1)}
+                              </button>
+                            ))}
+                            {f.locations.length > 12 && (
+                              <span className="self-center text-[10px] text-muted-foreground">
+                                +{f.locations.length - 12} more
+                              </span>
+                            )}
                           </div>
                         )}
                       </div>
@@ -268,8 +299,8 @@ export default function DfmPanel() {
               </div>
             ))}
             <p className="text-[11px] text-muted-foreground">
-              Advisory only — findings never block an order. Checks cover the manufacturing envelope
-              (sizes, drills, trace &amp; silk widths); copper-to-copper spacing isn&apos;t checked yet.
+              Advisory only — findings never block an order. Copper clearance is measured between
+              separate nets; solder-mask slivers and silkscreen-over-pad aren&apos;t checked yet.
             </p>
           </CardContent>
         </Card>

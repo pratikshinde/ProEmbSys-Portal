@@ -56,6 +56,8 @@ export default function GerberViewer() {
   const hoveredLayerId = useAppStore(s => s.hoveredLayerId)
   const boardColor = useAppStore(s => s.boardColor)
   const setBoardColor = useAppStore(s => s.setBoardColor)
+  const dfmReport = useAppStore(s => s.dfmReport)
+  const dfmFocus = useAppStore(s => s.dfmFocus)
 
   const [viewState, setViewState] = useState<ViewState>({ viewBox: '0 0 200 200', zoom: 1 })
   const [cursorPos, setCursorPos] = useState<{ gx: number; gy: number } | null>(null)
@@ -152,6 +154,28 @@ export default function GerberViewer() {
       zoom: scale,
     })
   }, [combinedBounds, containerSize])
+
+  // Pan/zoom to a DFM finding when the panel sets a focus point.
+  // dfmFocus is in Gerber-native Y-up mm; this viewer's space is Y-down, so
+  // the Y must be negated (screenY = −gerberY) — the same conversion the
+  // cursor readout does in reverse.
+  useEffect(() => {
+    if (!dfmFocus) return
+    const { w, h } = containerSize
+    if (w <= 0 || h <= 0) return
+    // Zoom to a fixed 6mm-wide window so a clearance violation is actually
+    // visible rather than a sub-pixel dot.
+    const windowMm = 6
+    const scale = Math.min(w, h) / windowMm
+    const vbW = w / scale
+    const vbH = h / scale
+    const cx = dfmFocus.x
+    const cy = -dfmFocus.y
+    setViewState({
+      viewBox: `${cx - vbW / 2} ${cy - vbH / 2} ${vbW} ${vbH}`,
+      zoom: scale,
+    })
+  }, [dfmFocus, containerSize])
 
   // Auto-fit when layers change
   useEffect(() => {
@@ -392,6 +416,20 @@ export default function GerberViewer() {
   const visibleLayerTypes = useMemo(() => {
     return new Set(visibleLayers.map(l => l.type))
   }, [visibleLayers])
+
+  // Every location the current DFM report points at, flattened for the marker
+  // overlay. Only failing findings carry locations, so passes never clutter the
+  // canvas. Coordinates stay in Gerber-native Y-up mm here; the overlay does
+  // the Y-down conversion at render time.
+  const dfmMarkers = useMemo(() => {
+    if (!dfmReport) return [] as { x: number; y: number }[]
+    const out: { x: number; y: number }[] = []
+    for (const f of dfmReport.findings) {
+      if (f.severity !== 'error' && f.severity !== 'warning') continue
+      for (const loc of f.locations ?? []) out.push({ x: loc.x, y: loc.y })
+    }
+    return out
+  }, [dfmReport])
 
   // Panel overlay — only shown on the Panel Config tab
   const panelOverlayContent = useMemo(() => {
@@ -909,6 +947,42 @@ export default function GerberViewer() {
               : undefined}
           >
             {panelOverlayContent}
+          </g>
+        )}
+
+        {/* DFM finding markers. Locations arrive in Gerber-native Y-up mm, so
+            Y is negated into this viewer's Y-down space. The bottom-side mirror
+            is applied here too, matching the panel overlay above — without it a
+            marker would sit on the mirror image of the offending geometry. */}
+        {dfmMarkers.length > 0 && (
+          <g
+            data-layer="dfm-markers"
+            transform={viewMode === 'board' && boardViewSide === 'bottom' && combinedBounds
+              ? `translate(${boundsCenterX}, 0) scale(-1, 1) translate(${-boundsCenterX}, 0)`
+              : undefined}
+          >
+            {dfmMarkers.map((m, i) => {
+              // Keep the marker a constant on-screen size regardless of zoom.
+              const r = 12 / Math.max(viewState.zoom, 0.0001)
+              const stroke = Math.max(r * 0.12, 0.02)
+              const isFocused =
+                !!dfmFocus && Math.abs(dfmFocus.x - m.x) < 1e-6 && Math.abs(dfmFocus.y - m.y) < 1e-6
+              return (
+                <g key={`${m.x},${m.y},${i}`} transform={`translate(${m.x}, ${-m.y})`}>
+                  <circle
+                    r={r}
+                    fill="none"
+                    stroke={isFocused ? '#f87171' : '#fbbf24'}
+                    strokeWidth={stroke}
+                    opacity={0.95}
+                  />
+                  <line x1={-r * 1.5} y1={0} x2={-r * 0.4} y2={0} stroke={isFocused ? '#f87171' : '#fbbf24'} strokeWidth={stroke} />
+                  <line x1={r * 0.4} y1={0} x2={r * 1.5} y2={0} stroke={isFocused ? '#f87171' : '#fbbf24'} strokeWidth={stroke} />
+                  <line x1={0} y1={-r * 1.5} x2={0} y2={-r * 0.4} stroke={isFocused ? '#f87171' : '#fbbf24'} strokeWidth={stroke} />
+                  <line x1={0} y1={r * 0.4} x2={0} y2={r * 1.5} stroke={isFocused ? '#f87171' : '#fbbf24'} strokeWidth={stroke} />
+                </g>
+              )
+            })}
           </g>
         )}
 

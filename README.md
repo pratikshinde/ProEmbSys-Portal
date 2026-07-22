@@ -18,6 +18,13 @@ Actively developed. Core ordering flow, backend, and panelization tool are funct
 
 Reverse-chronological. Each entry is a real commit — see `git log` for full diffs.
 
+### 2026-07-22 — DFM phase 2: annular ring, hole checks, and copper clearance
+- **Annular ring** and three related hole checks (unlanded plated holes, hole-to-hole web, holes outside the board outline). Each hole is matched to its concentric pad by first recovering the drill↔copper origin offset, so the checks work whether or not "Align Drill to Board Center" has been used.
+- **Copper-to-copper clearance** between different nets, measured exactly rather than approximated — computed in the Web Worker so a 20,000-shape copper layer doesn't freeze the UI (~0.5s for a dense board). Violations appear as clickable markers on the canvas; clicking one zooms straight to it.
+- Non-plated holes are now distinguished from plated ones. NPTH mounting holes have no pad by design, and without this the unlanded-hole check flagged them on both real test boards.
+- Validated against two real boards: all four copper layers report zero clearance violations (as they should — these are manufactured designs), and the measured minimum clearance comes out at exactly 0.2000mm, matching the designer's actual KiCad setting. Annular ring was cross-checked by hand against the source files: a 0.9mm pad on a 0.4mm drill gives 0.25mm, which is what the engine reports.
+- Getting there required two corrections that only real boards exposed: shapes meant to touch can land a fraction apart from coordinate rounding (leaving them wrongly on separate nets), and a pad flooded by the copper pour it connects to never touches that pour's outline. Both produced large numbers of false violations before being fixed.
+
 ### 2026-07-22 — DFM checks in the CAM tool, with user-editable rule templates
 - New **DFM Check** tab in the Panelization tool: checks an imported Gerber set against manufacturing limits — board/panel size, layer count, thickness, minimum drill, drill aspect ratio, minimum trace width and silkscreen line width — and reports graded findings. Advisory only; nothing blocks an order. Runs on an explicit "Run check" click, matching how panel computation only happens on "Create Panel".
 - Limits live in **editable, named DFM templates**, several per user, rather than one hardcoded set: customers save their own (private), staff publish shared ones at `/admin/dfm-templates`, and visitors who aren't signed in can still run checks against the shared ones. A built-in "ProEmbSys Standard" template is generated from our published fab capabilities and can't be deleted.

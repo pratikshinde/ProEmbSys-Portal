@@ -26,12 +26,12 @@ export interface DfmRules {
   boardThicknessMm: [number, number]
   maxAspectRatio: number
   minTraceWidthMm: DfmLimit
+  /** Minimum clearance between different nets on one copper layer. */
+  minCopperSpacingMm: DfmLimit
   minDrillMm: DfmLimit
   minSilkLineWidthMm: DfmLimit
-  /** Stored now, evaluated in roadmap Phase 2 (annular ring needs pad↔hole
-   *  matching) — kept in the blob so saved templates don't need migrating. */
   minAnnularRingMm: DfmLimit
-  /** Stored now, evaluated in roadmap Phase 3 (needs a geometry engine). */
+  /** Stored now, evaluated in roadmap Phase 3 (needs mask/copper interaction). */
   minMaskClearanceMm: DfmLimit
 }
 
@@ -40,8 +40,17 @@ const limitSchema = z.object({
   advanced: z.number().positive().optional(),
 })
 
-/** `rules` is a user-editable JSON blob persisted on DfmTemplate, so it is
- *  untrusted input on the way back in — always parse, never cast. */
+/**
+ * `rules` is a user-editable JSON blob persisted on DfmTemplate, so it is
+ * untrusted input on the way back in — always parse, never cast.
+ *
+ * ⚠ Rule fields added *after* a template could already have been saved must be
+ * `.optional()` here and back-filled by `withRuleDefaults`. Making one required
+ * would fail validation for every previously-saved template, and the
+ * non-throwing read path would then quietly substitute the baseline —
+ * discarding the customer's own thresholds without telling them. Adding an
+ * optional field is a no-op for old rows; making it required is data loss.
+ */
 export const dfmRulesSchema = z.object({
   maxBoardMm: z.number().positive(),
   layerRange: z.tuple([z.number().int().positive(), z.number().int().positive()]),
@@ -52,18 +61,30 @@ export const dfmRulesSchema = z.object({
   minSilkLineWidthMm: limitSchema,
   minAnnularRingMm: limitSchema,
   minMaskClearanceMm: limitSchema,
+  // Added in Phase 2 — optional for the reason above.
+  minCopperSpacingMm: limitSchema.optional(),
 })
+
+/** Back-fill fields absent from templates saved before those rules existed, so
+ *  every consumer sees a complete DfmRules while the customer's own values are
+ *  preserved untouched. */
+function withRuleDefaults(parsed: z.infer<typeof dfmRulesSchema>): DfmRules {
+  return {
+    ...parsed,
+    minCopperSpacingMm: parsed.minCopperSpacingMm ?? DEFAULT_DFM_RULES.minCopperSpacingMm,
+  } as DfmRules
+}
 
 /** Throws if the stored/submitted blob isn't a valid rule set. */
 export function parseDfmRules(value: unknown): DfmRules {
-  return dfmRulesSchema.parse(value) as DfmRules
+  return withRuleDefaults(dfmRulesSchema.parse(value))
 }
 
 /** Non-throwing variant for read paths where a corrupt row shouldn't take the
  *  whole page down — falls back to the shop baseline. */
 export function parseDfmRulesSafe(value: unknown): DfmRules {
   const result = dfmRulesSchema.safeParse(value)
-  return result.success ? (result.data as DfmRules) : DEFAULT_DFM_RULES
+  return result.success ? withRuleDefaults(result.data) : DEFAULT_DFM_RULES
 }
 
 /** The shop's own envelope, used to seed the SHARED baseline template and as
@@ -74,6 +95,7 @@ export const DEFAULT_DFM_RULES: DfmRules = {
   boardThicknessMm: FAB_CAPABILITIES.boardThicknessMm,
   maxAspectRatio: FAB_CAPABILITIES.maxAspectRatio,
   minTraceWidthMm: FAB_CAPABILITIES.minTraceWidthMm,
+  minCopperSpacingMm: FAB_CAPABILITIES.minCopperSpacingMm,
   minDrillMm: FAB_CAPABILITIES.minDrillMm,
   minSilkLineWidthMm: FAB_CAPABILITIES.minSilkLineWidthMm,
   minAnnularRingMm: FAB_CAPABILITIES.minAnnularRingMm,
@@ -112,6 +134,34 @@ export interface DfmContext {
 
 // ─── Output ──────────────────────────────────────────────────────────────────
 
+/** A copper-clearance violation, in Gerber-native Y-up mm (the viewer converts
+ *  to its Y-down screen space when placing a marker). */
+export interface SpacingViolation {
+  x: number
+  y: number
+  clearanceMm: number
+}
+
+/** Per-copper-layer result of the worker's spacing pass. */
+export interface CopperSpacingResult {
+  layerName: string
+  /** Smallest clearance among pairs that came within the rule distance, or
+   *  null when nothing did. NOT a global minimum gap — see SpacingComputation
+   *  in capsules.ts for why, and don't report it as one. */
+  minClearanceMm: number | null
+  violations: SpacingViolation[]
+  primitiveCount: number
+  /** True when the layer exceeded the primitive budget and was not checked. */
+  truncated: boolean
+  error?: string
+}
+
+/** Results the engine can't compute itself because they need async/worker work.
+ *  Absent → those checks report `info` ("not checked") rather than passing. */
+export interface DfmExtras {
+  spacing?: CopperSpacingResult[]
+}
+
 export type DfmSeverity = "error" | "warning" | "info" | "pass"
 
 export interface DfmFinding {
@@ -125,6 +175,9 @@ export interface DfmFinding {
   limitValue?: number
   /** Which layer produced the measurement, when attributable. */
   layerName?: string
+  /** Locations the finding refers to, Gerber-native Y-up mm — drives the
+   *  clickable markers on the CAM canvas. */
+  locations?: SpacingViolation[]
 }
 
 export interface DfmReport {

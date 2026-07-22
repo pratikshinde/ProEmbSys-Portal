@@ -36,9 +36,10 @@ export interface DfmTemplateRow {
 
 const LIMIT_FIELDS: { key: keyof DfmRules; label: string; pending?: boolean }[] = [
   { key: "minTraceWidthMm", label: "Min trace width (mm)" },
+  { key: "minCopperSpacingMm", label: "Min copper spacing (mm)" },
   { key: "minDrillMm", label: "Min drill diameter (mm)" },
   { key: "minSilkLineWidthMm", label: "Min silkscreen line (mm)" },
-  { key: "minAnnularRingMm", label: "Min annular ring (mm)", pending: true },
+  { key: "minAnnularRingMm", label: "Min annular ring (mm)" },
   { key: "minMaskClearanceMm", label: "Min mask clearance (mm)", pending: true },
 ]
 

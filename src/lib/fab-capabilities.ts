@@ -32,6 +32,11 @@ export interface FabCapabilities {
   /** Max board thickness : drill diameter ratio. */
   maxAspectRatio: number
   minTraceWidthMm: CapabilityLimit
+  /** Minimum copper-to-copper clearance between *different* nets. Published on
+   *  /fab-capabilities as one number with track width ("track width / spacing"),
+   *  but kept separate here: they're distinct rules and fabs quote them
+   *  independently, so a template may well tighten one without the other. */
+  minCopperSpacingMm: CapabilityLimit
   minDrillMm: CapabilityLimit
   minAnnularRingMm: CapabilityLimit
   minSilkLineWidthMm: CapabilityLimit
@@ -45,6 +50,7 @@ export const FAB_CAPABILITIES: FabCapabilities = {
   boardThicknessMm: [0.4, 3.2],
   maxAspectRatio: 10,
   minTraceWidthMm: { standard: 0.1, advanced: 0.09 },
+  minCopperSpacingMm: { standard: 0.1, advanced: 0.09 },
   minDrillMm: { standard: 0.3, advanced: 0.2 },
   minAnnularRingMm: { standard: 0.15, advanced: 0.13 },
   minSilkLineWidthMm: { standard: 0.15 },

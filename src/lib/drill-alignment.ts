@@ -63,14 +63,37 @@ export type Point = readonly [x: number, y: number]
 export function resolvedFlashCenters(
   commands: ReadonlyArray<{ type: string; coordinate: { x?: number; y?: number } }>,
 ): Point[] {
-  const out: Point[] = []
+  return resolvedFlashes(commands).map(f => f.center)
+}
+
+/** A flash with the aperture that was selected when it was emitted. */
+export interface ResolvedFlash {
+  center: Point
+  /** Aperture D-code in effect, or null if none was selected. */
+  apertureCode: number | null
+}
+
+/**
+ * The shared modal-coordinate walk behind `resolvedFlashCenters`, additionally
+ * carrying each flash's aperture code — which the annular-ring check needs to
+ * look up the pad's size, not just its position. Kept as one implementation so
+ * the modal-resolution subtleties (see above) can't drift between callers.
+ */
+export function resolvedFlashes(
+  commands: ReadonlyArray<{
+    type: string
+    coordinate: { x?: number; y?: number }
+    apertureCode?: number | null
+  }>,
+): ResolvedFlash[] {
+  const out: ResolvedFlash[] = []
   let curX: number | undefined
   let curY: number | undefined
   for (const cmd of commands) {
     if (cmd.coordinate.x !== undefined) curX = cmd.coordinate.x
     if (cmd.coordinate.y !== undefined) curY = cmd.coordinate.y
     if (cmd.type === 'flash' && curX !== undefined && curY !== undefined) {
-      out.push([curX, curY])
+      out.push({ center: [curX, curY], apertureCode: cmd.apertureCode ?? null })
     }
   }
   return out

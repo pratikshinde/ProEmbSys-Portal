@@ -5,7 +5,7 @@
 import { create } from 'zustand'
 import JSZip from 'jszip'
 import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode, DrillMeta } from './gerber-parser'
-import { gerberToSvg, gerberRenderBoardView, BoardView, GerberSvgResult } from './gerber-svg'
+import { gerberToSvg, gerberRenderBoardView, checkCopperSpacing, BoardView, GerberSvgResult } from './gerber-svg'
 import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
 import { runDfm } from './dfm/run-dfm'
 import type { DfmContext, DfmLayerInput, DfmReport, DfmRules } from './dfm/types'
@@ -108,12 +108,18 @@ interface AppState {
 
   // DFM
   dfmReport: DfmReport | null
+  dfmRunning: boolean
   dfmTemplateId: string | null
   setDfmTemplateId: (id: string | null) => void
   dfmContext: DfmContext
   updateDfmContext: (updates: Partial<DfmContext>) => void
-  runDfmCheck: (rules: DfmRules) => void
+  runDfmCheck: (rules: DfmRules) => Promise<void>
   clearDfmReport: () => void
+  /** Point the viewer should pan/zoom to, in Gerber-native Y-up mm. Set by
+   *  clicking a finding location; the viewer clears it once handled. Mirrors
+   *  the hoveredLayerId panel→viewer pattern. */
+  dfmFocus: { x: number; y: number } | null
+  setDfmFocus: (p: { x: number; y: number } | null) => void
 
   // UI state
   activeTab: 'layers' | 'panel' | 'info' | 'export' | 'dfm'
@@ -502,7 +508,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   clearLayers: () => {
-    set({ layers: [], panelResult: null, boardView: null })
+    // Drop the DFM report too — leaving findings (and their canvas markers)
+    // pointing at geometry that's no longer loaded would be misleading.
+    set({ layers: [], panelResult: null, boardView: null, dfmReport: null, dfmFocus: null })
   },
 
   rotateAllLayers: async (direction: 'left' | 'right') => {
@@ -1397,12 +1405,15 @@ export const useAppStore = create<AppState>((set, get) => ({
   // never automatically on layer/config change, matching how panel computation
   // is only triggered by "Create Panel".
   dfmReport: null,
+  dfmRunning: false,
   dfmTemplateId: null,
   setDfmTemplateId: (id) => set({ dfmTemplateId: id }),
   dfmContext: { boardThicknessMm: 1.6 },
   updateDfmContext: (updates) => set(state => ({ dfmContext: { ...state.dfmContext, ...updates } })),
+  dfmFocus: null,
+  setDfmFocus: (p) => set({ dfmFocus: p }),
 
-  runDfmCheck: (rules) => {
+  runDfmCheck: async (rules) => {
     const { layers, panelResult, dfmContext } = get()
     // LayerEntry already carries exactly the four fields DfmLayerInput needs,
     // so no adapter is required (the order flow's DetectedLayer matches too).
@@ -1421,9 +1432,28 @@ export const useAppStore = create<AppState>((set, get) => ({
         ? { panelWidthMm: panelResult.panelWidth, panelHeightMm: panelResult.panelHeight }
         : {}),
     }
-    set({ dfmReport: runDfm(input, context, rules) })
+
+    set({ dfmRunning: true })
+    try {
+      // Copper clearance is the only check that can't be computed inline — it
+      // needs tracespace's plot tree and is heavy enough to belong in the
+      // worker. Everything else stays synchronous inside runDfm.
+      const copperLayers = layers.filter(l => l.type === 'copper')
+      const spacing = await Promise.all(
+        copperLayers.map(l =>
+          checkCopperSpacing({
+            layerName: l.fileName,
+            contents: l.rawContent,
+            minSpacingMm: rules.minCopperSpacingMm.standard,
+          })
+        )
+      )
+      set({ dfmReport: runDfm(input, context, rules, { spacing }), dfmFocus: null })
+    } finally {
+      set({ dfmRunning: false })
+    }
   },
-  clearDfmReport: () => set({ dfmReport: null }),
+  clearDfmReport: () => set({ dfmReport: null, dfmFocus: null }),
 
   // UI state
   activeTab: 'layers',

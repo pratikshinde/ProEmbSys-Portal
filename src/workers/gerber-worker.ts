@@ -25,7 +25,8 @@ import {
   renderBoard as coreRenderBoard,
 } from '@tracespace/core'
 import { toHtml } from 'hast-util-to-html'
-import { normalizeGerberMacroPrimitives } from '../lib/gerber-preprocess'
+import { normalizeGerberMacroPrimitives, scalePlotTreeToMm } from '../lib/gerber-preprocess'
+import { flattenPlotTree, computeSpacing } from '../lib/dfm/capsules'
 
 export interface GerberWorkerResult {
   svgFragment: string
@@ -290,7 +291,78 @@ async function renderBoardView(files: BoardViewInput[]): Promise<BoardViewResult
   }
 }
 
-const api = { parseGerber, renderBoardView }
+export interface CopperSpacingInput {
+  layerName: string
+  contents: string
+  minSpacingMm: number
+  /** Guard against pathological layers: past this many primitives we report
+   *  `truncated` rather than spend unbounded time. */
+  maxPrimitives?: number
+}
+
+export interface CopperSpacingOutput {
+  layerName: string
+  minClearanceMm: number | null
+  violations: { x: number; y: number; clearanceMm: number }[]
+  primitiveCount: number
+  truncated: boolean
+  error?: string
+}
+
+const DEFAULT_MAX_PRIMITIVES = 120_000
+
+/**
+ * Copper-to-copper clearance for one layer.
+ *
+ * Runs here rather than on the main thread for two reasons: it's the only
+ * heavy computation in the DFM engine (a populated copper layer is tens of
+ * thousands of primitives), and the plot tree it needs is produced right here
+ * by plot() — the same tree parseGerber() already builds and discards.
+ *
+ * Returns findings only, never the primitive set: serialising tens of
+ * thousands of capsules across the Comlink boundary would cost more than the
+ * computation itself.
+ */
+function checkCopperSpacing(input: CopperSpacingInput): CopperSpacingOutput {
+  const base: CopperSpacingOutput = {
+    layerName: input.layerName,
+    minClearanceMm: null,
+    violations: [],
+    primitiveCount: 0,
+    truncated: false,
+  }
+  if (!input.contents || input.contents.trim().length === 0) {
+    return { ...base, error: 'Empty content' }
+  }
+
+  let image
+  try {
+    image = plot(parse(normalizeGerberMacroPrimitives(input.contents)))
+  } catch (err) {
+    return { ...base, error: `parse/plot failed: ${err instanceof Error ? err.message : String(err)}` }
+  }
+
+  // Normalise to mm before measuring — an inch-native file would otherwise be
+  // graded against millimetre thresholds and under-report by 25.4×.
+  scalePlotTreeToMm(image)
+
+  const budget = input.maxPrimitives ?? DEFAULT_MAX_PRIMITIVES
+  const { capsules, regions, truncated } = flattenPlotTree(image, budget)
+  if (truncated) {
+    return { ...base, primitiveCount: capsules.length, truncated: true }
+  }
+
+  const result = computeSpacing(capsules, input.minSpacingMm, 200, regions)
+  return {
+    layerName: input.layerName,
+    minClearanceMm: result.minClearanceMm,
+    violations: result.violations,
+    primitiveCount: result.primitiveCount,
+    truncated: false,
+  }
+}
+
+const api = { parseGerber, renderBoardView, checkCopperSpacing }
 export type GerberWorkerApi = typeof api
 
 Comlink.expose(api)

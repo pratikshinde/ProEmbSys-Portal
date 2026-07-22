@@ -10,6 +10,7 @@
 import * as Comlink from 'comlink'
 import type { GerberWorkerApi } from '@/workers/gerber-worker'
 import { normalizeGerberMacroPrimitives, scalePlotTreeToMm, scaleBoardShapeToMm } from './gerber-preprocess'
+import type { CopperSpacingResult } from './dfm/types'
 
 export interface GerberSvgResult {
   /** SVG fragment string — to be embedded in a parent SVG */
@@ -109,6 +110,35 @@ export async function gerberToSvg(content: string): Promise<GerberSvgResult> {
       isEmpty: true,
       error: message,
     }
+  }
+}
+
+/**
+ * Copper-to-copper clearance for one layer, computed in the worker.
+ * Failures degrade to an `error` on the result rather than throwing — a DFM
+ * check is advisory and must never take down the caller.
+ */
+export async function checkCopperSpacing(input: {
+  layerName: string
+  contents: string
+  minSpacingMm: number
+  maxPrimitives?: number
+}): Promise<CopperSpacingResult> {
+  const fallback: CopperSpacingResult = {
+    layerName: input.layerName,
+    minClearanceMm: null,
+    violations: [],
+    primitiveCount: 0,
+    truncated: false,
+  }
+  const worker = getWorker()
+  if (!worker) return { ...fallback, error: 'Worker unavailable (server-side render?)' }
+  try {
+    return (await worker.checkCopperSpacing(input)) as CopperSpacingResult
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.warn('checkCopperSpacing worker call failed:', message)
+    return { ...fallback, error: message }
   }
 }
 
