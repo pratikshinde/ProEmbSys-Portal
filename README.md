@@ -18,6 +18,11 @@ Actively developed. Core ordering flow, backend, and panelization tool are funct
 
 Reverse-chronological. Each entry is a real commit — see `git log` for full diffs.
 
+### 2026-07-24 — Fix dark halo around oversized soldermask openings in Board view
+- The masked-gold-copper technique from the 07-21 fiducial fix (below) had a second bug: SVG `<mask>` defaults to `color-interpolation: linearRGB` for its luminance calculation, which darkens anti-aliased pixels at the edge of whatever's being masked. That produced a visible dark ring around every pad where the mask opening is larger than the copper — same dark shade regardless of the actual soldermask color, which is why it looked identical (and wrong) on both a red and a green board.
+- Fix: force `color-interpolation: sRGB` on the `<mask>` element itself, in the shared `RawSvgMask` component (covers the CAM tool's single-PCB Board view and the PCB Order page's board preview) and the inline mask used by the panelized Board view.
+- Verified against the real fixture from the original fiducial fix (`WLC_Indicator`, FID2, 1.5mm copper pad under a 3.0mm mask opening): toggling the style on/off live against the same rendered geometry reproduces the halo and then cleanly removes it.
+
 ### 2026-07-22 — DFM phase 2: annular ring, hole checks, and copper clearance
 - **Annular ring** and three related hole checks (unlanded plated holes, hole-to-hole web, holes outside the board outline). Each hole is matched to its concentric pad by first recovering the drill↔copper origin offset, so the checks work whether or not "Align Drill to Board Center" has been used.
 - **Copper-to-copper clearance** between different nets, measured exactly rather than approximated — computed in the Web Worker so a 20,000-shape copper layer doesn't freeze the UI (~0.5s for a dense board). Violations appear as clickable markers on the canvas; clicking one zooms straight to it.

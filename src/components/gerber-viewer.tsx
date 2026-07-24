@@ -782,7 +782,9 @@ export default function GerberViewer() {
                       ) : null
                     ))}
                     {maskClipPairs.map(pair => (
-                      <mask key={`mask-mask-${pair.maskLayerId}`} id={`mask-mask-${pair.maskLayerId}`}>
+                      // colorInterpolation: 'sRGB' avoids the linearRGB luminance-mask
+                      // dark-edge halo — see RawSvgMask in raw-svg-group.tsx for why.
+                      <mask key={`mask-mask-${pair.maskLayerId}`} id={`mask-mask-${pair.maskLayerId}`} style={{ colorInterpolation: 'sRGB' }}>
                         <use href={`#layer-def-${pair.maskLayerId}`} style={{ color: '#fff' }} />
                       </mask>
                     ))}

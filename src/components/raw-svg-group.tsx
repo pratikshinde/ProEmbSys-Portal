@@ -46,6 +46,16 @@ export const RawSvgGroup = React.forwardRef<
  * pad vanished. <mask> (luminance/raster-based, not vector path intersection)
  * doesn't hit the same wall at the same size and was verified against the
  * exact file that broke <clipPath>.
+ *
+ * `colorInterpolation: 'sRGB'` on the <mask> itself is required — the SVG
+ * spec defaults luminance-mask compositing to linearRGB, which darkens
+ * partially-covered (anti-aliased) edge pixels during the gamma conversion.
+ * That reads as a dark ring exactly on the boundary of every masked shape —
+ * e.g. a fiducial's oversized mask opening showing a black/dark-green halo
+ * around the gold pad instead of a clean edge onto the substrate, regardless
+ * of the actual soldermask color. Without this, Board view visibly diverges
+ * from the Layers view (which renders the mask geometry directly, no
+ * luminance masking involved, so the halo never appears there).
  */
 export const RawSvgMask = React.forwardRef<
   SVGMaskElement,
@@ -62,7 +72,7 @@ export const RawSvgMask = React.forwardRef<
     else if (externalRef) externalRef.current = innerRef.current
   })
   return (
-    <mask ref={innerRef} id={id} {...rest}>
+    <mask ref={innerRef} id={id} style={{ colorInterpolation: 'sRGB' }} {...rest}>
       <g ref={groupRef} style={{ color: '#fff' }} />
     </mask>
   )
