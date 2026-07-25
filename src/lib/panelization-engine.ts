@@ -1611,8 +1611,15 @@ export function generatePanelizedGerber(
       lines.push(`%ADD${lShapeCornerCode}C,${config.lShapeLineWidth.toFixed(6)}*%`)
 
       for (const pos of panel.pcbPositions) {
-        const offX = pos.x + baseOffsetX
-        const offY = pos.y + baseOffsetY
+        // pos.x/pos.y are already panel-absolute (from computePanel), same as
+        // panel.toolingHoles/fiducials/infoTexts below — do NOT add
+        // baseOffsetX/baseOffsetY here, that's only for converting the body
+        // content's *native* file coordinates into panel space. Adding it a
+        // second time on top of already-local arm/w/h shifted every mark by
+        // the outline's native origin (e.g. -53mm/+170mm on a real board),
+        // landing them nowhere near the actual PCB corners.
+        const offX = pos.x
+        const offY = pos.y
 
         // Re-generate L-shapes with position offset
         const arm = config.lShapeArmLength

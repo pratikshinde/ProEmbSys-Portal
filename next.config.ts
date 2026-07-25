@@ -10,6 +10,7 @@ const nextConfig: NextConfig = {
     "preview-chat-ed3f2eff-3f7b-431c-b289-69927dfb980e.space.z.ai",
     "*.space.z.ai",
     "*.space.chatglm.site",
+    "192.168.68.101",
   ],
 };
 

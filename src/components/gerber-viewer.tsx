@@ -158,7 +158,12 @@ export default function GerberViewer() {
   // Pan/zoom to a DFM finding when the panel sets a focus point.
   // dfmFocus is in Gerber-native Y-up mm; this viewer's space is Y-down, so
   // the Y must be negated (screenY = −gerberY) — the same conversion the
-  // cursor readout does in reverse.
+  // cursor readout does in reverse. The marker itself renders inside a group
+  // that mirrors X around boundsCenterX when viewing the bottom side in Board
+  // mode (see the dfm-markers <g> below); this pan-to-marker effect must apply
+  // the identical mirror to cx, or it centers the viewport on the unmirrored
+  // location while the marker renders at its mirrored one — landing the "zoom
+  // to violation" window on empty space instead of the actual marker.
   useEffect(() => {
     if (!dfmFocus) return
     const { w, h } = containerSize
@@ -169,13 +174,14 @@ export default function GerberViewer() {
     const scale = Math.min(w, h) / windowMm
     const vbW = w / scale
     const vbH = h / scale
-    const cx = dfmFocus.x
+    const isBottomBoardView = viewMode === 'board' && boardViewSide === 'bottom' && !!combinedBounds
+    const cx = isBottomBoardView ? 2 * boundsCenterX - dfmFocus.x : dfmFocus.x
     const cy = -dfmFocus.y
     setViewState({
       viewBox: `${cx - vbW / 2} ${cy - vbH / 2} ${vbW} ${vbH}`,
       zoom: scale,
     })
-  }, [dfmFocus, containerSize])
+  }, [dfmFocus, containerSize, viewMode, boardViewSide, combinedBounds, boundsCenterX])
 
   // Auto-fit when layers change
   useEffect(() => {
