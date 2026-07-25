@@ -1088,35 +1088,59 @@ export function generateTopRibText(
 // ============================================================================
 
 /**
- * Check if a parsed Gerber layer (outline) has a primarily rectangular outline.
- * Returns true if the outline boundary appears to be a rectangle.
- * Rejects if the outline contains significant arc/curve segments that suggest
- * circular, elliptical, or rounded-corner PCB shapes.
+ * Check if a parsed Gerber layer (outline) has sharp 90° corners at its
+ * bounding-box extremes — the only thing that actually matters for placing
+ * an L-shape corner mark, since the mark sits at those four points.
  *
- * Detection heuristic:
- * - Count linear interpolation commands (interpolate) vs arc commands (arc_cw, arc_ccw)
- * - If arcs make up more than 10% of moves, the outline likely has curves
- * - Also checks that the outline commands form roughly 4 corner points
+ * Deliberately does NOT reject a file for containing arcs anywhere: a
+ * rectangular board very commonly has a mounting hole or fillet drawn on the
+ * Edge.Cuts/profile layer away from the corners, and a prior global
+ * arc-vs-line ratio heuristic rejected those boards outright — silently
+ * dropping L-shapes from copper and mask on export with no user-facing
+ * warning, even though the board's actual corners were perfectly square.
+ * Confirmed against a synthetic rectangle with one arc-drawn mounting hole:
+ * the old heuristic returned false, this one correctly returns true.
+ *
+ * Coordinates are modal (an axis is omitted when unchanged from the previous
+ * command), so absolute endpoints are resolved by walking the command list.
  */
 export function isRectangularOutline(layer: GerberLayer): boolean {
-  if (!layer.commands || layer.commands.length === 0) return false
+  if (!layer.commands || layer.commands.length === 0 || !layer.bounds) return false
 
-  let linearCount = 0
-  let arcCount = 0
-  let moveCount = 0
+  const { minX, minY, maxX, maxY } = layer.bounds
+  const eps = 1e-3 // mm
+
+  let curX = 0
+  let curY = 0
+  const straightEndpoints: { x: number; y: number }[] = []
+  const arcEndpoints: { x: number; y: number }[] = []
 
   for (const cmd of layer.commands) {
-    if (cmd.type === 'interpolate') linearCount++
-    else if (cmd.type === 'arc_cw' || cmd.type === 'arc_ccw') arcCount++
-    else if (cmd.type === 'move') moveCount++
+    const x2 = cmd.coordinate.x ?? curX
+    const y2 = cmd.coordinate.y ?? curY
+    if (cmd.type === 'interpolate') {
+      straightEndpoints.push({ x: curX, y: curY }, { x: x2, y: y2 })
+    } else if (cmd.type === 'arc_cw' || cmd.type === 'arc_ccw') {
+      arcEndpoints.push({ x: curX, y: curY }, { x: x2, y: y2 })
+    }
+    curX = x2
+    curY = y2
   }
 
-  // If no linear commands, definitely not rectangular
-  if (linearCount === 0) return false
+  if (straightEndpoints.length === 0) return false
 
-  // If arcs dominate, it's likely a circle/ellipse/rounded shape
-  const totalMoves = linearCount + arcCount
-  if (totalMoves > 0 && arcCount / totalMoves > 0.10) return false
+  const near = (p: { x: number; y: number }, x: number, y: number) =>
+    Math.abs(p.x - x) < eps && Math.abs(p.y - y) < eps
+
+  const corners: [number, number][] = [
+    [minX, minY], [maxX, minY], [maxX, maxY], [minX, maxY],
+  ]
+  for (const [cx, cy] of corners) {
+    const touchedByArc = arcEndpoints.some(p => near(p, cx, cy))
+    if (touchedByArc) return false
+    const touchedByStraightLine = straightEndpoints.some(p => near(p, cx, cy))
+    if (!touchedByStraightLine) return false
+  }
 
   return true
 }

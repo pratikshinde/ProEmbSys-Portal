@@ -3,7 +3,7 @@
 import React, { useRef, useEffect, useLayoutEffect, useCallback, useState, useMemo } from 'react'
 import { useAppStore, getLayerZIndex } from '@/lib/store'
 import { mergeLayerBounds, GerberSvgResult } from '@/lib/gerber-svg'
-import { PanelResult } from '@/lib/panelization-engine'
+import { PanelResult, isRectangularOutline } from '@/lib/panelization-engine'
 import { getRegionTextPolygons } from '@/lib/region-font'
 import { BOARD_COLOR_NAMES, BOARD_COLOR_PALETTE, getPcbColor, PCB_OPACITY, silkColorFor, getMaskClipPairs } from '@/lib/board-colors'
 import { RawSvgGroup, RawSvgMask } from './raw-svg-group'
@@ -553,6 +553,38 @@ export default function GerberViewer() {
       }
     }
 
+    // L-shape corner marks (Y-inverted) — preview of what generatePanelizedGerber
+    // actually adds to copper/mask on export. Gated the same way the exporter
+    // gates it (rectangular-outline check + enableLShapeMarks + arm fits the
+    // PCB) so the preview never shows marks that export would silently drop.
+    if (pc.enableLShapeMarks && (visibleLayerTypes.has('copper') || visibleLayerTypes.has('mask'))) {
+      const outlineLayer = layers.find(l => l.type === 'outline' && l.parsedLayer?.bounds)
+      const outlineOk = outlineLayer ? isRectangularOutline(outlineLayer.parsedLayer) : false
+      const arm = pc.lShapeArmLength
+      const w = pr.pcbWidth
+      const h = pr.pcbHeight
+      const maxArm = Math.min(w / 2, h / 2)
+      if (outlineOk && arm > 0 && arm <= maxArm) {
+        for (const pos of pr.pcbPositions) {
+          const sy = (ly: number) => -(pos.y + ly)
+          const gx = (lx: number) => pos.x + lx
+          const corners = [
+            `M${gx(arm)} ${sy(0)}L${gx(0)} ${sy(0)}L${gx(0)} ${sy(arm)}`,             // bottom-left
+            `M${gx(w - arm)} ${sy(0)}L${gx(w)} ${sy(0)}L${gx(w)} ${sy(arm)}`,          // bottom-right
+            `M${gx(w)} ${sy(h - arm)}L${gx(w)} ${sy(h)}L${gx(w - arm)} ${sy(h)}`,      // top-right
+            `M${gx(arm)} ${sy(h)}L${gx(0)} ${sy(h)}L${gx(0)} ${sy(h - arm)}`,          // top-left
+          ]
+          for (const [ci, d] of corners.entries()) {
+            elements.push(
+              <path key={`lshape-${pos.row}-${pos.col}-${ci}`}
+                d={d} fill="none" stroke="rgba(255,20,147,0.85)" strokeWidth={0.15}
+                vectorEffect="non-scaling-stroke" />
+            )
+          }
+        }
+      }
+    }
+
     // Info text — render on side ribs.
     // Region-font mode: draw the TRUE glyph polygons so the preview is WYSIWYG
     // with the exported Gerber. getRegionTextPolygons returns world-space
@@ -666,7 +698,7 @@ export default function GerberViewer() {
     )
 
     return elements
-  }, [panelResult, panelConfig, activeTab, visibleLayerTypes])
+  }, [panelResult, panelConfig, activeTab, visibleLayerTypes, layers])
 
   // Crosshair
   const crosshairContent = useMemo(() => {
