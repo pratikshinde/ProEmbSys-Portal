@@ -1353,6 +1353,18 @@ export interface DrillMeta {
   hitCount: number
   /** True when the Eagle TZ→LZ workaround re-interpreted the declared suppression. */
   eagleTzCorrected?: boolean
+  /**
+   * True when `source: 'header'` was actually a content-shape heuristic
+   * (Altium 9+-digit, Allegro "Holesize" without FILE_FORMAT) rather than a
+   * real declaration in the file. store.ts's initial SVG render always feeds
+   * raw upload content through tracespace's own, independent Excellon
+   * parsing — tracespace has no idea about either heuristic, so it makes its
+   * own (uncoordinated, possibly differently wrong) guess at the same
+   * ambiguous digits. Callers that render from raw content should check this
+   * flag and re-render from our own normalized, explicit-decimal
+   * serialization instead of trusting tracespace's guess.
+   */
+  formatGuessedFromContent?: boolean
 }
 
 /**
@@ -1393,6 +1405,19 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
   let declaredZeroSuppression: DrillZeroSuppressionMode = forceFormat ? forceFormat.zeroSuppression : 'leading'
   /** True once the file's own header declared a unit/format (not just our default). */
   let formatFromHeader = false
+  /**
+   * True only for the two heuristics below (Altium 9+-digit, Allegro
+   * "Holesize"-without-FILE_FORMAT) that infer the format from the shape of
+   * the coordinate DATA itself, as opposed to an explicit declaration
+   * (FORMAT=, METRIC/INCH,TZ|LZ, M71/M72, a real FILE_FORMAT comment). Both
+   * also set `formatFromHeader = true` so the rest of the parser treats them
+   * as settled — this flag exists purely so callers who render from raw file
+   * content (tracespace has its own independent Excellon interpretation, and
+   * has no idea about either heuristic) know to re-render from our own
+   * corrected, explicit-decimal serialization instead of trusting tracespace's
+   * uncoordinated guess at the same ambiguous digits.
+   */
+  let formatGuessedFromContent = false
   /** Whether an M48 header block was ever opened. */
   let sawM48 = false
   /** Collect at most one 'none'-mode width warning so a big file can't spam. */
@@ -1418,7 +1443,34 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
       fmtDec = 5
       units = 'mm'
       formatFromHeader = true
+      formatGuessedFromContent = true
       warnings.push('Detected 9+ digit coordinates with no format header — assuming 5.5 metric (Altium).')
+    }
+  }
+
+  // Allegro "Holesize" header dialect (PentaLogix ViewMaster/CAM350-adjacent
+  // exports of a .brd design): the header lists hole sizes and declares "MM"
+  // per line, but — unlike the Allegro exports this parser already handles —
+  // never emits a ";FILE_FORMAT=" comment, so the digit width is never stated
+  // anywhere. Observed real files always pad to 8 fixed-width digits with no
+  // suppression; defaulting to 2.4 truncates the two most-significant digits
+  // off every coordinate (e.g. "07587580" -> last 6 digits "587580" -> a wrong
+  // 58.758mm instead of the correct 75.8758mm), silently moving every hole and
+  // producing negative bounds on a board with no negative coordinates.
+  // Confirmed against a real board pair (drill file + matching .rou route
+  // file): the route file's own ";EXTENTS:" comment (in mils) gave a clean
+  // 6.000in x 6.000in = 152.4mm square, and only a 3.5 split lands every
+  // coordinate inside that footprint — 2.4 (or any split reusing the 8 raw
+  // digits under a shorter total width) does not.
+  if (!forceFormat && !formatFromHeader && /;\s*Holesize\s*\d+\..*MM/i.test(normalized)) {
+    const eightDigit = /[XY][+-]?(\d{8})(?![\d.])/.exec(normalized)
+    if (eightDigit && fmtInt === 2 && fmtDec === 4) {
+      fmtInt = 3
+      fmtDec = 5
+      units = 'mm'
+      formatFromHeader = true
+      formatGuessedFromContent = true
+      warnings.push('Detected Allegro "Holesize" header with 8-digit coordinates and no FILE_FORMAT comment — assuming 3.5 metric.')
     }
   }
 
@@ -1859,6 +1911,7 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     toolCount: apertures.size,
     hitCount: commands.length,
     ...(eagleTzCorrected ? { eagleTzCorrected: true } : {}),
+    ...(formatGuessedFromContent ? { formatGuessedFromContent: true } : {}),
   }
 
   return {

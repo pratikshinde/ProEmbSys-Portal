@@ -6,8 +6,10 @@ import LayerPanel from './layer-panel';
 import PanelConfigPanel from './panel-config';
 import ExportPanel from './export-panel';
 import DfmPanel from './dfm-panel';
+import RoutingPanel from './routing-panel';
+import GcodePanel from './gcode-panel';
 import { Button } from './ui/button';
-import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck } from 'lucide-react';
+import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck, Scissors, Terminal } from 'lucide-react';
 import { useAppStore } from '../lib/store';
 import JSZip from 'jszip';
 import { analyzeGerberSet, GerberQuoteAnalysis } from '../lib/gerber-analysis';
@@ -1861,6 +1863,8 @@ function PanelizationPage() {
           {[
             { key: 'layers' as const, icon: Layers, label: 'Layers' },
             { key: 'panel' as const, icon: LayoutGrid, label: 'Panel Config' },
+            { key: 'routing' as const, icon: Scissors, label: 'Routing' },
+            { key: 'gcode' as const, icon: Terminal, label: 'G-Code' },
             { key: 'dfm' as const, icon: ShieldCheck, label: 'DFM Check' },
             { key: 'export' as const, icon: Download, label: 'Info & Export' },
           ].map(({ key, icon: Icon, label }) => (
@@ -1908,6 +1912,8 @@ function PanelizationPage() {
               <div style={{ padding:12, height:"100%" }}>
                 {activeTab === 'layers' && <LayerPanel />}
                 {activeTab === 'panel' && <PanelConfigPanel />}
+                {activeTab === 'routing' && <RoutingPanel />}
+                {activeTab === 'gcode' && <GcodePanel />}
                 {activeTab === 'dfm' && <DfmPanel />}
                 {activeTab === 'export' && <ExportPanel />}
               </div>

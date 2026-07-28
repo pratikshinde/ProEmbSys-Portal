@@ -15,7 +15,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { gerberToSvg, gerberRenderBoardView, mergeLayerBounds, GerberSvgResult } from '@/lib/gerber-svg'
 import { detectLayerType, detectLayerSide, LayerType, LayerSide } from '@/lib/gerber-analysis'
 import { isExcellonDrillFile } from '@/lib/gerber-parser'
-import { BOARD_COLOR_PALETTE, BoardColorName, getPcbColor, PCB_OPACITY, silkColorFor, getLayerZIndex, getMaskClipPairs } from '@/lib/board-colors'
+import { BOARD_COLOR_PALETTE, BoardColorName, EXPOSED_SUBSTRATE_COLOR, getPcbColor, PCB_OPACITY, silkColorFor, getLayerZIndex, getMaskClipPairs } from '@/lib/board-colors'
 import { RawSvgGroup, RawSvgMask } from './raw-svg-group'
 
 export interface BoardPreviewEntry {
@@ -246,6 +246,18 @@ export default function BoardPreview({
                   return (
                     <React.Fragment key={layer.id}>
                       <RawSvgMask id={maskId} html={layer.svgData.svgFragment} />
+                      {/* Exposed bare FR4 under the mask opening, painted
+                          before the gold-copper reveal — see board-colors.ts's
+                          EXPOSED_SUBSTRATE_COLOR doc comment. Without this a
+                          mask-only opening with no copper beneath it (e.g. a
+                          keepout relief) is fully invisible here. */}
+                      <g mask={`url(#${maskId})`}>
+                        <rect
+                          x={viewBox.x} y={viewBox.y}
+                          width={viewBox.width} height={viewBox.height}
+                          fill={EXPOSED_SUBSTRATE_COLOR}
+                        />
+                      </g>
                       <g mask={`url(#${maskId})`}>
                         <RawSvgGroup
                           style={{

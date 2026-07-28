@@ -11,9 +11,31 @@ import { runDfm } from './dfm/run-dfm'
 import type { DfmContext, DfmLayerInput, DfmReport, DfmRules } from './dfm/types'
 import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DrillZeroSuppression, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber } from './panelization-engine'
 import { LayerType, LayerSide, detectLayerType, detectLayerSide } from './gerber-analysis'
+import { planRouting, resolveOutlineMode } from './routing/plan-routing'
+import { DEFAULT_ROUTING_CONFIG, type BoardContour, type RoutingConfig, type RoutingResult } from './routing/types'
+import { generateGcodeFiles as buildGcodeFiles, DEFAULT_GCODE_CONTEXT, type GcodeContext, type GcodeFile } from './routing/gcode'
+import { isRoutGcodeFile, parseRoutSlots, routSlotsToGerber } from './routing/import-rout'
+import { collectPanelizedDrillHoles } from './gerber-exporter'
+import { traceBoardContour } from './board-contour'
 import { BoardColorName } from './board-colors'
 
 export type { LayerType, LayerSide }
+
+/** The CAM tool's sidebar tabs. Previously this union was spelled out inline on
+ *  both `activeTab` and `setActiveTab`, which meant adding a tab required
+ *  editing two places that could silently drift apart. */
+export type CamTab = 'layers' | 'panel' | 'routing' | 'gcode' | 'dfm' | 'export'
+
+/** Tabs whose canvas shows the whole *panel* rather than the single imported
+ *  PCB. `gerber-viewer.tsx` gates five separate things on this (bounds, the
+ *  overlay memo, the two `<use>`-repeat render paths, and the status readout) —
+ *  they must all agree, so the membership test lives here rather than being
+ *  re-spelled as an `||` chain at each site. */
+export const PANEL_VIEW_TABS: ReadonlySet<CamTab> = new Set<CamTab>(['panel', 'routing', 'gcode', 'export'])
+
+export function isPanelViewTab(tab: CamTab): boolean {
+  return PANEL_VIEW_TABS.has(tab)
+}
 
 export interface LayerEntry {
   id: string
@@ -121,9 +143,46 @@ interface AppState {
   dfmFocus: { x: number; y: number } | null
   setDfmFocus: (p: { x: number; y: number } | null) => void
 
+  // Routing (depaneling router paths — see src/lib/routing/)
+  routingConfig: RoutingConfig
+  /** Shallow merge. `RoutingConfig` is deliberately FLAT so this is always
+   *  correct — see the warning on the interface in routing/types.ts. */
+  updateRoutingConfig: (updates: Partial<RoutingConfig>) => void
+  resetRoutingConfig: () => void
+  routingResult: RoutingResult | null
+  /** Config changed since the last generate. The panel offers a regenerate
+   *  prompt; nothing ever auto-recomputes (same rule as Create Panel / Run check). */
+  routingStale: boolean
+  /** Traced board profile for the outline layer, refreshed by `generateRouting`
+   *  itself (never by `rebuildBoardView`, which is fire-and-forget and can
+   *  resolve out of order — see the contour-routing plan's own rationale).
+   *  `null` when the resolved outline mode is `'bbox'` or tracing failed. */
+  boardContour: BoardContour | null
+  /** True only while `generateRouting` is awaiting an async contour trace —
+   *  bbox-mode generates stay synchronous and never set this. */
+  routingGenerating: boolean
+  generateRouting: () => Promise<void>
+  clearRoutingResult: () => void
+  /** Point the viewer should pan/zoom to, in Gerber-native Y-up mm. Shares the
+   *  viewer's focus effect with `dfmFocus`. */
+  routingFocus: { x: number; y: number } | null
+  setRoutingFocus: (p: { x: number; y: number } | null) => void
+
+  // G-code (LinuxCNC dialect — see src/lib/routing/gcode.ts). Deliberately its
+  // own flat slice for the same reason RoutingConfig is: updateGcodeContext is
+  // a shallow merge, so a nested field would need re-spreading in two places.
+  gcodeContext: GcodeContext
+  updateGcodeContext: (updates: Partial<GcodeContext>) => void
+  resetGcodeContext: () => void
+  gcodeFiles: GcodeFile[] | null
+  /** Synchronous, like generateRouting — reads the current routingResult and
+   *  the imported drill layers, requires a routingResult to exist. */
+  generateGcodeFilesAction: () => void
+  clearGcodeFiles: () => void
+
   // UI state
-  activeTab: 'layers' | 'panel' | 'info' | 'export' | 'dfm'
-  setActiveTab: (tab: 'layers' | 'panel' | 'info' | 'export' | 'dfm') => void
+  activeTab: CamTab
+  setActiveTab: (tab: CamTab) => void
   showGrid: boolean
   toggleGrid: () => void
   showCrosshair: boolean
@@ -299,6 +358,90 @@ function maybeSyncExportDrillFormat(get: () => AppState, set: (fn: (state: AppSt
   set(state => ({ panelConfig: { ...state.panelConfig, drillFormat: detected } }))
 }
 
+/**
+ * Content to feed `gerberToSvg` for a drill layer. Normally the raw upload —
+ * tracespace has its own Excellon parsing and handles the well-known
+ * conventions (explicit FORMAT=, METRIC/INCH,TZ|LZ, M71/M72, KiCad explicit
+ * decimals, real T-code tool tables) fine, and several real fixtures were
+ * verified byte-for-byte against exactly that raw-content render path.
+ *
+ * But when `parseExcellonDrill` only reached its format through a
+ * content-shape heuristic — `DrillMeta.formatGuessedFromContent` (Altium
+ * 9+-digit, or an Allegro "Holesize" header with no FILE_FORMAT comment) —
+ * the file's OWN dialect is unusual enough that tracespace can't be trusted
+ * with the raw text at all. Confirmed on a real customer file: the same
+ * "Holesize N. = ..." dialect that forces the digit-width guess ALSO never
+ * emits a single `Tnn` tool-select command anywhere in the body (tool
+ * changes are implied positionally by bare `M00` markers instead — see the
+ * parser's M00 handling) — so tracespace's plotter, which needs an explicit
+ * tool selection to resolve a flash's diameter, silently drops every hole
+ * (0 plotted children, confirmed) regardless of whether the coordinate
+ * digits are re-normalized. `generateNormalizedExcellon` only rewrites the
+ * ORIGINAL text line-by-line and can't invent tool-select commands that were
+ * never there, so it doesn't fix this either.
+ *
+ * `serializeParsedDrillToExcellon` sidesteps all of it by building a
+ * complete, from-scratch Excellon file (real `M48` tool table + a `Tnn`
+ * select before every tool change) directly from `parsedLayer.apertures` /
+ * `.commands`, which our own parser already resolved correctly independent
+ * of what conventions — or omissions — the source file used.
+ */
+function drillSvgSourceContent(content: string, parsedLayer: GerberLayer): string {
+  if (!parsedLayer.drillMeta?.formatGuessedFromContent) return content
+  return serializeParsedDrillToExcellon(parsedLayer)
+}
+
+interface DrillOrRoutResult {
+  parsedLayer: GerberLayer
+  svgSourceContent: string
+  /** 'rout' layers must skip the Excellon size-mismatch auto-detect below —
+   *  their bounds are a handful of small milled slots, not the whole board,
+   *  so the size ratio would look like a format error and trigger
+   *  `autoDetectDrillFormat` on G-code text that was never Excellon at all. */
+  kind: 'excellon' | 'rout'
+}
+
+/**
+ * Recognize and parse the two non-Gerber import shapes this tool accepts:
+ * genuine Excellon drill data, and incoming Excellon-2-style `.rou` rout
+ * files (milling slots — see `routing/import-rout.ts`). Checked in that
+ * order because a rout file's body (`G90`/`M30`/bare tool selects) also
+ * satisfies `isExcellonDrillFile`'s heuristics; `isRoutGcodeFile`'s stricter
+ * signature (plunge/retract + cutter comp + a tool select with NO diameter)
+ * only matches real rout files. Returns null for ordinary Gerber content.
+ */
+function parseDrillOrRoutContent(content: string, fileName: string): DrillOrRoutResult | null {
+  if (isRoutGcodeFile(content)) {
+    const { polygons } = parseRoutSlots(content)
+    const gerberText = routSlotsToGerber(polygons)
+    return { parsedLayer: parseGerber(gerberText, fileName), svgSourceContent: gerberText, kind: 'rout' }
+  }
+  if (isExcellonDrillFile(content)) {
+    const parsedLayer = parseExcellonDrill(content, fileName)
+    return { parsedLayer, svgSourceContent: drillSvgSourceContent(content, parsedLayer), kind: 'excellon' }
+  }
+  return null
+}
+
+/**
+ * The single canonical way to find "the outline layer" across the routing
+ * and panelization codepaths — `type === 'outline'`, `visible`, and has
+ * resolved bounds. Used consistently by `computePanelResult`, `generateRouting`,
+ * and `generateGcodeFilesAction`.
+ *
+ * Before this was extracted, `computePanelResult` required `visible` and
+ * `generateRouting` didn't — a hidden outline layer could silently drive
+ * routing math (the outline-not-rectangular check, and now contour tracing
+ * and the instancing datum) while being excluded from panel sizing. Routing
+ * intentionally does NOT fall back to "largest layer" like
+ * `computePanelResult`'s own `boundsLayer` does — that fallback exists for
+ * dimensioning an odd export, not for deciding which file IS the board
+ * outline to trace.
+ */
+function findOutlineBoundsLayer(layers: LayerEntry[]): LayerEntry | undefined {
+  return layers.find(l => l.type === 'outline' && l.visible && l.parsedLayer?.bounds)
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   // Layers
   layers: [],
@@ -307,18 +450,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     const content = await file.text()
     const fileName = file.name
     try {
-      // Use Excellon parser for drill files, Gerber parser for everything else
-      let parsedLayer: GerberLayer
-      if (isExcellonDrillFile(content)) {
-        parsedLayer = parseExcellonDrill(content, fileName)
-      } else {
-        parsedLayer = parseGerber(content, fileName)
-      }
+      // Use Excellon parser for drill files, the rout-slot importer for
+      // incoming .rou milling files, Gerber parser for everything else
+      const drillOrRout = parseDrillOrRoutContent(content, fileName)
+      const parsedLayer: GerberLayer = drillOrRout ? drillOrRout.parsedLayer : parseGerber(content, fileName)
 
       // Generate SVG using server API (also extracts TF.FileFunction if present)
+      const svgSourceContent = drillOrRout ? drillOrRout.svgSourceContent : content
       let svgData: GerberSvgResult | null = null
       try {
-        svgData = await gerberToSvg(content)
+        svgData = await gerberToSvg(svgSourceContent)
 
         // If SVG generation failed (empty/error), create a fallback SVG from parsed data
         if (!svgData || svgData.isEmpty || svgData.error) {
@@ -331,9 +472,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
 
       // Layer type detection: prefer TF.FileFunction (from Gerber content),
-      // fall back to filename-based heuristics. Force 'drill' if content is Excellon.
+      // fall back to filename-based heuristics. Force 'drill' if content is
+      // Excellon or a milling rout file (see parseDrillOrRoutContent).
       let type: LayerType, side: LayerSide
-      if (isExcellonDrillFile(content)) {
+      if (drillOrRout) {
         type = 'drill'
         side = 'none'
       } else if (svgData?.layerAnalysis?.type) {
@@ -350,10 +492,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       convertLayerUnits(parsedLayer, targetUnit)
 
       // Auto-detect drill format by comparing against existing board layers
-      let finalContent = content
+      // — never for rout-derived layers, whose bounds are a handful of small
+      // milled slots, not the whole board (see DrillOrRoutResult.kind).
+      let finalContent = svgSourceContent
       let finalParsed = parsedLayer
       let finalSvg = svgData
-      if (type === 'drill' && parsedLayer.bounds) {
+      if (type === 'drill' && drillOrRout?.kind !== 'rout' && parsedLayer.bounds) {
         const existingLayers = get().layers
         const boardLayers = existingLayers.filter(l => l.type !== 'drill' && l.type !== 'fab' && l.type !== 'other' && l.parsedLayer?.bounds)
         if (boardLayers.length > 0) {
@@ -508,9 +652,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   clearLayers: () => {
-    // Drop the DFM report too — leaving findings (and their canvas markers)
-    // pointing at geometry that's no longer loaded would be misleading.
-    set({ layers: [], panelResult: null, boardView: null, dfmReport: null, dfmFocus: null })
+    // Drop the DFM report and the routing plan too — leaving findings (and
+    // their canvas markers) or router tool paths pointing at geometry that's no
+    // longer loaded would be misleading, and a stale route would still export.
+    set({
+      layers: [], panelResult: null, boardView: null,
+      dfmReport: null, dfmFocus: null,
+      routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
+    })
   },
 
   rotateAllLayers: async (direction: 'left' | 'right') => {
@@ -623,7 +772,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     }))
     
-    set({ layers: updatedLayers, panelResult: null })
+    // Rotation changes every layer's geometry and drops the panel, so any
+    // planned routing is against dimensions that no longer apply.
+    set({
+      layers: updatedLayers, panelResult: null,
+      routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
+    })
     void get().rebuildBoardView()
   },
 
@@ -691,18 +845,16 @@ export const useAppStore = create<AppState>((set, get) => ({
 
           // Extract just the filename from the path for display
           const fileName = entry.path.split('/').pop() || entry.path
-          // Use Excellon parser for drill files, Gerber parser for everything else
-          let parsedLayer: GerberLayer
-          if (isExcellonDrillFile(content)) {
-            parsedLayer = parseExcellonDrill(content, fileName)
-          } else {
-            parsedLayer = parseGerber(content, fileName)
-          }
+          // Use Excellon parser for drill files, the rout-slot importer for
+          // incoming .rou milling files, Gerber parser for everything else
+          const drillOrRout = parseDrillOrRoutContent(content, fileName)
+          const parsedLayer: GerberLayer = drillOrRout ? drillOrRout.parsedLayer : parseGerber(content, fileName)
 
           // Generate SVG using server API (also extracts TF.FileFunction if present)
+          const svgSourceContent = drillOrRout ? drillOrRout.svgSourceContent : content
           let svgData: GerberSvgResult | null = null
           try {
-            svgData = await gerberToSvg(content)
+            svgData = await gerberToSvg(svgSourceContent)
 
             // If SVG generation failed (empty/error), create a fallback SVG from parsed data
             if (!svgData || svgData.isEmpty || svgData.error) {
@@ -715,9 +867,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           }
 
           // Layer type detection: prefer TF.FileFunction (from Gerber content),
-          // fall back to filename-based heuristics. Force 'drill' if content is Excellon.
+          // fall back to filename-based heuristics. Force 'drill' if content is
+          // Excellon or a milling rout file (see parseDrillOrRoutContent).
           let type: LayerType, side: LayerSide
-          if (isExcellonDrillFile(content)) {
+          if (drillOrRout) {
             type = 'drill'
             side = 'none'
           } else if (svgData?.layerAnalysis?.type) {
@@ -736,7 +889,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             id: generateId(),
             name: fileName.replace(/\.[^.]+$/, ''),
             fileName,
-            rawContent: content,
+            rawContent: svgSourceContent,
             originalContent: content,
             parsedLayer,
             svgData,
@@ -776,7 +929,12 @@ export const useAppStore = create<AppState>((set, get) => ({
 
           for (let i = 0; i < newLayers.length; i++) {
             const layer = newLayers[i]
-            if (layer.type !== 'drill' || !layer.parsedLayer?.bounds) continue
+            // Rout-derived slot layers go through parseGerber, which never sets
+            // drillMeta — this distinguishes them from real Excellon layers
+            // without needing a separate field on LayerEntry. Their bounds are
+            // a handful of small milled slots, not the whole board, so they
+            // must never enter the size-mismatch auto-detect below.
+            if (layer.type !== 'drill' || !layer.parsedLayer?.bounds || !layer.parsedLayer?.drillMeta) continue
 
             const db = layer.parsedLayer.bounds!
             const drillWidth = db.maxX - db.minX
@@ -902,17 +1060,16 @@ export const useAppStore = create<AppState>((set, get) => ({
 
           // Extract filename from the path
           const fileName = path.split('/').pop() || path
-          
-          let parsedLayer: GerberLayer
-          if (isExcellonDrillFile(content)) {
-            parsedLayer = parseExcellonDrill(content, fileName)
-          } else {
-            parsedLayer = parseGerber(content, fileName)
-          }
 
+          // Use Excellon parser for drill files, the rout-slot importer for
+          // incoming .rou milling files, Gerber parser for everything else
+          const drillOrRout = parseDrillOrRoutContent(content, fileName)
+          const parsedLayer: GerberLayer = drillOrRout ? drillOrRout.parsedLayer : parseGerber(content, fileName)
+
+          const svgSourceContent = drillOrRout ? drillOrRout.svgSourceContent : content
           let svgData: GerberSvgResult | null = null
           try {
-            svgData = await gerberToSvg(content)
+            svgData = await gerberToSvg(svgSourceContent)
             if (!svgData || svgData.isEmpty || svgData.error) {
               console.warn('SVG generation failed for', fileName, '- creating fallback SVG')
               svgData = createFallbackSvg(parsedLayer, fileName)
@@ -923,7 +1080,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           }
 
           let type: LayerType, side: LayerSide
-          if (isExcellonDrillFile(content)) {
+          if (drillOrRout) {
             type = 'drill'
             side = 'none'
           } else if (svgData?.layerAnalysis?.type) {
@@ -941,7 +1098,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             id: generateId(),
             name: fileName.replace(/\.[^.]+$/, ''),
             fileName,
-            rawContent: content,
+            rawContent: svgSourceContent,
             originalContent: content,
             parsedLayer,
             svgData,
@@ -981,7 +1138,12 @@ export const useAppStore = create<AppState>((set, get) => ({
 
           for (let i = 0; i < newLayers.length; i++) {
             const layer = newLayers[i]
-            if (layer.type !== 'drill' || !layer.parsedLayer?.bounds) continue
+            // Rout-derived slot layers go through parseGerber, which never sets
+            // drillMeta — this distinguishes them from real Excellon layers
+            // without needing a separate field on LayerEntry. Their bounds are
+            // a handful of small milled slots, not the whole board, so they
+            // must never enter the size-mismatch auto-detect below.
+            if (layer.type !== 'drill' || !layer.parsedLayer?.bounds || !layer.parsedLayer?.drillMeta) continue
 
             const db = layer.parsedLayer.bounds!
             const drillWidth = db.maxX - db.minX
@@ -1166,7 +1328,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     }
 
-    set({ layers: updatedLayers })
+    // Drill alignment shifts drill geometry, which mouse-bite placement and the
+    // routing preview are both measured against — replan rather than keep it.
+    set({
+      layers: updatedLayers,
+      routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
+    })
     void get().rebuildBoardView()
   },
 
@@ -1183,7 +1350,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!newConfig.drillFormat) {
         newConfig.drillFormat = { ...DEFAULT_PANEL_CONFIG.drillFormat }
       }
-      return { panelConfig: newConfig }
+      // Panel geometry drives routing geometry, so any config change makes an
+      // existing routing plan potentially wrong — flag it rather than silently
+      // keeping stale tool paths that would export as a fabrication file.
+      return { panelConfig: newConfig, routingStale: true }
     })
     // NOTE: Panel computation is now only triggered when user clicks "Create Panel" button
   },
@@ -1193,7 +1363,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       panelConfig: {
         ...DEFAULT_PANEL_CONFIG,
         drillFormat: { ...DEFAULT_PANEL_CONFIG.drillFormat },
-      }
+      },
+      // Full reset — drop the routing plan entirely rather than mark it stale.
+      routingResult: null,
+      routingStale: false,
+      routingFocus: null,
+      gcodeFiles: null,
+      boardContour: null,
     })
     // NOTE: Panel computation is now only triggered when user clicks "Create Panel" button
   },
@@ -1232,14 +1408,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   computePanelResult: () => {
     const { layers, panelConfig } = get()
     if (layers.length === 0) {
-      set({ panelResult: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null })
       return
     }
 
     // Find the outline layer for PCB dimensions.
     // Priority: 1) Explicitly typed 'outline' layer, 2) Layer with the largest bounding area
     // (the outline/profile is typically the outermost layer that encompasses all others).
-    const outlineLayer = layers.find(l => l.type === 'outline' && l.visible && l.parsedLayer.bounds)
+    const outlineLayer = findOutlineBoundsLayer(layers)
     let boundsLayer = outlineLayer
     if (!boundsLayer) {
       // Fallback: pick the visible layer with the largest bounding area as the PCB outline.
@@ -1257,7 +1433,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     if (!boundsLayer || !boundsLayer.parsedLayer.bounds) {
-      set({ panelResult: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null })
       return
     }
 
@@ -1266,7 +1442,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const pcbHeight = bounds.maxY - bounds.minY
 
     if (pcbWidth <= 0 || pcbHeight <= 0) {
-      set({ panelResult: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null })
       return
     }
 
@@ -1341,13 +1517,18 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
 
-    set({ panelResult: result })
+    // A fresh panel invalidates any existing routing plan outright: tool paths
+    // are panel-absolute, so keeping them would let a .rou export carry the
+    // PREVIOUS panel's coordinates — the worst failure this feature can produce.
+    set({ panelResult: result, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null })
   },
 
   // View state
   targetUnit: 'mm',
   setTargetUnit: (unit) => {
-    set({ targetUnit: unit })
+    // Layer geometry is about to be rescaled in place, so any planned routing
+    // is measured against dimensions that no longer exist.
+    set({ targetUnit: unit, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null })
     // Convert all layers to new unit
     const { layers } = get()
     for (const layer of layers) {
@@ -1454,6 +1635,117 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   clearDfmReport: () => set({ dfmReport: null, dfmFocus: null }),
+
+  // Routing
+  routingConfig: { ...DEFAULT_ROUTING_CONFIG },
+  updateRoutingConfig: (updates) =>
+    // Shallow merge is safe *because* RoutingConfig is flat. If you ever add a
+    // nested object you must re-spread it here AND in resetRoutingConfig —
+    // that is the PanelConfig.drillFormat trap. Keep the config flat instead.
+    set(state => ({ routingConfig: { ...state.routingConfig, ...updates }, routingStale: true })),
+  resetRoutingConfig: () =>
+    set({ routingConfig: { ...DEFAULT_ROUTING_CONFIG }, routingStale: true }),
+  routingResult: null,
+  routingStale: false,
+  boardContour: null,
+  routingGenerating: false,
+  generateRouting: async () => {
+    const { panelResult, panelConfig, routingConfig, layers } = get()
+    if (!panelResult) {
+      set({ routingResult: null, routingStale: false, boardContour: null, gcodeFiles: null })
+      return
+    }
+
+    const outlineLayer = findOutlineBoundsLayer(layers)
+    const resolvedMode = resolveOutlineMode(routingConfig.pcbOutlineMode, outlineLayer?.parsedLayer ?? null)
+
+    let boardContour: BoardContour | null = null
+    if (resolvedMode === 'contour' && outlineLayer) {
+      set({ routingGenerating: true })
+
+      let unionMinX = Infinity, unionMinY = Infinity, unionMaxX = -Infinity, unionMaxY = -Infinity
+      for (const l of layers) {
+        const b = l.parsedLayer?.bounds
+        if (!b) continue
+        unionMinX = Math.min(unionMinX, b.minX); unionMinY = Math.min(unionMinY, b.minY)
+        unionMaxX = Math.max(unionMaxX, b.maxX); unionMaxY = Math.max(unionMaxY, b.maxY)
+      }
+
+      boardContour = await traceBoardContour(
+        { fileName: outlineLayer.fileName, contents: outlineLayer.rawContent },
+        {
+          toleranceMm: routingConfig.contourToleranceMm,
+          unionBoundsMm: Number.isFinite(unionMinX) ? { minX: unionMinX, minY: unionMinY, maxX: unionMaxX, maxY: unionMaxY } : null,
+          sourceFileName: outlineLayer.fileName,
+        }
+      )
+
+      // Reference-identity staleness guard. Every mutating store action
+      // replaces `layers`/`panelResult` wholesale (never mutates in place),
+      // so if either has moved on while this awaited the trace, the layer
+      // set or panel this was planned against no longer exists — discard
+      // rather than plan routing against geometry that isn't current
+      // anymore (the same "never keep a stale plan" discipline as every
+      // other routingResult invalidation site in this file).
+      if (get().layers !== layers || get().panelResult !== panelResult) {
+        set({ routingGenerating: false })
+        return
+      }
+    }
+
+    const outlineBoundsMm = outlineLayer?.parsedLayer?.bounds
+      ? { minX: outlineLayer.parsedLayer.bounds.minX, minY: outlineLayer.parsedLayer.bounds.minY }
+      : null
+
+    set({
+      routingResult: planRouting(panelResult, panelConfig, routingConfig, {
+        outlineLayer: outlineLayer?.parsedLayer ?? null,
+        boardContour,
+        outlineBoundsMm,
+      }),
+      boardContour,
+      routingStale: false,
+      routingFocus: null,
+      routingGenerating: false,
+      // Any G-code already generated referred to the PREVIOUS plan — regenerating
+      // routing must invalidate it exactly like the routing plan itself gets
+      // invalidated by a panel change, or a download could silently carry stale
+      // tool paths.
+      gcodeFiles: null,
+    })
+  },
+  clearRoutingResult: () => set({ routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null }),
+  routingFocus: null,
+  setRoutingFocus: (p) => set({ routingFocus: p }),
+
+  // G-code
+  gcodeContext: { ...DEFAULT_GCODE_CONTEXT },
+  updateGcodeContext: (updates) =>
+    set(state => ({ gcodeContext: { ...state.gcodeContext, ...updates } })),
+  resetGcodeContext: () => set({ gcodeContext: { ...DEFAULT_GCODE_CONTEXT } }),
+  gcodeFiles: null,
+  generateGcodeFilesAction: () => {
+    const { routingResult, gcodeContext, layers, panelResult, panelInfo } = get()
+    if (!routingResult || !panelResult) {
+      set({ gcodeFiles: null })
+      return
+    }
+    // Same globalBaseOffset convention as exportPanelizedGerbers: derived from
+    // the outline layer's own bounds so drill hits land in the same
+    // panel-absolute space as the route paths, which are already there.
+    const outlineLayer = findOutlineBoundsLayer(layers)
+    const globalBaseOffset = outlineLayer?.parsedLayer?.bounds
+      ? { x: -outlineLayer.parsedLayer.bounds.minX, y: -outlineLayer.parsedLayer.bounds.minY }
+      : undefined
+    const drillLayers = layers
+      .filter(l => l.type === 'drill' && l.parsedLayer?.bounds)
+      .map(l => ({ name: l.name, fileName: l.fileName, content: l.rawContent, parsedLayer: l.parsedLayer, type: l.type, side: l.side }))
+    const drillHoleGroups = collectPanelizedDrillHoles(drillLayers, panelResult, globalBaseOffset)
+      .map(g => ({ diameterMm: g.diameterMm, holes: g.holes }))
+    const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
+    set({ gcodeFiles: buildGcodeFiles(routingResult, drillHoleGroups, partNumber, gcodeContext) })
+  },
+  clearGcodeFiles: () => set({ gcodeFiles: null }),
 
   // UI state
   activeTab: 'layers',

@@ -37,7 +37,7 @@ Next.js 16 / React 19 / TypeScript, App Router. Two things coexist:
 1. **Import** — User uploads `.gbr`/`.drl` files or a ZIP. `store.ts:addLayer` / `addLayersFromZip` parse each file and call `gerberToSvg()` from `gerber-svg.ts`, which dispatches to a Web Worker.
 2. **Parse** — `gerber-parser.ts` produces `GerberLayer` data with bounds and draw commands, used for panelization + export math. It holds **both** parsers: `parseGerber` (custom RS-274X) and `parseExcellonDrill` (Excellon drill), dispatched on `isExcellonDrillFile`. Drill layers additionally carry a `drillMeta` field (resolved unit / digits / zero suppression / tool + hole counts / where the format came from) which the Layers panel displays.
 3. **SVG render** — `src/workers/gerber-worker.ts` runs `@tracespace/parser` → `@tracespace/plotter` → `@tracespace/renderer` and returns an `svgFragment` + bounds. Fully client-side; no server roundtrip.
-4. **Layer detection** — Layer type and side are inferred from Gerber's `TF.FileFunction` attribute first, then filename heuristics in `gerber-analysis.ts:detectLayerType/detectLayerSide` (re-exported by `store.ts` — the two Gerber consumers, the Panelization tool and the PCB Order quote flow, share this logic rather than duplicating it).
+4. **Layer detection** — Layer type and side are inferred from Gerber's `TF.FileFunction` attribute first, then filename heuristics in `gerber-analysis.ts:detectLayerType/detectLayerSide` (re-exported by `store.ts` — the two Gerber consumers, the Panelization tool and the PCB Order quote flow, share this logic rather than duplicating it). The filename fallback matters more than it sounds: PentaLogix ViewMaster exports (confirmed on a real customer set) carry no `TF.FileFunction` attribute at all, so a file named e.g. `_MSK-TOP.art`/`_SLK-BOT.art` depends entirely on the heuristic recognizing the `MSK`/`SLK` abbreviations for mask/silk — without that, `TOP`/`BOT` in the same filename falls through to the bare-copper catch-all and every mask/silk layer renders as copper.
 5. **View** — `gerber-viewer.tsx` is an SVG canvas with pan/zoom. On the **Panel Config** tab it builds a `<defs>` of one geometry per layer and `<use>`s it for every PCB position so panel-mode DOM size stays constant in `rows × cols`.
 6. **Panelization** — `panelization-engine.ts` computes a `PanelResult` from PCB dimensions + `PanelConfig`. PCB dimensions come from the layer with the largest bounding area (or the explicit `outline` layer if present).
 7. **Export** — `gerber-exporter.ts` generates RS-274X Gerber for every layer in the panel plus Excellon drill output, bundled into a ZIP via JSZip + file-saver.
@@ -77,7 +77,8 @@ Requires a running Postgres and a populated `.env` (`DATABASE_URL`, `AUTH_SECRET
 |---|---|
 | `src/lib/store.ts` | Zustand store — Panelization tool state and layer import logic |
 | `src/lib/gerber-analysis.ts` | Shared Gerber/Excellon layer-type detection + quote-time board analysis (dimensions, layer count, hole count) — used by both `store.ts` and the PCB Order flow |
-| `src/lib/gerber-parser.ts` | RS-274X parser (apertures, coordinates, regions, arcs) **and** the Excellon drill parser (`parseExcellonDrill`, `autoDetectDrillFormat`, `generateNormalizedExcellon`) — the only drill parser in the repo |
+| `src/lib/gerber-parser.ts` | RS-274X parser (apertures, coordinates, regions, arcs) **and** the Excellon drill parser (`parseExcellonDrill`, `autoDetectDrillFormat`, `generateNormalizedExcellon`, `serializeParsedDrillToExcellon`) — the only drill parser in the repo |
+| `src/lib/routing/import-rout.ts` | Import (not export) support for incoming Excellon-2-style `.rou` milling files — `isRoutGcodeFile`, `parseRoutSlots`, `routSlotsToGerber`. See "Milling slots from incoming .rou files" below |
 | `src/lib/gerber-svg.ts` | Type definitions + `gerberToSvg()` Comlink client (lazy-instantiates the worker) |
 | `src/workers/gerber-worker.ts` | Web Worker — tracespace parse/plot/render, returns the `GerberSvgResult` shape |
 | `src/lib/drill-alignment.ts` | Exact drill↔Gerber origin-offset recovery (pad-pattern voting, ported from delta-gerber) + modal-coordinate flash-center resolution |
@@ -97,6 +98,10 @@ Requires a running Postgres and a populated `.env` (`DATABASE_URL`, `AUTH_SECRET
 | `src/lib/fab-capabilities.ts` | `FAB_CAPABILITIES` — the shop's real manufacturing envelope; renders `/fab-capabilities` **and** seeds the baseline DFM template |
 | `src/lib/dfm/` | DFM engine: `types.ts` (rules + zod validation + report contract), `measure.ts` (**all** unit normalisation), `run-dfm.ts` (check orchestration), `holes.ts` (Tier B: annular ring + plating detection), `capsules.ts` (Tier C: plot-tree → capsule geometry, net union-find, spacing), `templates.ts` (visibility + isDefault helpers shared by the user/admin routes) |
 | `src/components/dfm-panel.tsx` | CAM tool's DFM Check tab — template picker, context inputs, Run check, findings, rule editor |
+| `src/lib/board-contour.ts` | Adapter: tracespace `BoardShape` -> `BoardContour` (`src/lib/routing/types.ts`) — the ONLY file that reads a tracespace `BoardShape`. `boardShapeToContour` (pure), `traceBoardContour` (async: parse + plot one outline layer + adapt), `boardShapeCoversContent` (the >=50%-coverage trust gate, shared with `gerber-svg.ts`'s substrate clip so the two guards can't drift) |
+| `src/lib/routing/` | Depaneling router paths: `types.ts` (flat `RoutingConfig` + result contract, `BoardContour`/`ContourRing`), `geometry.ts` (**all** rectangle cutter-offset + edge-split conventions + the spatial-hash `dedupeCoincidentSegments`), `offset.ts` (the pure contour offset/tab engine — `offsetClosedRing`, arc-length parameterisation, tab curvature guard; zero tracespace/store imports), `plan-routing.ts` (`planRouting` + `validateRouting`, the bbox loop AND the contour branch — `resolveOutlineMode`/`computeContourGeometry`/`planContourPcb`), `emit-gerber.ts`, `emit-excellon.ts` (`.rou` + mouse-bite drill), `gcode.ts` (LinuxCNC G-code emitter — `generateRouteGcode`/`generateDrillGcode`/`generateGcodeFiles`, byte-verified against real shop files). Pure — no React, no store. See `ROUTING_ROADMAP.md` |
+| `src/components/routing-panel.tsx` | CAM tool's Routing tab — bit presets, scope, tabs/mouse bites, pre-flight issues with one-click fixes, Generate, route-only download |
+| `src/components/gcode-panel.tsx` | CAM tool's G-Code tab — `GcodeContext` fields (Z heights/depth, feeds, spindle, dwell, pressure pad), Generate, file list, G-code-only download |
 | `src/lib/email.ts` | Resend wrapper (password reset, staff welcome, lazily instantiated — see below) |
 | `src/lib/order-status.ts` + `src/components/order-status-badge.tsx` / `order-timeline.tsx` | The only sanctioned way to display an `OrderStatus` — humanized labels + colors (never show raw enum strings like `PENDING_REVIEW` to users), plus the pipeline timeline on `/orders/[id]` |
 | `middleware.ts` | Edge-safe route protection for `/admin/**` |
@@ -121,7 +126,7 @@ The same degenerate-outline case also breaks the `viewBox` tracespace's own `ren
 
 **tracespace's board compositor is unit-naive** — `coreRenderLayers`/`coreRenderBoard` merge all layers into one shared coordinate space using each plot tree's raw native numbers, never converting between inch- and mm-native layers (it stamps the same union viewBox on every per-layer SVG, only the `width`/`height` unit *suffix* differs). A homogeneous file set is self-consistent by luck; a mixed set misaligns by 25.4× — and our own Excellon pipeline *creates* mixed sets from consistent ones, since `serializeParsedDrillToExcellon`/`generateNormalizedExcellon` always emit METRIC (drill auto-detect, format override, and "Align Drill to Board Center" all re-serialize the drill in mm while inch-native Gerbers stay untouched). Symptom: board artwork collapses into a corner of a huge wrongly-sized substrate. Fix: `scalePlotTreeToMm`/`scaleBoardShapeToMm` in `gerber-preprocess.ts` scale every inch-native plot tree (and the boardShape, iff the outline layer's tree was inch-native — a BoardShape doesn't carry units of its own) to mm in place, immediately after `corePlot` and before any render step, so the whole downstream pipeline shares one mm space. The plot-tree grammar is closed (`@tracespace/plotter`'s `tree.d.ts`), so the walk is exhaustive; arc `theta` values are angles and are not scaled. `BoardView.shapeScale` is consequently always `1` now (the clip path d is already mm).
 
-`src/lib/gerber-preprocess.ts`'s `normalizeGerberMacroPrimitives()` runs before every `@tracespace/parser` call (both worker render paths and the main-thread board-view duplicate in `gerber-svg.ts`) to work around a tracespace bug: it silently drops an aperture macro's geometry when a primitive's point list is wrapped across multiple lines before the terminating `*` — valid RS-274X (Proteus does this routinely), but tracespace's tokenizer treats the embedded newline as ending the primitive early, so every flash of that D-code renders as nothing (confirmed to break both copper and soldermask on real exports). The fix collapses newlines strictly inside `%AM...%` blocks; it's a no-op for the far more common single-line-primitive macros (e.g. KiCad's multi-primitive-per-line `RoundRect`, verified byte-for-byte identical parse/render before and after).
+`src/lib/gerber-preprocess.ts`'s `normalizeGerberMacroPrimitives()` runs before every `@tracespace/parser` call — the worker render path, the main-thread board-view duplicate in `gerber-svg.ts`, and `src/lib/board-contour.ts`'s `traceBoardContour` (routing's contour tracer, four call sites in total as of the contour-routing feature) — to work around a tracespace bug: it silently drops an aperture macro's geometry when a primitive's point list is wrapped across multiple lines before the terminating `*` — valid RS-274X (Proteus does this routinely), but tracespace's tokenizer treats the embedded newline as ending the primitive early, so every flash of that D-code renders as nothing (confirmed to break both copper and soldermask on real exports). The fix collapses newlines strictly inside `%AM...%` blocks; it's a no-op for the far more common single-line-primitive macros (e.g. KiCad's multi-primitive-per-line `RoundRect`, verified byte-for-byte identical parse/render before and after).
 
 ### Coordinate system
 
@@ -137,6 +142,8 @@ Panel-overlay apertures (L-shape marks, stroke text, donuts, fiducials) are allo
 
 Panel text (customer/PCB reference on the top rib, per-layer labels on the bottom rib) renders as **filled Gerber regions** (`textFont: 'region'`, the default) or single-stroke polylines (`'stroke'`), selected in `export-panel.tsx`. The region path (`region-font.ts`) extracts **real glyph outlines** from an embedded Geist Regular subset (`region-font-data.ts`, base64 OFL-1.1 font, ~12 KB, parsed once via opentype.js and memoized per glyph): outlines are normalized so cap height = 1.0, flattened to polylines (adaptive Bézier subdivision), and split into dark outer / clear counter contours by **nesting depth** (a contour inside an odd number of others is a hole). Emission is CAM350-style: all outer contours under `%LPD%` + G36/G37, then counters under `%LPC%`, then reset to `%LPD%`. `measureRegionText` is the **single source of region text metrics** — shared by the emitter, panel-label positioning (`generateLayerLabels`), and the preview, so all three stay aligned (never re-hardcode advance/char widths). The on-screen preview (`gerber-viewer.tsx`) is **WYSIWYG**: in region mode it draws the exact same laid-out polygons via `getRegionTextPolygons` (both call the shared `layoutTexts`), so preview and exported Gerber are byte-for-byte identical coordinates. Glyphs are flattened to line segments only (no G36 arcs) for universal CAM safety. To change the typeface, re-subset a permissive (OFL/Apache) TTF and regenerate `region-font-data.ts`. Rib text size is user-configurable per rib (`PanelConfig.topRibFontSize` / `bottomRibFontSize`, both default 2.8mm cap height) via number inputs in `export-panel.tsx`, next to the font-type selector — `generateTopRibText` and `generateLayerLabels` read these instead of a hardcoded constant. `parseExcellonDrill` (in `gerber-parser.ts`) handles Altium 9+-digit coordinates (5.5 autodetect), Allegro `;Holesize`/`;FILE_FORMAT` comment headers, `M00` tool changes, stepped `R` repeat commands, headerless files (no `M48`/`%`), and explicit-decimal coordinates (KiCad) — ported/adapted from the standalone `pcb-panelization-tool` repo's `font-fix` branch, which is the upstream lineage of this tool.
 
+⚠ **Some Allegro/PentaLogix-ViewMaster exports carry `;Holesize`  comments (units) but never a `;FILE_FORMAT` comment (digit width)** — leaving the default 2.4 split to truncate the file's actual 8-digit fixed-width coordinates down to their last 6 digits, silently moving every hole and producing negative bounds on a board with none. Confirmed on a real customer file pair: the digit truncation was only caught by cross-checking the drill's implied board footprint against the companion `.rou` file's own `;EXTENTS:` comment (in mils), which gave a clean 152.4mm square that only a 3.5mm split lands inside. Detected up-front (same pattern as the Altium 9+-digit check right above it in the source): a `;Holesize N. = ... MM` comment plus consistently 8-digit coordinates with no format ever declared assumes 3.5 metric.
+
 ### Drill zero suppression — two opposite conventions
 
 `DrillZeroSuppressionMode` in `gerber-parser.ts` names **which zeros were removed from the file** (`'leading'` → pad left to restore). `DrillZeroSuppression` in `panelization-engine.ts` is the *export* setting and is deliberately **inverted**, because CAM350 reads the LZ/TZ header keywords backwards: exporting `'leading'` strips *trailing* zeros. They don't collide (exports carry an explicit header; the drill handed to the viewer is normalized to explicit decimals) — but never unify them without re-testing in CAM350. `'none'` means fixed-width coordinates in both.
@@ -151,6 +158,18 @@ A drill layer keeps its pristine upload in `LayerEntry.originalContent`; `rawCon
 
 `generateNormalizedExcellon` always converts coordinate *values* to mm, but must also rewrite the header's unit declaration to match — it previously only did so for bare `METRIC`/`INCH` tokens, silently leaving `M71`/`M72`-declared files with mm-valued coordinates under a stale inch-mode header (self-contradictory Excellon, mis-scaled in both the on-screen render and — since `rawContent` feeds the exporter too — the actual fabrication output). Unit-token detection now also matches `M71`/`M72`, and a final fallback at the `%` end-of-header marker declares `METRIC` if nothing upstream already did.
 
+⚠ **A drill layer's on-screen render normally comes from the RAW upload, not our parsed representation** — `store.ts`'s initial `gerberToSvg()` call for a drill file passes `content` straight through to tracespace, which has its own, completely independent Excellon interpretation (parsing, format-guessing, all of it). Our `parseExcellonDrill` result only drives panelization math, DFM, bounds comparisons, etc. — normally this is fine because tracespace handles the same well-known conventions we do. But for a file whose format we only reached via a content-shape heuristic (`DrillMeta.formatGuessedFromContent` — the Altium 9+-digit and Allegro-Holesize-without-FILE_FORMAT cases above), tracespace has no idea about either heuristic and makes its own, uncoordinated guess at the same ambiguous digits — confirmed on the real Allegro-Holesize file: it has **no `Tnn` tool-select command anywhere in its body at all** (tool changes are implied purely positionally via bare `M00`), so tracespace's plotter — which needs an explicit tool selection to resolve a flash's diameter — silently dropped every single hole (0 plotted children) regardless of digit format. `store.ts`'s `drillSvgSourceContent()` checks that flag and, when set, feeds tracespace `serializeParsedDrillToExcellon(parsedLayer)` instead of the raw upload — a complete synthetic Excellon file (real `M48` tool table + a `Tnn` select before every tool change) built from our own already-correct parse, sidestepping tracespace's guess entirely rather than trying to coordinate with it. `generateNormalizedExcellon` doesn't work for this — it only rewrites the original text line-by-line and can't invent tool-select commands that were never there.
+
+### Milling slots from incoming `.rou` files
+
+`detectLayerType`/`isExcellonDrillFile` both treat an incoming `.rou` as ordinary drill data, but a real rout file (confirmed against a customer file exported alongside the Allegro-Holesize `.drl` above, for the same job) is plain G-code, not Excellon: `T01` selects a tool, `G00X..Y..` rapids to a start point, `G41`/`M15` begin a cut, a run of `G01X..Y..` traces the path, `M16` retracts. Feeding that to `parseExcellonDrill` (which reads any line containing `X`/`Y` as a hole position) turned every cut move into a spurious "drill hit" at the corner of the milled shape, with no diameter.
+
+`src/lib/routing/import-rout.ts` recognizes and parses this dialect properly: `isRoutGcodeFile` discriminates it from genuine Excellon via a **bare tool select with no diameter anywhere** (`T01`, never `T01C<dia>`) alongside the plunge/retract + cutter-comp markers — genuine Excellon always pairs a tool select with a diameter declared somewhere. `parseRoutSlots` walks the G-code into one closed polygon per plunge/retract (`M15`...`M16`) block. Two things this deliberately does NOT do:
+- **Recover a cutter-compensation offset.** The real file's `G41` (cutter comp left) suggested the coordinates might be a tool-center path needing a bit-radius correction like this repo's own routing engine applies — but the incoming file never declares tool `T01`'s diameter, so that correction isn't computable from the file alone. Confirmed instead against the board's own `SLOT HOLE REPORT.XLS` (exact `SLOT_SIZE_MAJOR/MINOR`/`SLOT_X/Y`): the raw G01 coordinates already trace the *finished* slot boundary with zero cutter offset needed, so rendering them verbatim is the honest, correct answer — not a shortcut.
+- **Auto-detect the coordinate digit format.** Confirmed to use the identical fixed 8-digit-no-suppression convention as its companion `.drl` (3 integer + 5 decimal digits, mm) — a real, tool-specific convention, not guessed per-file.
+
+`routSlotsToGerber` renders each polygon as a filled Gerber region (`G36`/`G37`, dark polarity, **explicit-decimal coordinates** — tracespace accepts these directly in Gerber body content, sidestepping the whole fixed-width/zero-suppression class of bug for the *output* side even though the *input* dialect needed the fixed-width decode above). `store.ts`'s `parseDrillOrRoutContent` runs `isRoutGcodeFile` **before** `isExcellonDrillFile` (a rout file's body also satisfies the Excellon heuristics — `M30`, `G90`, real coordinates), converts to this synthetic Gerber text, and classifies the resulting layer as `type: 'drill'` — deliberately not a new `LayerType` member (see the routing roadmap's documented reason to avoid that), and 'drill' already correctly participates in Board-view compositing. Rout-derived layers are recognizable by `!parsedLayer.drillMeta` (only `parseExcellonDrill` ever sets that field) and must be excluded from the drill size-mismatch auto-detect in all three import paths — their bounds are a handful of small milled slots, not the whole board, and running `autoDetectDrillFormat` on G-code text that was never Excellon would corrupt an already-correct result.
+
 ### Viewer preview features (hover-isolate, soldermask color)
 
 Hovering a layer row in the Layers panel sets `store.hoveredLayerId`; `gerber-viewer.tsx`'s `visibleLayers` memo isolates to just that layer while `viewMode === 'layers'` (Individual layers overlay), ignoring each layer's own visibility toggle, and reverts to the normal filtered/z-sorted list on mouse-leave. Scoped to Layers mode only — Board mode is a single composited render (via per-layer SVG compositing, not tracespace/core's `renderBoard`) and isolating one layer there would need a much bigger re-compositing change.
@@ -161,10 +180,175 @@ The Board view's soldermask color (Green/Red/Blue/Purple/Yellow/Black/White, `st
 
 This originally used an SVG `<clipPath>` instead of `<mask>` — reverted after it broke on the very file that motivated the fix. A real board's mask layer can carry 1000+ shapes (one opening per pad), and past a few hundred children this renderer's `<clipPath>` silently resolves to an *empty* clip region — reproducible from a fresh page load, not a mutation-invalidation artifact — while the exact same geometry works fine as a `<mask>` (confirmed by swapping just that primitive against the live `WLC_Indicator` fiducial and sampling the composited pixel color). `<mask>` is luminance/raster-based rather than vector path intersection and doesn't hit the same wall at this scale. Don't switch this back to `<clipPath>` without re-verifying against a real multi-hundred-pad board, not just a synthetic single-shape test — that's exactly the gap that let the original regression ship.
 
+⚠ **A mask opening with NO copper anywhere beneath it was still fully invisible** even after the fix above — confirmed on a real customer board: `FV30359-1_NC_MSK-TOP.art` has an 18.3mm circular soldermask opening (D27) centered on each of two large inductor footprints (L1/L2), with zero copper geometry underneath on either the top or bottom copper layer (a keepout/relief area, not a pad). `getMaskClipPairs`'s technique only ever reveals gold *copper* through a mask opening — with no copper to reveal, nothing paints, and the opening reads as plain board background, exactly like a spot with no mask feature at all. This is the same underlying case as the fiducial annulus above (bare FR4 within a mask opening, no copper at that specific point) — just with *zero* copper anywhere in the opening instead of a smaller copper dot in the middle. Fix: `EXPOSED_SUBSTRATE_COLOR` (`board-colors.ts`) — a single tan/fiberglass tone, deliberately constant across every soldermask color choice, since bare FR4 looks the same regardless of what color mask the rest of the board uses. Painted as a rect clipped by the same mask, *underneath* the existing gold-copper reveal, at all three board-compositing call sites — so it shows through wherever the opening has no copper (both the fiducial annulus and a fully copper-less opening like this one), and is invisible wherever the gold-copper layer paints over it opaque. This is a visible change to the previously-shipped fiducial look (the annulus now reads as this tan tone instead of the board's own dark `substrate` background) — deliberately, since both are physically the same bare-FR4 phenomenon and the tan tone is the more accurate one of the two.
+
+⚠ **`nativeSvgBounds` (the `bounds` used for the exposed-substrate rect above, and for `bgRect`) is already in native SVG Y-down space — do not negate it.** The exposed-substrate rect's first implementation used `y={-bounds.maxY}` (treating `bounds` as Gerber Y-up and converting), which put the rect roughly one board-height off from where it should be — it only covered the bottom portion of the board, so a feature in the upper half (like the L1/L2 example above) got no coverage at all and looked exactly as unfixed as before. Caught by pixel-sampling the live render (not just eyeballing a screenshot) and confirmed against the already-correct sibling code right above it, which uses `y={bounds.minY - 0.2}` with no negation. `bgRect`'s own construction is the reference for this convention — match it exactly rather than re-deriving the sign from the Gerber-Y-up/SVG-Y-down convention described earlier in this file, which applies to *raw Gerber coordinates*, not to `bounds` values already handed to you in SVG space.
+
 ### PCB Order page board preview (`board-preview.tsx`)
 
 `PCBOrderPage` (in `portal-main.tsx`) renders a read-only composited board preview after a Gerber upload, in the soldermask color the customer picked from the existing **Color** spec buttons — the spec picker drives the preview directly (`specs.color` passed straight in as `maskColor`), there's no separate preview-only color control. Deliberately **store-independent**: `PCBOrderPage` never touches the Panelization tool's Zustand store, so `board-preview.tsx` classifies and renders layers itself from the same raw `{name, content}[]` entries `handleFile` already extracts for `analyzeGerberSet` (lifted into `previewEntries` state so the ZIP isn't parsed twice). Classification mirrors `store.ts`'s exact 3-tier priority — content-sniffed drill files first, then the file's own `TF.FileFunction` attribute (via `gerberToSvg`'s `layerAnalysis`, which requires rendering *before* classifying), then `detectLayerType`/`detectLayerSide` filename heuristics as a last resort. The TF.FileFunction tier isn't optional: plenty of real exports (e.g. this project's own `SenseBus_TH_Pro-B_Mask.gbr` test fixture) don't match the filename heuristic's expected patterns even though the file correctly declares its function — skipping straight to filename-only classification silently drops those layers as `'other'`. Shares `RawSvgGroup` (`raw-svg-group.tsx`) and the color/opacity/z-order tables in `board-colors.ts` with `gerber-viewer.tsx` so the two renders can't drift apart; a version-bump to either file should be re-verified in both places. Static + fit-to-view with a Top/Bottom toggle (no pan/zoom, unlike the CAM tool's viewer) — an intentionally lighter-weight preview for the order page.
 
+### Panel Y origin — `sideRibBottom`, not `sideRibTop`
+
+`computePanel` works in CAM350's first quadrant: **Y up, origin at the panel's
+bottom-left**. The PCB grid therefore starts at `config.sideRibBottom`, and
+`sideRibTop` is only ever reached via `panelHeight − sideRibTop`.
+
+`pcbPositions.y` used to be computed from `sideRibTop`, which is invisible with
+the default symmetric 5/5 ribs but offset the entire grid by
+`(sideRibTop − sideRibBottom)` for any asymmetric panel. Because the
+tooling-hole exclusion zone correctly derives from `sideRibBottom` (in two
+places), it then no longer described where the PCBs actually were, and holes were
+placed on top of boards: measured on a 2×2 panel with `T=20 B=5`, five
+tooling/reference holes landed at Y=77 while the PCBs spanned Y=20..82. Fixed;
+symmetric-rib output is byte-identical, so no existing panel changes.
+
+If you touch grid placement, the invariant is that these must all agree:
+`pcbPositions.y`, both `gridBottom`/`gridTop` computations, the rib-text
+generators (`ribHeight = sideRibBottom` for the bottom rib, `sideRibTop` for the
+top), and the hole placement (`sideRibBottom/2` low, `panelHeight − sideRibTop/2`
+high).
+
+### Routing (depaneling) — conventions that must not drift
+
+`src/lib/routing/` turns a computed panel into router tool paths, emitted as
+Gerber, Excellon `.rou`, **and** LinuxCNC G-code. Full rationale + the Phase A/B
+history: `ROUTING_ROADMAP.md`.
+
+- **Cutter compensation is applied exactly once**, in `geometry.ts`'s `offsetRectOutward`. Every `RoutePath.points` is already TOOL-CENTER, offset outward from the finished board edge by the bit radius — emitters must never offset again, and the export README states the convention explicitly because a fab reading a route layer cannot otherwise tell centerline from board edge.
+- ⚠ **`pathGap = tabWidth + bitDiameter`**, not `tabWidth`. The cut is the path swept by a disc of radius `r`, so a path gap of `g` leaves `g − 2r` of material. Using `tabWidth` as the gap directly makes every breakaway tab one bit-diameter too narrow — a silent scrap bug.
+- ⚠ **Mouse-bite holes are pulled OUTWARD from the board's own edge line** by `mouseBiteHoleDiameterMm/2 + mouseBiteEdgeClearanceMm` (default clearance 0.2mm) — never straddling the cut line (half the drilled hole inside the finished board, half outside), which is the traditional convention but leaves a semicircular nub of drilled hole on the finished edge after snapping. `RouteTab.center` itself stays on the true edge (it's what the solid-tab bridge visualization is measured from); only the HOLES get the outward pull, computed via `pullOutward()` in `plan-routing.ts` and shared by both the bbox loop and `planContourPcb`. Two PCBs facing across a shared gap get *two* hole rows, each pulled toward its own board's scrap side; that is correct, since each board needs its own perforation to snap flush.
+- ⚠ **Tab positions are always measured in one PANEL-GLOBAL direction** — left-to-right for horizontal edges (bottom AND top), bottom-to-top for vertical edges (left AND right) — never in `rectEdges`' own a→b perimeter-walk direction, which reverses for 'top' and 'left' (needed so the wrap-around stitching logic sees a continuous CCW walk). A symmetric auto-spaced tab set (`evenTabCenters`) survives that reversal by luck — an evenly-spaced-with-equal-margins set is symmetric under reflection — but a real customer file using a custom `tabPositionsMm` override hit exactly this: two facing PCBs across a panel gap measured "distance from edge start" from OPPOSITE ends, landing tabs at different absolute X (or Y) positions. With `mergeCoincidentPasses` sharing one pass down the gap centreline, each board's own pass then cut straight through its NEIGHBOUR's now-misaligned tab, silently destroying tabs on both sides with no error or warning. Fixed by mirroring the desired position (`edgeLen - d`) before it's used for the interrupt span or `boardEdgePoint`, for 'top' and 'left' specifically — the tab's displayed ID still uses the un-mirrored value, so labels are unaffected and the fix is byte-identical for the (overwhelmingly common) symmetric auto-spaced case.
+- **Routing needs `gap ≥ bitDiameter`.** `DEFAULT_PANEL_CONFIG.gapX/gapY` is 0.5mm, so every new panel starts in conflict for all three bit presets — the tab surfaces this as an `error` with a one-click fix that patches the gaps *and* rebuilds the panel (a patch that changes panel geometry invalidates `panelResult`).
+- **Rib margins are measured from `pcbPositions` + `panelWidth/Height`, never from `config.sideRib*`** — deriving them from the real layout keeps the routing engine correct regardless of how the grid origin is computed. (`computePanel` used to place PCBs from `sideRibTop` while the tooling-hole exclusion zone derived from `sideRibBottom`; that is now fixed — see "Panel Y origin" below — but measuring the layout is still the right habit.)
+- **`RoutingConfig` is a separate, deliberately FLAT store slice**, not new `PanelConfig` fields. `updateRoutingConfig` is a shallow merge; a nested object would need a manual re-spread in both it and `resetRoutingConfig`, which is exactly the `PanelConfig.drillFormat` trap. Keeping it out of `PanelConfig` also gives the existing panel export zero regression surface.
+- ⚠ **A stale routing plan is cleared, never kept.** Tool paths are panel-absolute, so a `.rou` carrying a *previous* panel's coordinates is a real fabrication-scrap risk. `computePanelResult`, `resetPanelConfig`, `clearLayers`, `setTargetUnit`, `rotateAllLayers` and `alignDrillLayersToBoard` all null out `routingResult`; changing routing config only marks `routingStale` (the panel then prompts to regenerate — it never auto-recomputes).
+- **Route files own their own aperture namespace** because each is written as its own file, so the `findMaxDCode` collision dance that overlay features inside customer layers require does not apply here. Unlike `generatePanelOutlineGerber` (which hardcodes 3.4mm to byte-match a CAM350 sample) the route Gerber respects `OutputFormat`.
+- **Mouse-bite holes default to their own `_MouseBites.drl`**, which keeps the CAM350-verified `_Drill.drl`/`_PINN.drl` output byte-identical; folding them into the main drill is an opt-in checkbox.
+- Non-rectangular outlines route the **real traced board profile** by default (`pcbOutlineMode: 'auto'`) — see "Contour routing" below. Bounding-box routing is still available (explicit `'bbox'` mode) for the cases contour tracing can't handle, and still raises the `outline-not-rectangular` warning when it's what's actually going to run.
+- ⚠ **The `.rou` dialect is provisional** — there is no CAM350 rout export in the repo to diff against (only `Panel_border.gbr` and `pinn.drl`). It emits the standard Excellon-2 rout form and is labelled provisional in the README and UI.
+- The viewer's route swath deliberately **omits `vectorEffect="non-scaling-stroke"`** (unlike nearly everything else in `panelOverlayContent`) because its width *is* the physical material the cutter removes — a non-scaling stroke would make the preview lie about the cut.
+
+### Contour routing (non-rectangular boards) — conventions that must not drift
+
+Shaped boards (rounded corners, chamfers, curved edges, interior cutouts) are
+routed as their **real traced profile**, not a bounding box. Full design
+rationale and staging history: the "Contour routing for non-rectangular PCBs"
+plan referenced from `ROUTING_ROADMAP.md`.
+
+- **Three new files, one job each.** `src/lib/board-contour.ts` is the ONLY
+  code that ever reads a tracespace `BoardShape` — `boardShapeToContour`
+  (pure adapter) and `traceBoardContour` (async: parse + plot + adapt one
+  outline layer). `src/lib/routing/offset.ts` is the pure offset/tab engine
+  (`offsetClosedRing`, arc-length/tab placement) — zero tracespace or store
+  imports. `src/lib/routing/plan-routing.ts`'s contour branch
+  (`computeContourGeometry`/`planContourPcb`) is the orchestration layer that
+  turns the two into `RoutePath`/`RouteTab` objects, mirroring how the
+  pre-existing bbox loop sits on top of `geometry.ts`'s primitives.
+- **Orientation convention: outer ring CCW, hole rings CW, offset always to
+  the RIGHT of travel.** This is uniformly outward for the board's outer
+  boundary and inward for interior cutouts with no sign flag threaded through
+  the code — verified against a CW unit square before relying on it (see
+  `offset.ts`'s own header). The join-type rule (round join vs. analytic
+  miter) falls out of the SAME turn-sign test regardless of which ring type
+  it's applied to; it's a local fact about the vertex relative to the offset
+  direction, not "convex on a CCW ring" — that phrasing in earlier notes was
+  calibrated for the outer-boundary case only.
+- ⚠ **`pcbOutlineMode` is `'auto'` by default** (contour, EXCEPT when the
+  outline is already a plain rectangle, where bbox produces identical output
+  for less work — `resolveOutlineMode` in `plan-routing.ts`). This was
+  deliberately flipped from `'bbox'` only after the whole pipeline was built
+  and verified end to end; a shaped board routed under the old default would
+  have been silently over-cut.
+- ⚠ **A contour trace failure is a blocking error, never a silent fallback to
+  bbox.** The bbox is *known-wrong* for a shaped board — offering it under an
+  error banner would invite downloading scrap toolpaths anyway. Same for an
+  offset that collapses, an ambiguous nesting classification, or a panel with
+  more than one depth-0 outer boundary (the file describes several boards,
+  not one PCB) — every one of these emits ZERO per-PCB paths plus an `error`
+  issue rather than a plausible-but-wrong path.
+- **Cutouts are emitted before the outer profile**, per PCB — interior
+  features must be milled while the board is still fully supported by the
+  panel. Just array order (`planContourPcb`), but it directly determines
+  `.rou`/G-code sequence.
+- **Trace once, offset once, tab once — in the outline file's own space.**
+  `planRouting`'s contour branch computes `ContourGeometry` a single time,
+  then only TRANSLATES it per panel position (`dx = pos.x -
+  outlineBoundsMm.minX`, ditto Y). ⚠ That datum is `RoutingPlanContext.outlineBoundsMm`
+  — the outline layer's own (arc-blind) `GerberLayer.bounds`, the SAME
+  convention `gerber-exporter.ts`'s `globalBaseOffset` uses — NOT
+  `BoardContour.boundsMm` (arc-accurate). The two differ by the arc bulge;
+  using the wrong one puts the route out of register with the copper/mask
+  artwork by that amount.
+- **`generateRouting` is async and traces its own contour** (`store.ts`) —
+  never reads `BoardView.boardContour` (fire-and-forget, can resolve out of
+  order, skipped by `computePanelResult`). It aborts with NO state change if
+  `layers`/`panelResult` moved on during the trace (reference-identity
+  staleness guard — every mutating store action replaces those refs
+  wholesale, so this check is exact, not heuristic).
+- **`findOutlineBoundsLayer` (`store.ts`) is the one place "the outline
+  layer" is found**, used by `computePanelResult`, `generateRouting`, and
+  `generateGcodeFilesAction` — before this was extracted, `computePanelResult`
+  required `.visible` and `generateRouting` didn't, so a hidden outline layer
+  could silently drive routing math while being excluded from panel sizing.
+- **Tabs spread evenly by arc length around the whole closed contour** — the
+  bbox path's `tabTop/Bottom/Left/Right` edge toggles don't apply and are
+  hidden in contour mode; `tabsPerContour` replaces `tabsPerEdge`. A
+  **curvature guard** (`findSafeTabCenter` in `offset.ts`) rejects placing a
+  tab across more than ~20° of accumulated turning (a corner or a tight arc),
+  nudging up to one `pathGap` before giving up and skipping that tab —
+  `contour-tabs-skipped` reports how many.
+- `dedupeCoincidentSegments` (`geometry.ts`) is a **spatial hash**, not the
+  original O(n²) scan — contour mode's segment counts (tens of thousands on a
+  large panel) made the naive version impractical. Verified
+  element-for-element identical output via a randomized harness before
+  replacing it; see the function's own header for the 3×3-neighbourhood
+  provable-superset argument.
+- ⚠ **Contour mode still doesn't merge coincident PASSES between adjacent
+  PCBs** (each board's outline is routed fully independently — redundant
+  double-cutting on a shared line, not unsafe by itself), **but it DOES
+  guard against coincident-pass TAB destruction**, which is a real
+  fabrication defect, not just inefficiency. At `gap == bit`, two facing
+  PCBs' offset boundaries land on the exact same physical line — and unlike
+  bbox mode's rectangle tabs (aligned across facing edges by the
+  edge-direction-canonicalisation fix below), contour tabs are placed by
+  whole-perimeter arc length with no per-edge concept to keep them aligned
+  between two DIFFERENT PCB instances. Without a check, a neighbour's own
+  uninterrupted pass — having no reason to know about a tab it doesn't own —
+  would cut straight through it. The per-PCB loop in `planRouting`'s contour
+  branch pre-computes every instance's tab centres, then for each PCB checks
+  every OTHER instance's tabs against its OWN boundary via
+  `nearestArcLengthOnRing`; a match within a bit-radius contributes an
+  `extraSilentDs` interrupt — same silencing as an owned tab, but with no
+  `RouteTab` emitted (the owning PCB already has that one). Confirmed by a
+  differential test: disabling this check on the real WIFI V6 fixture across
+  a dozen grid/tab-count combinations produced 111 real cross-PCB
+  tab-destruction cases; with it enabled, zero. `ContourGeometry.cutSpans`
+  had to move out of the once-computed shared geometry into `planContourPcb`
+  itself (it now depends on a PER-INSTANCE thing — its neighbours) — the
+  file-space `outerPts`/`outerTable`/`tabPositions`/`cutouts` stay
+  computed once, only the final cut spans are per instance.
+
+### G-code (LinuxCNC) — conventions that must not drift
+
+`src/lib/routing/gcode.ts` turns a `RoutingResult` plus the panel's own imported
+drill holes into G-code, confirmed against 7 real production files from the
+user's actual LinuxCNC machine (one cutting/routing program, six drilling
+programs at different tool diameters). Unlike the Gerber/Excellon emitters,
+there's exactly **one** real dialect in evidence, so this file is deliberately
+concrete rather than a pluggable multi-dialect abstraction — extract a
+`GcodeDialect` seam only once a second real machine shows up to generalize
+from. Full rationale: `ROUTING_ROADMAP.md` §3.
+
+- **One cutting program per router-bit diameter, one drilling program per distinct hole diameter** — mouse-bite holes and the panel's own imported drill hits that share a diameter are combined into the same file. This matches the shop's own workflow: LinuxCNC's manual tool change means separate programs per bit, not mid-file `T`-code changes.
+- ⚠ **`generateRouteGcode` and `generateDrillGcode` use two deliberately DIFFERENT templates** — the real sample files' own two post-processor paths disagree on where `G21` sits, whether the dwell is repeated, and even trailing whitespace. Don't unify them into one shared template; that would mean guessing which convention is "correct" when the shop's own tooling doesn't agree with itself.
+- **Sequencing needs no tab-specific logic** — a `RoutePath` boundary already IS a retract (the routing planner only splits a path at a tab or a dedup boundary), and a point-to-point move *within* a path is already a continuous cut. This was confirmed by diffing the real cutting file's retract count against its own corner-vs-tab layout.
+- **`DRILL_FEED_TABLE_MM_PER_MIN` (`gcode.ts`) is looked up per tool diameter by default** (`GcodeContext.autoFeedByDiameter`, default true) — `resolveDrillFeedMmPerMin` piecewise-LINEARLY interpolates between seven REAL (diameter, feed) pairs read directly from the shop's own drilling files, clamping to the nearest endpoint outside that range rather than extrapolating. This reverses an earlier, more conservative decision to use one uniform `drillFeedMmPerMin` for every diameter — that was the right call with only six data points and no visible shape to them; a seventh real point (2.15mm) later made the step-down shape (2000 down to 500 mm/min, smaller bits faster) clear enough to encode directly. Still not a fitted formula — piecewise-linear interpolation between real measurements is an honest encoding of the vendor's own data, not invented "smart" science, and `drillFeedMmPerMin` remains available as the flat rate when `autoFeedByDiameter` is turned off.
+- Coordinates are always **explicit-decimal** (no zero suppression at all) — this dialect has none of the LZ/TZ inversion bug class Excellon output has to guard against.
+- `generateGcodeFilesAction` (store.ts) collects the panel's own drill holes via `collectPanelizedDrillHoles` (`gerber-exporter.ts`, extracted from the existing panelized-drill export loop) and folds them together with `collectMouseBiteHoles(routingResult)` before diameter-grouping — G-code drills both mouse bites AND the customer's real holes, not just one or the other.
+- ⚠ **Stale G-code is cleared, never kept**, same discipline as `routingResult`: `gcodeFiles` is nulled out everywhere `routingResult` is (every panel/layer-mutating store action, plus regenerating routing itself) — a `.NC` program carrying a previous plan's coordinates is a fabrication-scrap risk exactly like a stale `.rou`.
+- G-code needs no viewer overlay of its own — it's a text serialization of the same `routingResult.paths` geometry the Routing tab's `route-overlay` group already renders.
+
 ### UI layout (Panelization tool)
 
-Collapsible resizable sidebar (280–600px) + full-height SVG canvas. Four sidebar tabs — **Layers**, **Panel Config**, **DFM Check**, **Info & Export** — controlled by `activeTab` in the store. Panel computation is only triggered by explicit user action (clicking "Create Panel"), not automatically on layer add or config change; the DFM check follows the same convention ("Run check").
+Collapsible resizable sidebar (280–600px) + full-height SVG canvas. Six sidebar tabs — **Layers**, **Panel Config**, **Routing**, **G-Code**, **DFM Check**, **Info & Export** — controlled by `activeTab` in the store, typed as `CamTab` (extract/extend that union rather than re-spelling it inline; it used to be declared twice and could drift). Which tabs show the whole *panel* rather than the single PCB is `PANEL_VIEW_TABS` / `isPanelViewTab()` in `store.ts` — `gerber-viewer.tsx` gates five separate things on it (bounds, the overlay memo, both `<use>`-repeat render paths, the status readout) and they must all agree, so never re-spell it as an `||` chain at a call site. Panel computation is only triggered by explicit user action (clicking "Create Panel"), not automatically on layer add or config change; the DFM check ("Run check"), routing ("Generate Routing"), and G-code ("Generate G-Code") all follow the same convention.

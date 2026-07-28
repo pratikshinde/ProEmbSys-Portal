@@ -23,6 +23,8 @@ export default function ExportPanel() {
   const updateOutputFormat = useAppStore(s => s.updateOutputFormat)
   const resetOutputFormat = useAppStore(s => s.resetOutputFormat)
   const computePanelResult = useAppStore(s => s.computePanelResult)
+  // Route files ride along in the full panel export when a plan exists.
+  const routingResult = useAppStore(s => s.routingResult)
   const [exporting, setExporting] = React.useState(false)
 
   const handleExport = async () => {
@@ -39,7 +41,7 @@ export default function ExportPanel() {
         side: l.side,
       }))
 
-      await exportPanelizedGerbers(layerFiles, panelResult, panelConfig, panelInfo, outputFormat)
+      await exportPanelizedGerbers(layerFiles, panelResult, panelConfig, panelInfo, outputFormat, routingResult)
     } catch (err) {
       console.error('Export failed:', err)
       alert('Export failed. Check console for details.')

@@ -21,6 +21,20 @@ export const BOARD_COLOR_PALETTE: Record<BoardColorName, { substrate: string; co
   White:  { substrate: '#d8d8d0', copperTint: '#b8b8ae', swatch: '#e8e6df' },
 }
 
+// Bare, soldermask-free FR4 laminate exposed by a genuine soldermask opening
+// that has NO copper anywhere beneath it — as opposed to `substrate` above,
+// which approximates the board's general background field (everywhere with
+// no copper, soldermask-covered or not, used as a flat fallback). Real,
+// large mask-only openings do occur (e.g. a keepout/relief area under a big
+// inductor with no copper pour underneath) and are otherwise invisible in the
+// composited Board view: `getMaskClipPairs`'s gold-reveal technique only ever
+// shows copper *through* a mask opening, so an opening with zero underlying
+// copper reveals nothing and reads as empty background — even though it's
+// real, deliberate Gerber content. This color is constant across every
+// soldermask choice: removing solder mask exposes the same raw fiberglass
+// laminate no matter what color mask the rest of the board uses.
+export const EXPOSED_SUBSTRATE_COLOR = '#c2a878'
+
 // PCB-realistic layer colors for board-mode compositing, shared by the CAM tool's
 // Board view (gerber-viewer.tsx) and the PCB Order page's read-only preview
 // (board-preview.tsx) so the two never drift apart. Colors that don't depend on

@@ -11,6 +11,8 @@ import * as Comlink from 'comlink'
 import type { GerberWorkerApi } from '@/workers/gerber-worker'
 import { normalizeGerberMacroPrimitives, scalePlotTreeToMm, scaleBoardShapeToMm } from './gerber-preprocess'
 import type { CopperSpacingResult } from './dfm/types'
+import { boardShapeCoversContent, boardShapeToContour } from './board-contour'
+import type { BoardContour } from './routing/types'
 
 export interface GerberSvgResult {
   /** SVG fragment string — to be embedded in a parent SVG */
@@ -156,6 +158,14 @@ export interface BoardView {
   shapePathD: string | null
   /** Multiply shapePathD coordinates by this to get mm (25.4 for inch files). */
   shapeScale: number
+  /**
+   * Traced board profile, ADVISORY ONLY — a viewer preview, never a
+   * fabrication source. `rebuildBoardView()` is fire-and-forget from several
+   * call sites and can resolve out of order or be skipped entirely (see
+   * `computePanelResult`), so the routing engine re-traces its own contour
+   * at generate time via `traceBoardContour` instead of reading this field.
+   */
+  boardContour: BoardContour | null
   error?: string
 }
 
@@ -173,6 +183,7 @@ export async function gerberRenderBoardView(
     viewBox: { x: 0, y: 0, width: 0, height: 0 },
     shapePathD: null,
     shapeScale: 1,
+    boardContour: null,
   }
 
   if (!files || files.length === 0) return { ...empty, error: 'No files' }
@@ -305,7 +316,8 @@ export async function gerberRenderBoardView(
       const size: number[] = bs.size ?? []
       const shapeW = size[2] - size[0]
       const shapeH = size[3] - size[1]
-      const covers = contentW > 0 && contentH > 0 && shapeW >= 0.5 * contentW && shapeH >= 0.5 * contentH
+      const unionBoundsMm = { minX: uMinX, minY: uMinY, maxX: uMaxX, maxY: uMaxY }
+      const covers = boardShapeCoversContent(bs.size, unionBoundsMm)
       if (typeof pathD === 'string' && pathD.length > 0 && covers) {
         shapePathD = pathD
         useTrustedShape = true
@@ -334,7 +346,17 @@ export async function gerberRenderBoardView(
       ;[x, y, width, height] = viewBoxStr.split(/\s+/).map(Number)
     }
 
-    return { topFragment, bottomFragment, viewBox: { x, y, width, height }, shapePathD, shapeScale }
+    // Advisory-only preview contour (see BoardView.boardContour's own doc
+    // comment for why the routing engine never reads this field back).
+    const outlineFile = boardFiles.find(f => f.type === 'outline')
+    const boardContour: BoardContour = boardShapeToContour(bs, {
+      toleranceMm: 0.01,
+      unionBoundsMm: contentW > 0 && contentH > 0 ? { minX: uMinX, minY: uMinY, maxX: uMaxX, maxY: uMaxY } : null,
+      sourceFileName: outlineFile?.filename ?? null,
+      outlineWasInches,
+    })
+
+    return { topFragment, bottomFragment, viewBox: { x, y, width, height }, shapePathD, shapeScale, boardContour }
   } catch (err) {
     console.error('[BoardView] Outer pipeline failed with error:', err)
     const message = err instanceof Error ? err.message : String(err)

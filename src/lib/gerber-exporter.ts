@@ -12,7 +12,6 @@ import {
   PanelInfo,
   OutputFormat,
   DEFAULT_OUTPUT_FORMAT,
-  DrillFormatConfig,
   autoDetectIntegerDigits,
   generatePanelOutlineGerber,
   generatePanelizedGerber,
@@ -22,9 +21,15 @@ import {
   formatCoordinate,
   formatDrillCoordinate,
   generateDrillFormatHeader,
+  resolveExportDrillFormat,
+  emitExcellonToolBlock,
   BaseOffset,
   isRectangularOutline,
 } from './panelization-engine'
+import { collectMouseBiteHoles, type RoutingResult } from './routing/types'
+import { generateRouteGerber } from './routing/emit-gerber'
+import { generateRoutFile, generateMouseBiteDrill } from './routing/emit-excellon'
+import type { GcodeFile } from './routing/gcode'
 
 export interface LayerFile {
   name: string
@@ -88,9 +93,15 @@ export async function exportPanelizedGerbers(
   panel: PanelResult,
   config: PanelConfig,
   info?: PanelInfo,
-  outputFormat?: OutputFormat
+  outputFormat?: OutputFormat,
+  /** Router tool paths, when the Routing tab has generated a plan. Optional so
+   *  every existing caller is unaffected. */
+  routing?: RoutingResult | null
 ): Promise<void> {
-  const fmt: OutputFormat = outputFormat || DEFAULT_OUTPUT_FORMAT
+  // Clone: the auto-upgrade below writes fmt.integerDigits, and callers pass
+  // the store's outputFormat object straight in — mutating it would compound
+  // across exports.
+  const fmt: OutputFormat = { ...(outputFormat || DEFAULT_OUTPUT_FORMAT) }
 
   // Auto-fix output format: ensure integer digits are sufficient for panel dimensions.
   // If not, silently upgrade to prevent coordinate truncation (which would cause
@@ -143,14 +154,19 @@ export async function exportPanelizedGerbers(
   const outlineGerber = generatePanelOutlineGerber(panel, { ...config, panelBorderWidth: 0.1 }, fmt)
   folder.file(`${partNumber}_Panel_Border.gerber`, outlineGerber)
 
-
+  // Routing (router tool paths + mouse bites), when a plan has been generated
+  writeRouteFiles(folder, partNumber, routing, config, panel, fmt)
 
   // Generate panelized drill file with user-selected drill format
   // Always generate drill file when there are drill layers OR tooling/reference holes are enabled
   const drillLayers = layers.filter(l => l.type === 'drill')
   if (drillLayers.length > 0 || config.enableToolingHoles) {
     // Pass the Gerber output unit so drill format auto-syncs to prevent CAM350 scale mismatch
-    const drillContent = generatePanelizedDrill(drillLayers, panel, config, globalBaseOffset, fmt.unit)
+    // Mouse bites are folded in only when the user asked for it; by default they
+    // go to their own file so this output stays byte-identical to before.
+    const extraHoles =
+      routing && routing.config.mouseBiteInMainDrill ? collectMouseBiteHoles(routing) : undefined
+    const drillContent = generatePanelizedDrill(drillLayers, panel, config, globalBaseOffset, fmt.unit, extraHoles)
     folder.file(`${partNumber}_Drill.drl`, drillContent)
   }
 
@@ -188,12 +204,192 @@ export async function exportPanelizedGerbers(
   }
 
   // Add README
-  const readme = generateReadme(panel, config, info, layers, fmt)
+  const readme = generateReadme(panel, config, info, layers, fmt, routing)
   folder.file('README.txt', readme)
 
   // Generate and download ZIP
   const blob = await zip.generateAsync({ type: 'blob' })
   saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_Panel.zip`)
+}
+
+/**
+ * Write the routing outputs into an existing ZIP folder.
+ *
+ * Shared by the full panel export and the route-only export so the two can
+ * never produce different route files for the same plan.
+ */
+function writeRouteFiles(
+  folder: JSZip,
+  partNumber: string,
+  routing: RoutingResult | null | undefined,
+  config: PanelConfig,
+  panel: PanelResult,
+  fmt: OutputFormat
+): void {
+  if (!routing || routing.paths.length === 0) return
+
+  folder.file(`${partNumber}_Route.gerber`, generateRouteGerber(routing, fmt))
+  folder.file(`${partNumber}_Route.rou`, generateRoutFile(routing, config.drillFormat, panel, fmt.unit))
+
+  // Own file unless the user folded the bites into the main drill program.
+  if (!routing.config.mouseBiteInMainDrill) {
+    const bites = generateMouseBiteDrill(routing, config.drillFormat, panel, fmt.unit)
+    if (bites) folder.file(`${partNumber}_MouseBites.drl`, bites)
+  }
+}
+
+/**
+ * Route-only ZIP, for iterating on bit size from the Routing tab without
+ * re-zipping a dozen panelized layers each time.
+ */
+export async function exportRoutingFiles(
+  routing: RoutingResult,
+  config: PanelConfig,
+  panel: PanelResult,
+  info?: PanelInfo,
+  outputFormat?: OutputFormat
+): Promise<void> {
+  const fmt: OutputFormat = { ...(outputFormat || DEFAULT_OUTPUT_FORMAT) }
+
+  const neededDigits = autoDetectIntegerDigits(panel.panelWidth, panel.panelHeight, fmt.unit)
+  if (fmt.integerDigits < neededDigits) fmt.integerDigits = neededDigits
+
+  const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
+  const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
+  const version = sanitizeForFilename(info?.revision, 'v1')
+  const dateStr = sanitizeForFilename(info?.date, new Date().toISOString().slice(0, 10))
+
+  const zip = new JSZip()
+  const folder = zip.folder('routing')
+  if (!folder) throw new Error('Failed to create ZIP folder')
+
+  writeRouteFiles(folder, partNumber, routing, config, panel, fmt)
+  folder.file('README.txt', generateRoutingReadme(routing, fmt))
+
+  const blob = await zip.generateAsync({ type: 'blob' })
+  saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_Route.zip`)
+}
+
+/**
+ * G-code-only ZIP, for downloading the generated LinuxCNC programs without
+ * re-zipping the Gerber/route files each time.
+ */
+export async function exportGcodeFiles(
+  gcodeFiles: GcodeFile[],
+  info?: PanelInfo
+): Promise<void> {
+  const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
+  const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
+  const version = sanitizeForFilename(info?.revision, 'v1')
+  const dateStr = sanitizeForFilename(info?.date, new Date().toISOString().slice(0, 10))
+
+  const zip = new JSZip()
+  const folder = zip.folder('gcode')
+  if (!folder) throw new Error('Failed to create ZIP folder')
+
+  for (const f of gcodeFiles) folder.file(f.filename, f.content)
+
+  const lines: string[] = []
+  lines.push('=== G-Code Files ===')
+  lines.push('')
+  lines.push(`Generated: ${new Date().toISOString()}`)
+  lines.push('Dialect: LinuxCNC (RS274NGC, named parameters, M64/M65 P0 pressure pad)')
+  lines.push('')
+  lines.push('One cutting program per router-bit diameter, one drilling program per distinct')
+  lines.push('hole diameter (mouse bites and imported drill hits sharing a diameter are combined).')
+  lines.push('LinuxCNC\'s manual tool change means separate programs per bit rather than')
+  lines.push('mid-file T-code changes.')
+  lines.push('')
+  lines.push('--- Files ---')
+  for (const f of gcodeFiles) lines.push(f.filename)
+  folder.file('README.txt', lines.join('\n'))
+
+  const blob = await zip.generateAsync({ type: 'blob' })
+  saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_GCode.zip`)
+}
+
+/**
+ * The routing section of a README. Shared by both exports.
+ *
+ * The tool-center sentence is load-bearing: a fab opening the route layer has no
+ * way to tell a centerline path from a board-edge path, and guessing wrong
+ * mis-sizes every board by the bit diameter.
+ */
+function routingReadmeLines(routing: RoutingResult): string[] {
+  const c = routing.config
+  const holeCount = routing.tabs.reduce((n, t) => n + t.holes.length, 0)
+  const scopes = [
+    c.routePanelOutline ? 'panel outline' : null,
+    c.routeIndividualPcbs ? 'individual PCBs' : null,
+  ].filter(Boolean).join(' + ') || 'none'
+
+  const isContour = routing.pcbOutlineMode === 'contour'
+  const cutoutCount = routing.paths.filter(p => p.role === 'pcb-cutout').length
+
+  const lines: string[] = []
+  lines.push('--- Routing ---')
+  lines.push(`Router bit: ${c.bitDiameterMm} mm`)
+  lines.push(`Scope: ${scopes}`)
+  lines.push(`PCB outline: ${isContour ? 'traced board contour' : 'bounding box'}`)
+  lines.push(`Passes: ${routing.paths.length}`)
+  lines.push(`Total cut length: ${routing.totalPathLengthMm.toFixed(1)} mm`)
+  if (c.routeIndividualPcbs) {
+    lines.push(`Tab style: ${c.tabStyle}`)
+    if (c.tabStyle !== 'none') {
+      lines.push(`Tab width (uncut bridge): ${c.tabWidthMm} mm`)
+      if (isContour) {
+        lines.push(`Tabs around contour: ${c.tabsPerContour}   Total tabs: ${routing.tabs.length}`)
+      } else {
+        lines.push(`Tabs per edge: ${c.tabsPerEdge}   Total tabs: ${routing.tabs.length}`)
+      }
+      lines.push(`Path gap per tab: ${(c.tabWidthMm + c.bitDiameterMm).toFixed(3)} mm (tab width + bit diameter)`)
+    }
+    if (c.tabStyle === 'mousebite') {
+      lines.push(`Mouse bites: ${holeCount} holes, ${c.mouseBiteHoleDiameterMm} mm dia at ${c.mouseBiteHolePitchMm} mm pitch`)
+      lines.push(`Mouse-bite hole row is offset ${c.mouseBiteEdgeClearanceMm} mm outward from the true board edge (clear of the finished PCB, not straddling the cut line)`)
+      lines.push(`Mouse-bite holes location: ${c.mouseBiteInMainDrill ? 'folded into the main drill file' : 'separate _MouseBites.drl'}`)
+    }
+    if (isContour) {
+      lines.push(`Interior cutouts: ${c.routeInteriorCutouts ? `${cutoutCount} routed, cut BEFORE the outer profile on each PCB` : 'not routed'}`)
+    } else {
+      lines.push(`Shared-gap passes merged: ${c.mergeCoincidentPasses ? 'yes' : 'no'}`)
+    }
+  }
+  lines.push('')
+  lines.push('IMPORTANT: Route paths are TOOL-CENTER coordinates, offset outward from the')
+  lines.push(`finished board edge by the bit radius (${(c.bitDiameterMm / 2).toFixed(4)} mm). Do not apply`)
+  lines.push('cutter compensation again.')
+  if (isContour) {
+    lines.push('')
+    lines.push(`PCB outline paths are FLATTENED POLYLINES (no arcs), chord tolerance ${c.contourToleranceMm} mm —`)
+    lines.push('traced from the outline layer and offset by the bit radius. Interior cutouts')
+    lines.push('are included in this package and are cut before the outer profile on each PCB,')
+    lines.push('since the board must still be fully supported by the panel while interior')
+    lines.push('features are milled.')
+  }
+  lines.push('')
+  lines.push('NOTE: the .rou dialect is provisional — it has not yet been verified against a')
+  lines.push('CAM350 rout export. Please confirm it against your router before production use.')
+  return lines
+}
+
+function generateRoutingReadme(routing: RoutingResult, fmt: OutputFormat): string {
+  const lines: string[] = []
+  lines.push('=== Routing Files ===')
+  lines.push('')
+  lines.push(`Generated: ${new Date().toISOString()}`)
+  lines.push(`Panel: ${routing.panelWidthMm.toFixed(1)} x ${routing.panelHeightMm.toFixed(1)} mm`)
+  lines.push(`Gerber format: ${fmt.integerDigits}.${fmt.decimalDigits} ${fmt.unit === 'mm' ? 'metric' : 'imperial'}`)
+  lines.push('')
+  lines.push(...routingReadmeLines(routing))
+  lines.push('')
+  lines.push('--- Files ---')
+  lines.push('*_Route.gerber   Router tool paths as a Gerber layer (documentation / CAM interchange)')
+  lines.push('*_Route.rou      Excellon-format rout program with tool definitions')
+  if (!routing.config.mouseBiteInMainDrill && routing.tabs.some(t => t.holes.length > 0)) {
+    lines.push('*_MouseBites.drl Break-away perforation holes (NPTH)')
+  }
+  return lines.join('\n')
 }
 
 
@@ -203,7 +399,8 @@ function generateReadme(
   config: PanelConfig,
   info?: PanelInfo,
   layers?: LayerFile[],
-  fmt?: OutputFormat
+  fmt?: OutputFormat,
+  routing?: RoutingResult | null
 ): string {
   const format = fmt || DEFAULT_OUTPUT_FORMAT
   const lines: string[] = []
@@ -228,7 +425,7 @@ function generateReadme(
   lines.push(`X Gap: ${config.gapX} mm`)
   lines.push(`Y Gap: ${config.gapY} mm`)
   lines.push(`Side Ribs: T=${config.sideRibTop} B=${config.sideRibBottom} L=${config.sideRibLeft} R=${config.sideRibRight} mm`)
-  lines.push(`L-Shape Cuts: N/A`)
+  lines.push(`L-Shape Marks: ${config.enableLShapeMarks ? `Enabled (arm ${config.lShapeArmLength}mm, width ${config.lShapeLineWidth}mm)` : 'Disabled'}`)
   lines.push(`Tooling Holes: ${config.enableToolingHoles ? `Enabled (${config.toolingHoleDiameter}mm)` : 'Disabled'}`)
   lines.push(`Reference Holes: ${config.enableToolingHoles ? `Enabled (${config.referenceHoleDiameter}mm)` : 'Disabled'}`)
   lines.push(`Fiducials: ${config.enableFiducials ? `Enabled (⌀ Copper: ${config.fiducialDiameter}mm, ⌀ Mask: ${config.fiducialClearance}mm, Top: ${config.fiducialsTop !== false ? 'Yes' : 'No'}, Bottom: ${config.fiducialsBottom !== false ? 'Yes' : 'No'})` : 'Disabled'}`)
@@ -238,6 +435,11 @@ function generateReadme(
   lines.push(`Units: ${config.drillFormat.unit === 'mm' ? 'Metric (mm)' : 'English (inches)'}`)
   lines.push(`Zero Suppression: ${config.drillFormat.zeroSuppression === 'none' ? 'None (fixed-width)' : config.drillFormat.zeroSuppression === 'leading' ? 'Leading Zero (LZ)' : 'Trailing Zero (TZ)'}`)
   lines.push('')
+
+  if (routing && routing.paths.length > 0) {
+    lines.push(...routingReadmeLines(routing))
+    lines.push('')
+  }
 
   if (info) {
     lines.push('--- PCB Information ---')
@@ -256,6 +458,13 @@ function generateReadme(
     const hasDrills = layers.some(l => l.type === 'drill')
     if (hasDrills) {
       lines.push(`${partNumber}_Drill.drl - Panelized drill file (Excellon)`)
+    }
+    if (routing && routing.paths.length > 0) {
+      lines.push(`${partNumber}_Route.gerber - Router tool paths as a Gerber layer`)
+      lines.push(`${partNumber}_Route.rou - Excellon-format rout program (provisional dialect)`)
+      if (!routing.config.mouseBiteInMainDrill && routing.tabs.some(t => t.holes.length > 0)) {
+        lines.push(`${partNumber}_MouseBites.drl - Break-away perforation holes (NPTH)`)
+      }
     }
     for (const layer of layers) {
       const descriptiveName = generateDescriptiveLayerName(layer)
@@ -299,29 +508,7 @@ function generatePINNDrill(
   config: PanelConfig,
   gerberUnit?: 'mm' | 'inches'
 ): string {
-  // Clone drill format so we can auto-fix integer digits if needed
-  const drillFmt: DrillFormatConfig = { ...config.drillFormat }
-
-  // CRITICAL: Sync drill unit with the Gerber output unit.
-  // CAM350 may display Gerber and drill at different scales if units differ.
-  if (gerberUnit && drillFmt.unit !== gerberUnit) {
-    const prevUnit = drillFmt.unit
-    drillFmt.unit = gerberUnit
-    // When switching from inches to mm, increase decimal digits for adequate resolution
-    if (prevUnit === 'inches' && gerberUnit === 'mm') {
-      if (drillFmt.decimalDigits < 3) drillFmt.decimalDigits = 3
-    }
-    console.warn(`[PINN Export] Auto-synced drill unit from ${prevUnit} to ${gerberUnit} to match Gerber output`)
-  }
-
-  // Auto-fix drill format: ensure integer digits are sufficient for panel dimensions.
-  const maxCoord = Math.max(panel.panelWidth, panel.panelHeight)
-  const maxCoordInUnit = drillFmt.unit === 'mm' ? maxCoord : maxCoord / 25.4
-  const neededIntDigits = maxCoordInUnit <= 0 ? 3 : Math.floor(Math.log10(maxCoordInUnit)) + 2
-  if (drillFmt.integerDigits < neededIntDigits) {
-    drillFmt.integerDigits = Math.min(neededIntDigits, 6)
-    console.warn(`[PINN Export] Auto-upgraded drill format to ${drillFmt.integerDigits}:${drillFmt.decimalDigits}`)
-  }
+  const drillFmt = resolveExportDrillFormat(config.drillFormat, panel, gerberUnit, 'PINN Export')
 
   const lines: string[] = []
 
@@ -349,28 +536,7 @@ function generatePINNDrill(
   // Sort by diameter
   toolDiameters.sort((a, b) => a - b)
 
-  // Tool definitions — T01C<diameter>F<feed>B<break>S<speed>H<peck>
-  // CAM350 includes F/B/S/H parameters in tool definitions.
-  // We use standard placeholder values that CAM350 recognizes:
-  //   F = feed rate, B = board break, S = spindle speed, H = peck height
-  const toolParams = drillFmt.unit === 'mm' ? 'F42B423S6H2000' : 'F100B1000S6H2000'
-  for (let i = 0; i < toolDiameters.length; i++) {
-    const tCode = (i + 1).toString().padStart(2, '0')
-    let dia: number
-    if (drillFmt.unit === 'mm') {
-      dia = toolDiameters[i]
-    } else {
-      dia = toolDiameters[i] / 25.4
-    }
-    lines.push(`T${tCode}C${dia.toFixed(drillFmt.decimalDigits)}${toolParams}`)
-  }
-
-  // DETECT,ON and ATC,ON — required by CAM350, placed before %
-  lines.push('DETECT,ON')
-  lines.push('ATC,ON')
-
-  // End of header
-  lines.push('%')
+  lines.push(...emitExcellonToolBlock(toolDiameters, drillFmt))
 
   // Helper to get T-code for a diameter
   function getTCode(dia: number): string {
@@ -411,31 +577,13 @@ function generatePanelizedDrill(
   panel: PanelResult,
   config: PanelConfig,
   globalBaseOffset?: BaseOffset,
-  gerberUnit?: 'mm' | 'inches'
+  gerberUnit?: 'mm' | 'inches',
+  /** Mouse-bite perforations, only when the user opted to fold them in here
+   *  rather than into their own file. Omitted by default, so this function's
+   *  output stays byte-identical to before routing existed. */
+  mouseBiteHoles?: { x: number; y: number; diameter: number }[]
 ): string {
-  // Clone drill format so we can auto-fix integer digits if needed
-  const drillFmt: DrillFormatConfig = { ...config.drillFormat }
-
-  // CRITICAL: Sync drill unit with the Gerber output unit.
-  // CAM350 may display Gerber and drill at different scales if units differ.
-  if (gerberUnit && drillFmt.unit !== gerberUnit) {
-    const prevUnit = drillFmt.unit
-    drillFmt.unit = gerberUnit
-    // When switching from inches to mm, increase decimal digits for adequate resolution
-    if (prevUnit === 'inches' && gerberUnit === 'mm') {
-      if (drillFmt.decimalDigits < 3) drillFmt.decimalDigits = 3
-    }
-    console.warn(`[Export] Auto-synced drill unit from ${prevUnit} to ${gerberUnit} to match Gerber output`)
-  }
-
-  // Auto-fix drill format: ensure integer digits are sufficient for panel dimensions.
-  const maxCoord = Math.max(panel.panelWidth, panel.panelHeight)
-  const maxCoordInUnit = drillFmt.unit === 'mm' ? maxCoord : maxCoord / 25.4
-  const neededIntDigits = maxCoordInUnit <= 0 ? 3 : Math.floor(Math.log10(maxCoordInUnit)) + 2
-  if (drillFmt.integerDigits < neededIntDigits) {
-    drillFmt.integerDigits = Math.min(neededIntDigits, 6)
-    console.warn(`[Export] Auto-upgraded drill format to ${drillFmt.integerDigits}:${drillFmt.decimalDigits}`)
-  }
+  const drillFmt = resolveExportDrillFormat(config.drillFormat, panel, gerberUnit, 'Export')
 
   const lines: string[] = []
 
@@ -470,31 +618,20 @@ function generatePanelizedDrill(
     }
   }
 
+  // Mouse-bite diameters, only when the user folded them into this program
+  if (mouseBiteHoles) {
+    for (const h of mouseBiteHoles) {
+      if (h.diameter > 0 && !seenDiameters.has(h.diameter)) {
+        seenDiameters.add(h.diameter)
+        toolDiameters.push(h.diameter)
+      }
+    }
+  }
+
   // Sort by diameter
   toolDiameters.sort((a, b) => a - b)
 
-  // Tool definitions — T01C<diameter>F<feed>B<break>S<speed>H<peck>
-  // CAM350 includes F/B/S/H parameters in tool definitions.
-  // We use standard placeholder values that CAM350 recognizes:
-  //   F = feed rate, B = board break, S = spindle speed, H = peck height
-  const toolParams = drillFmt.unit === 'mm' ? 'F42B423S6H2000' : 'F100B1000S6H2000'
-  for (let i = 0; i < toolDiameters.length; i++) {
-    const tCode = (i + 1).toString().padStart(2, '0')
-    let dia: number
-    if (drillFmt.unit === 'mm') {
-      dia = toolDiameters[i]
-    } else {
-      dia = toolDiameters[i] / 25.4
-    }
-    lines.push(`T${tCode}C${dia.toFixed(drillFmt.decimalDigits)}${toolParams}`)
-  }
-
-  // DETECT,ON and ATC,ON — required by CAM350, placed before %
-  lines.push('DETECT,ON')
-  lines.push('ATC,ON')
-
-  // End of header
-  lines.push('%')
+  lines.push(...emitExcellonToolBlock(toolDiameters, drillFmt))
 
   // Helper to get T-code for a diameter
   function getTCode(dia: number): string {
@@ -552,10 +689,69 @@ function generatePanelizedDrill(
     }
   }
 
+  // Mouse-bite perforations, grouped by diameter (coordinates already
+  // panel-absolute, so they need no per-position offsetting)
+  if (mouseBiteHoles && mouseBiteHoles.length > 0) {
+    const bitesByDia = new Map<number, typeof mouseBiteHoles>()
+    for (const h of mouseBiteHoles) {
+      if (!bitesByDia.has(h.diameter)) bitesByDia.set(h.diameter, [])
+      bitesByDia.get(h.diameter)!.push(h)
+    }
+    for (const [dia, holes] of bitesByDia) {
+      lines.push(getTCode(dia))
+      for (const h of holes) {
+        lines.push(`X${fmtCoord(h.x)}Y${fmtCoord(h.y)}`)
+      }
+    }
+  }
+
   // End program — M30 only, no G05 (matching CAM350 reference)
   lines.push('M30')
 
   return lines.join('\n')
+}
+
+/**
+ * Panelized drill hole positions grouped by diameter, in panel-absolute mm.
+ *
+ * Extracted from the per-diameter loop inside `generatePanelizedDrill` so the
+ * G-code layer (`routing/gcode.ts`) can drill the customer's own imported
+ * holes — not just mouse bites — without duplicating the flash-command walk
+ * or the panel-position repeat logic.
+ */
+export function collectPanelizedDrillHoles(
+  drillLayers: LayerFile[],
+  panel: PanelResult,
+  globalBaseOffset?: BaseOffset
+): { diameterMm: number; holes: { x: number; y: number }[] }[] {
+  const byDia = new Map<number, { x: number; y: number }[]>()
+
+  for (const dl of drillLayers) {
+    if (!dl.parsedLayer) continue
+    const boX = globalBaseOffset ? globalBaseOffset.x : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minX : 0)
+    const boY = globalBaseOffset ? globalBaseOffset.y : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minY : 0)
+
+    for (const cmd of dl.parsedLayer.commands) {
+      if (cmd.type !== 'flash' || cmd.apertureCode === null || !cmd.coordinate) continue
+      const apt = dl.parsedLayer.apertures.get(cmd.apertureCode)
+      if (!apt) continue
+      const dia = extractDrillDiameter(apt)
+      if (dia <= 0) continue
+
+      if (!byDia.has(dia)) byDia.set(dia, [])
+      const holes = byDia.get(dia)!
+      for (const pos of panel.pcbPositions) {
+        holes.push({
+          x: (cmd.coordinate.x || 0) + pos.x + boX,
+          y: (cmd.coordinate.y || 0) + pos.y + boY,
+        })
+      }
+    }
+  }
+
+  return [...byDia.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([diameterMm, holes]) => ({ diameterMm, holes }))
 }
 
 /**

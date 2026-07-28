@@ -282,6 +282,89 @@ export function generateDrillFormatHeader(drillFmt: DrillFormatConfig): string[]
   return lines
 }
 
+/**
+ * Resolve the drill format actually used for an export: a clone of the
+ * configured format, with the unit synced to the Gerber output unit and the
+ * integer digits widened if the panel is large enough to overflow them.
+ *
+ * Returns a **clone** — never mutates `config.drillFormat`, which is live store
+ * state.
+ *
+ * @param label Prefix for the console warnings, so each caller's log messages
+ *   stay distinguishable (e.g. 'Export' vs 'PINN Export').
+ */
+export function resolveExportDrillFormat(
+  drillFormat: DrillFormatConfig,
+  panel: PanelResult,
+  gerberUnit: 'mm' | 'inches' | undefined,
+  label: string
+): DrillFormatConfig {
+  const drillFmt: DrillFormatConfig = { ...drillFormat }
+
+  // CRITICAL: Sync drill unit with the Gerber output unit.
+  // CAM350 may display Gerber and drill at different scales if units differ.
+  if (gerberUnit && drillFmt.unit !== gerberUnit) {
+    const prevUnit = drillFmt.unit
+    drillFmt.unit = gerberUnit
+    // When switching from inches to mm, increase decimal digits for adequate resolution
+    if (prevUnit === 'inches' && gerberUnit === 'mm') {
+      if (drillFmt.decimalDigits < 3) drillFmt.decimalDigits = 3
+    }
+    console.warn(`[${label}] Auto-synced drill unit from ${prevUnit} to ${gerberUnit} to match Gerber output`)
+  }
+
+  // Auto-fix drill format: ensure integer digits are sufficient for panel dimensions.
+  const maxCoord = Math.max(panel.panelWidth, panel.panelHeight)
+  const maxCoordInUnit = drillFmt.unit === 'mm' ? maxCoord : maxCoord / 25.4
+  const neededIntDigits = maxCoordInUnit <= 0 ? 3 : Math.floor(Math.log10(maxCoordInUnit)) + 2
+  if (drillFmt.integerDigits < neededIntDigits) {
+    drillFmt.integerDigits = Math.min(neededIntDigits, 6)
+    console.warn(`[${label}] Auto-upgraded drill format to ${drillFmt.integerDigits}:${drillFmt.decimalDigits}`)
+  }
+
+  return drillFmt
+}
+
+/**
+ * Emit the Excellon tool-definition block that closes a drill header:
+ * one `T<nn>C<dia><params>` line per tool, then DETECT,ON / ATC,ON / %.
+ *
+ * `toolDiametersMm` must already be sorted and de-duplicated — the index of
+ * each entry is its T-code, so callers resolve a diameter back to a T-code by
+ * position in the same array.
+ */
+export function emitExcellonToolBlock(
+  toolDiametersMm: number[],
+  drillFmt: DrillFormatConfig
+): string[] {
+  const lines: string[] = []
+
+  // Tool definitions — T01C<diameter>F<feed>B<break>S<speed>H<peck>
+  // CAM350 includes F/B/S/H parameters in tool definitions.
+  // We use standard placeholder values that CAM350 recognizes:
+  //   F = feed rate, B = board break, S = spindle speed, H = peck height
+  const toolParams = drillFmt.unit === 'mm' ? 'F42B423S6H2000' : 'F100B1000S6H2000'
+  for (let i = 0; i < toolDiametersMm.length; i++) {
+    const tCode = (i + 1).toString().padStart(2, '0')
+    let dia: number
+    if (drillFmt.unit === 'mm') {
+      dia = toolDiametersMm[i]
+    } else {
+      dia = toolDiametersMm[i] / 25.4
+    }
+    lines.push(`T${tCode}C${dia.toFixed(drillFmt.decimalDigits)}${toolParams}`)
+  }
+
+  // DETECT,ON and ATC,ON — required by CAM350, placed before %
+  lines.push('DETECT,ON')
+  lines.push('ATC,ON')
+
+  // End of header
+  lines.push('%')
+
+  return lines
+}
+
 // ============================================================================
 // Aperture Definition Extraction
 // ============================================================================
@@ -570,13 +653,28 @@ export function computePanel(
   const panelWidth = config.sideRibLeft + gridWidth + config.sideRibRight
   const panelHeight = config.sideRibTop + gridHeight + config.sideRibBottom
 
-  // PCB positions
+  // PCB positions.
+  //
+  // Y is up with the origin at the panel's bottom-left (CAM350 first quadrant),
+  // so the grid starts at `sideRibBottom` — NOT `sideRibTop`, which is what this
+  // used to say. With the default symmetric 5/5 ribs the two are equal and the
+  // difference is invisible, but with asymmetric ribs the whole grid was offset
+  // vertically by (sideRibTop − sideRibBottom): the tooling-hole exclusion zone
+  // below (and its duplicate in the fiducial block) correctly derives from
+  // `sideRibBottom`, so it no longer described where the PCBs actually were and
+  // holes were placed on top of boards. Measured on a 2×2 panel with T=20/B=5:
+  // five tooling/reference holes landed at Y=77 with the PCBs spanning 20..82.
+  //
+  // Every other consumer in this file already treats Y this way — the hole
+  // placement (top rib at `panelHeight − sideRibTop/2`, bottom rib at
+  // `sideRibBottom/2`), both grid-exclusion computations, the fiducial
+  // fallbacks, and both rib-text generators. This line was the sole outlier.
   const pcbPositions: PanelResult['pcbPositions'] = []
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       pcbPositions.push({
         x: config.sideRibLeft + c * (pcbWidth + gapX),
-        y: config.sideRibTop + r * (pcbHeight + gapY),
+        y: config.sideRibBottom + r * (pcbHeight + gapY),
         row: r,
         col: c,
       })

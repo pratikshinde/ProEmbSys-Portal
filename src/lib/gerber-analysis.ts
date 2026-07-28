@@ -43,13 +43,19 @@ export function detectLayerType(fileName: string): LayerType {
   if (baseName === 'PASTETOP' || baseName === 'PASTEBOT') return 'paste'
   if (baseName === 'DRILLDRAWING') return 'fab'
 
-  // Standard KiCad/Altium naming
+  // Standard KiCad/Altium naming. MASK/SILK also match their common CAM
+  // abbreviations MSK/SLK (e.g. PentaLogix ViewMaster's "_MSK-TOP.art" /
+  // "_SLK-BOT.art") — without this, a TOP/BOT-plus-abbreviation filename with
+  // no TF.FileFunction attribute (ViewMaster emits none) fell through to the
+  // bare TOP/BOT copper catch-all below, so mask and silk layers rendered as
+  // copper (wrong color/opacity, and the mask/copper clip-pairing in
+  // board-colors.ts silently degraded to its flat-paint fallback).
   if (upper.includes('GTL') || (upper.includes('TOP') && upper.includes('COPPER')) || upper.endsWith('.GTL')) return 'copper'
   if (upper.includes('GBL') || (upper.includes('BOT') && upper.includes('COPPER')) || upper.endsWith('.GBL')) return 'copper'
-  if (upper.includes('GTS') || (upper.includes('TOP') && upper.includes('MASK')) || upper.endsWith('.GTS') || upper.includes('SMB') || upper.includes('SMT')) return 'mask'
-  if (upper.includes('GBS') || (upper.includes('BOT') && upper.includes('MASK')) || upper.endsWith('.GBS')) return 'mask'
-  if (upper.includes('GTO') || (upper.includes('TOP') && upper.includes('SILK')) || upper.endsWith('.GTO') || upper.includes('SST') || upper.includes('SSB')) return 'silk'
-  if (upper.includes('GBO') || (upper.includes('BOT') && upper.includes('SILK')) || upper.endsWith('.GBO')) return 'silk'
+  if (upper.includes('GTS') || (upper.includes('TOP') && (upper.includes('MASK') || upper.includes('MSK'))) || upper.endsWith('.GTS') || upper.includes('SMB') || upper.includes('SMT')) return 'mask'
+  if (upper.includes('GBS') || (upper.includes('BOT') && (upper.includes('MASK') || upper.includes('MSK'))) || upper.endsWith('.GBS')) return 'mask'
+  if (upper.includes('GTO') || (upper.includes('TOP') && (upper.includes('SILK') || upper.includes('SLK'))) || upper.endsWith('.GTO') || upper.includes('SST') || upper.includes('SSB')) return 'silk'
+  if (upper.includes('GBO') || (upper.includes('BOT') && (upper.includes('SILK') || upper.includes('SLK'))) || upper.endsWith('.GBO')) return 'silk'
   if (upper.includes('GKO') || upper.includes('OUTLINE') || upper.includes('BOARD') || upper.endsWith('.GKO') || upper.includes('EDGE') || upper.includes('PROFILE') || upper.includes('CONTOUR') || upper.includes('DIMENSION') || upper === 'MILL' || upper === 'MILLING' || upper === 'ROUTE' || upper.endsWith('.GM1') || upper.endsWith('.GML') || baseName === 'GM1' || baseName === 'GML') return 'outline'
   if (upper.includes('GTP') || upper.includes('GBP') || upper.includes('PASTE')) return 'paste'
 

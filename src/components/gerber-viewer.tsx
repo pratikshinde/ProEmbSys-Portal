@@ -1,11 +1,11 @@
 'use client'
 
 import React, { useRef, useEffect, useLayoutEffect, useCallback, useState, useMemo } from 'react'
-import { useAppStore, getLayerZIndex } from '@/lib/store'
+import { useAppStore, getLayerZIndex, isPanelViewTab } from '@/lib/store'
 import { mergeLayerBounds, GerberSvgResult } from '@/lib/gerber-svg'
 import { PanelResult, isRectangularOutline } from '@/lib/panelization-engine'
 import { getRegionTextPolygons } from '@/lib/region-font'
-import { BOARD_COLOR_NAMES, BOARD_COLOR_PALETTE, getPcbColor, PCB_OPACITY, silkColorFor, getMaskClipPairs } from '@/lib/board-colors'
+import { BOARD_COLOR_NAMES, BOARD_COLOR_PALETTE, EXPOSED_SUBSTRATE_COLOR, getPcbColor, PCB_OPACITY, silkColorFor, getMaskClipPairs } from '@/lib/board-colors'
 import { RawSvgGroup, RawSvgMask } from './raw-svg-group'
 
 /**
@@ -58,6 +58,9 @@ export default function GerberViewer() {
   const setBoardColor = useAppStore(s => s.setBoardColor)
   const dfmReport = useAppStore(s => s.dfmReport)
   const dfmFocus = useAppStore(s => s.dfmFocus)
+  const routingResult = useAppStore(s => s.routingResult)
+  const routingFocus = useAppStore(s => s.routingFocus)
+  const boardContour = useAppStore(s => s.boardContour)
 
   const [viewState, setViewState] = useState<ViewState>({ viewBox: '0 0 200 200', zoom: 1 })
   const [cursorPos, setCursorPos] = useState<{ gx: number; gy: number } | null>(null)
@@ -108,8 +111,8 @@ export default function GerberViewer() {
       native = svgLayers.length > 0 ? mergeLayerBounds(svgLayers.map(l => l.svgData!)) : null
     }
 
-    // On Panel tab, use panel dimensions for bounds (Y-inverted to match SVG space)
-    const combined = ((activeTab === 'panel' || activeTab === 'export') && panelResult)
+    // On panel-view tabs, use panel dimensions for bounds (Y-inverted to match SVG space)
+    const combined = (isPanelViewTab(activeTab) && panelResult)
       ? { minX: 0, minY: -panelResult.panelHeight, maxX: panelResult.panelWidth, maxY: 0 }
       : native
 
@@ -155,17 +158,18 @@ export default function GerberViewer() {
     })
   }, [combinedBounds, containerSize])
 
-  // Pan/zoom to a DFM finding when the panel sets a focus point.
-  // dfmFocus is in Gerber-native Y-up mm; this viewer's space is Y-down, so
+  // Pan/zoom to a DFM finding or a routing tab when a panel sets a focus point.
+  // Both sources are in Gerber-native Y-up mm; this viewer's space is Y-down, so
   // the Y must be negated (screenY = −gerberY) — the same conversion the
-  // cursor readout does in reverse. The marker itself renders inside a group
-  // that mirrors X around boundsCenterX when viewing the bottom side in Board
-  // mode (see the dfm-markers <g> below); this pan-to-marker effect must apply
-  // the identical mirror to cx, or it centers the viewport on the unmirrored
-  // location while the marker renders at its mirrored one — landing the "zoom
-  // to violation" window on empty space instead of the actual marker.
+  // cursor readout does in reverse. The markers themselves render inside groups
+  // that mirror X around boundsCenterX when viewing the bottom side in Board
+  // mode (see the dfm-markers / route-overlay <g>s below); this pan-to-marker
+  // effect must apply the identical mirror to cx, or it centers the viewport on
+  // the unmirrored location while the marker renders at its mirrored one —
+  // landing the "zoom to it" window on empty space instead of the marker.
+  const focusPoint = dfmFocus ?? routingFocus
   useEffect(() => {
-    if (!dfmFocus) return
+    if (!focusPoint) return
     const { w, h } = containerSize
     if (w <= 0 || h <= 0) return
     // Zoom to a fixed 6mm-wide window so a clearance violation is actually
@@ -175,13 +179,13 @@ export default function GerberViewer() {
     const vbW = w / scale
     const vbH = h / scale
     const isBottomBoardView = viewMode === 'board' && boardViewSide === 'bottom' && !!combinedBounds
-    const cx = isBottomBoardView ? 2 * boundsCenterX - dfmFocus.x : dfmFocus.x
-    const cy = -dfmFocus.y
+    const cx = isBottomBoardView ? 2 * boundsCenterX - focusPoint.x : focusPoint.x
+    const cy = -focusPoint.y
     setViewState({
       viewBox: `${cx - vbW / 2} ${cy - vbH / 2} ${vbW} ${vbH}`,
       zoom: scale,
     })
-  }, [dfmFocus, containerSize, viewMode, boardViewSide, combinedBounds, boundsCenterX])
+  }, [focusPoint, containerSize, viewMode, boardViewSide, combinedBounds, boundsCenterX])
 
   // Auto-fit when layers change
   useEffect(() => {
@@ -439,7 +443,7 @@ export default function GerberViewer() {
 
   // Panel overlay — only shown on the Panel Config tab
   const panelOverlayContent = useMemo(() => {
-    if (!panelResult || (activeTab !== 'panel' && activeTab !== 'export')) return null
+    if (!panelResult || !isPanelViewTab(activeTab)) return null
 
     const pr = panelResult
     const pc = panelConfig
@@ -452,18 +456,50 @@ export default function GerberViewer() {
     const elements: React.ReactNode[] = []
 
     const isMirrored = viewMode === 'board' && boardViewSide === 'bottom'
+
+    // Per-PCB outline preview: draw the real traced contour instead of the
+    // rectangle when a contour-mode routing plan exists. `boardContour` is
+    // only populated by generateRouting() (a Routing-tab action, and only
+    // when outline mode resolves to 'contour'), so before that's ever run —
+    // or on a plain-rectangle board where 'auto'/'bbox' correctly stays a
+    // rectangle — this falls back to the same dashed rect as before.
+    const contourOuter =
+      routingResult?.pcbOutlineMode === 'contour' && boardContour && !boardContour.failureReason
+        ? boardContour.rings.find(r => r.depth === 0 && !r.isHole)
+        : null
+    // Same translation datum convention as the exporter and planContourPcb:
+    // the outline layer's own (arc-blind) bounds, not boardContour.boundsMm.
+    const outlineDatum = contourOuter
+      ? layers.find(l => l.type === 'outline' && l.visible && l.parsedLayer?.bounds)?.parsedLayer.bounds
+      : null
+
     // PCB positions (Y-inverted to match Gerber SVG coordinate system)
     for (const pos of pr.pcbPositions) {
       const screenY = -pos.y
       const screenYBottom = -(pos.y + pr.pcbHeight)
       const tx = pos.x + pr.pcbWidth / 2
       const textY = (screenY + screenYBottom) / 2
-      elements.push(
-        <rect key={`pcb-${pos.row}-${pos.col}`}
-          x={pos.x} y={screenYBottom} width={pr.pcbWidth} height={pr.pcbHeight}
-          fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth={0.1}
-          strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />
-      )
+
+      if (contourOuter && outlineDatum) {
+        const dx = pos.x - outlineDatum.minX
+        const dy = pos.y - outlineDatum.minY
+        const pointsAttr = contourOuter.points
+          .map(p => `${(p.x + dx).toFixed(4)},${(-(p.y + dy)).toFixed(4)}`)
+          .join(' ')
+        elements.push(
+          <polygon key={`pcb-${pos.row}-${pos.col}`}
+            points={pointsAttr}
+            fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth={0.1}
+            strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />
+        )
+      } else {
+        elements.push(
+          <rect key={`pcb-${pos.row}-${pos.col}`}
+            x={pos.x} y={screenYBottom} width={pr.pcbWidth} height={pr.pcbHeight}
+            fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth={0.1}
+            strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />
+        )
+      }
 
       const labelText = (
         <text key={`pcb-label-${pos.row}-${pos.col}`}
@@ -704,7 +740,88 @@ export default function GerberViewer() {
     )
 
     return elements
-  }, [panelResult, panelConfig, activeTab, visibleLayerTypes, layers])
+  }, [panelResult, panelConfig, activeTab, visibleLayerTypes, layers, routingResult, boardContour])
+
+  // Route overlay — router tool paths, tabs and mouse bites.
+  //
+  // Deliberately separate from panelOverlayContent: it is gated on
+  // routingResult (an explicit user action) rather than on panelResult + tab, so
+  // a generated plan stays visible while you look at other tabs.
+  //
+  // Y is negated throughout (screenY = −gerberY); the planner works in Gerber
+  // Y-up mm and this viewer's space is Y-down.
+  const routeOverlayContent = useMemo(() => {
+    if (!routingResult || routingResult.paths.length === 0) return null
+
+    const elements: React.ReactNode[] = []
+    const bit = routingResult.config.bitDiameterMm
+
+    // Build each path's `d` string ONCE, then draw it twice below (swath
+    // underlay + centerline overlay) — this used to recompute the identical
+    // .map().join() separately in each of the two loops, doubling the work
+    // for no reason (harmless at bbox-mode path counts, but contour mode's
+    // much larger point counts per path make it worth not doing twice).
+    // Still two SEPARATE render loops, not merged into one: SVG paints in
+    // document order, and pushing "ALL swaths, then ALL centerlines" (rather
+    // than interleaving swath/centerline per path) is what guarantees every
+    // centerline draws on top of every swath, including a NEIGHBOURING
+    // path's — merging the loops would let one path's wide translucent swath
+    // paint over an earlier path's thin centerline wherever they overlap.
+    const pathDs = routingResult.paths
+      .filter(path => path.points.length >= 2)
+      .map(path => ({
+        path,
+        d: path.points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(4)} ${(-p.y).toFixed(4)}`).join(''),
+      }))
+
+    // The cut swath, drawn at the REAL bit width. Note the deliberate absence
+    // of vectorEffect="non-scaling-stroke" here — unlike almost everything in
+    // panelOverlayContent, this stroke must scale with zoom, because its width
+    // *is* the physical material the cutter removes. A non-scaling stroke
+    // would make the preview lie about how much copper the router eats.
+    for (const { path, d } of pathDs) {
+      elements.push(
+        <path key={`swath-${path.id}`}
+          d={d} fill="none" stroke="rgba(255,120,0,0.28)" strokeWidth={bit}
+          strokeLinecap="round" strokeLinejoin="round" />
+      )
+    }
+
+    // Tool-center centerlines on top, thin and zoom-independent so the actual
+    // programmed path stays legible at any magnification.
+    for (const { path, d } of pathDs) {
+      elements.push(
+        <path key={`center-${path.id}`}
+          d={d} fill="none" stroke="rgba(255,160,60,0.95)" strokeWidth={0.12}
+          strokeDasharray="0.8 0.4" vectorEffect="non-scaling-stroke" />
+      )
+    }
+
+    // Tabs: the uncut material bridge, drawn along the board edge.
+    for (const tab of routingResult.tabs) {
+      const half = tab.widthMm / 2
+      const x1 = tab.center.x - tab.dir.x * half
+      const y1 = tab.center.y - tab.dir.y * half
+      const x2 = tab.center.x + tab.dir.x * half
+      const y2 = tab.center.y + tab.dir.y * half
+      elements.push(
+        <line key={`tab-${tab.id}`}
+          x1={x1} y1={-y1} x2={x2} y2={-y2}
+          stroke="rgba(80,255,140,0.9)" strokeWidth={0.35}
+          strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+      )
+      for (const [hi, h] of tab.holes.entries()) {
+        elements.push(
+          <circle key={`bite-${tab.id}-${hi}`}
+            cx={h.x} cy={-h.y} r={tab.holeDiameterMm / 2}
+            fill="rgba(10,20,35,0.85)" stroke="rgba(80,255,140,0.9)" strokeWidth={0.05}
+            vectorEffect="non-scaling-stroke" />
+        )
+      }
+    }
+
+    return elements
+  }, [routingResult])
 
   // Crosshair
   const crosshairContent = useMemo(() => {
@@ -802,7 +919,7 @@ export default function GerberViewer() {
               </g>
             ) : rawBgRect
 
-            if ((activeTab === 'panel' || activeTab === 'export') && panelResult && nativeSvgBounds) {
+            if (isPanelViewTab(activeTab) && panelResult && nativeSvgBounds) {
               const pr = panelResult
               const refBounds = nativeSvgBounds
               const maskClipPairs = getMaskClipPairs(bLayers)
@@ -848,13 +965,25 @@ export default function GerberViewer() {
                             const clipPair = maskClipByMaskId.get(layer.id)
                             if (clipPair) {
                               return (
-                                <use
-                                  key={layer.id}
-                                  href={`#layer-def-${clipPair.copperLayerId}`}
-                                  data-layer={layer.id}
-                                  mask={`url(#mask-mask-${layer.id})`}
-                                  style={{ color: getBoardLayerColor('mask', layer.side), opacity: PCB_OPACITY.copper ?? 1 }}
-                                />
+                                <React.Fragment key={layer.id}>
+                                  {/* Exposed bare FR4 under the mask opening —
+                                      see the single-PCB board view below for
+                                      why this is needed. */}
+                                  {bounds && (
+                                    <rect
+                                      x={bounds.minX} y={bounds.minY}
+                                      width={bounds.maxX - bounds.minX} height={bounds.maxY - bounds.minY}
+                                      mask={`url(#mask-mask-${layer.id})`}
+                                      fill={EXPOSED_SUBSTRATE_COLOR}
+                                    />
+                                  )}
+                                  <use
+                                    href={`#layer-def-${clipPair.copperLayerId}`}
+                                    data-layer={layer.id}
+                                    mask={`url(#mask-mask-${layer.id})`}
+                                    style={{ color: getBoardLayerColor('mask', layer.side), opacity: PCB_OPACITY.copper ?? 1 }}
+                                  />
+                                </React.Fragment>
                               )
                             }
                             return (
@@ -889,6 +1018,24 @@ export default function GerberViewer() {
                     return (
                       <React.Fragment key={layer.id}>
                         <RawSvgMask id={maskId} html={layer.svgData!.svgFragment} />
+                        {/* Exposed bare FR4, painted first and clipped to the
+                            mask opening — shows through wherever the opening
+                            has NO copper to reveal (the gold copy below
+                            paints over it opaque wherever copper does exist).
+                            Without this, a mask-only opening (e.g. a keepout
+                            relief with no copper pour beneath it) is fully
+                            invisible: the gold-reveal technique below only
+                            ever shows copper *through* the mask, never the
+                            mask's own real geometry. */}
+                        {bounds && (
+                          <g mask={`url(#${maskId})`}>
+                            <rect
+                              x={bounds.minX} y={bounds.minY}
+                              width={bounds.maxX - bounds.minX} height={bounds.maxY - bounds.minY}
+                              fill={EXPOSED_SUBSTRATE_COLOR}
+                            />
+                          </g>
+                        )}
                         <g mask={`url(#${maskId})`}>
                           <RawSvgGroup
                             data-layer={layer.id}
@@ -910,7 +1057,7 @@ export default function GerberViewer() {
                 })}
               </>
             )
-          })() : (activeTab === 'panel' || activeTab === 'export') && panelResult && nativeSvgBounds ? (() => {
+          })() : isPanelViewTab(activeTab) && panelResult && nativeSvgBounds ? (() => {
             // Per-layer overlay — fallback when board view is unavailable.
             const outlineLayer = visibleLayers.find(l => l.type === 'outline' && l.svgData?.boundsObj)
             const refBounds = (outlineLayer?.svgData?.boundsObj) || nativeSvgBounds
@@ -990,6 +1137,26 @@ export default function GerberViewer() {
           </g>
         )}
 
+        {/* Route overlay — router tool paths, tabs, mouse bites. Carries the
+            SAME bottom-side mirror as the panel overlay above: a route is a
+            physical cut, so it must not disagree with the panel it cuts when
+            viewed from the bottom.
+
+            ANIMATION SEAM: the deferred CNC tooling animation belongs inside
+            this group — it needs only routingResult.paths plus a cumulative
+            per-segment length table to interpolate a moving cutter marker.
+            Nothing else here has to change for it. */}
+        {routeOverlayContent && (
+          <g
+            data-layer="route-overlay"
+            transform={viewMode === 'board' && boardViewSide === 'bottom' && combinedBounds
+              ? `translate(${boundsCenterX}, 0) scale(-1, 1) translate(${-boundsCenterX}, 0)`
+              : undefined}
+          >
+            {routeOverlayContent}
+          </g>
+        )}
+
         {/* DFM finding markers. Locations arrive in Gerber-native Y-up mm, so
             Y is negated into this viewer's Y-down space. The bottom-side mirror
             is applied here too, matching the panel overlay above — without it a
@@ -1041,7 +1208,7 @@ export default function GerberViewer() {
           </span>
         )}
         <span>Zoom: {viewState.zoom.toFixed(1)}x</span>
-        {(activeTab === 'panel' || activeTab === 'export') && panelResult && (
+        {isPanelViewTab(activeTab) && panelResult && (
           <span className="text-[#0ea5e9]">
             Panel: {panelResult.panelWidth.toFixed(1)}×{panelResult.panelHeight.toFixed(1)} mm | {panelResult.totalPCBs} PCBs
           </span>
