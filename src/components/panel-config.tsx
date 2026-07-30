@@ -12,6 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Grid3x3, Crosshair, LayoutGrid, Settings2, RotateCcw, FileDown, Wrench, Play } from 'lucide-react'
 import { DrillFormatPreset, DRILL_FORMAT_PRESETS } from '@/lib/panelization-engine'
+import PanelTemplatePicker from './panel-template-picker'
 
 export default function PanelConfigPanel() {
   const panelConfig = useAppStore(s => s.panelConfig)
@@ -27,6 +28,8 @@ export default function PanelConfigPanel() {
   const computePanelResult = useAppStore(s => s.computePanelResult)
 
   return (
+    <div className="space-y-4">
+    <PanelTemplatePicker />
     <Card className="border-[#1a3a5c] bg-[#0a1e38]/70">
       <CardHeader className="pb-3">
         <div className="flex items-center justify-between">
@@ -871,5 +874,6 @@ export default function PanelConfigPanel() {
         </Button>
       </CardContent>
     </Card>
+    </div>
   )
 }

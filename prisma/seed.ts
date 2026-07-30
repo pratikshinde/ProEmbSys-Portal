@@ -7,6 +7,7 @@
  */
 import { PrismaClient, PricingCategory, Prisma } from "@prisma/client"
 import { DEFAULT_DFM_RULES } from "../src/lib/dfm/types"
+import { DEFAULT_PANEL_TEMPLATE_SETTINGS } from "../src/lib/panel-template/types"
 
 const db = new PrismaClient()
 
@@ -14,6 +15,7 @@ const db = new PrismaClient()
  *  creating duplicates, and so it stays referentially stable for users who
  *  selected it. */
 const BASELINE_DFM_TEMPLATE_ID = "dfm-tpl-proembsys-standard"
+const BASELINE_PANEL_TEMPLATE_ID = "panel-tpl-proembsys-standard"
 
 type SeedRow = { category: PricingCategory; key: string; label: string; value: number; unit: string; sortOrder: number }
 
@@ -106,6 +108,29 @@ async function main() {
     },
   })
   console.log("Seeded the ProEmbSys Standard DFM template.")
+
+  // The SHARED baseline panelization template — the shop's own default
+  // rib/tooling/routing/G-code/array settings, all five sections built from
+  // each engine's own DEFAULT_* constant so this can never drift from what
+  // "no template selected" already behaves like. `isSystem` keeps it
+  // undeletable, matching the DFM baseline above.
+  await db.panelTemplate.upsert({
+    where: { id: BASELINE_PANEL_TEMPLATE_ID },
+    create: {
+      id: BASELINE_PANEL_TEMPLATE_ID,
+      scope: "SHARED",
+      name: "ProEmbSys Standard",
+      settings: DEFAULT_PANEL_TEMPLATE_SETTINGS as unknown as Prisma.InputJsonValue,
+      isDefault: true,
+      isSystem: true,
+    },
+    update: {
+      name: "ProEmbSys Standard",
+      settings: DEFAULT_PANEL_TEMPLATE_SETTINGS as unknown as Prisma.InputJsonValue,
+      isSystem: true,
+    },
+  })
+  console.log("Seeded the ProEmbSys Standard panelization template.")
 }
 
 main()

@@ -39,6 +39,7 @@ model User {
   blogPosts           BlogPost[]
   shopOrders          ShopOrder[]
   dfmTemplates        DfmTemplate[]
+  panelTemplates      PanelTemplate[]
 
   @@map("users")
 }
@@ -445,4 +446,49 @@ model DfmTemplate {
   @@index([userId])
   @@index([scope])
   @@map("dfm_templates")
+}
+
+// A separate enum from DfmTemplateScope even though the values are identical
+// today — sharing a Postgres enum would couple two unrelated features'
+// migrations, and this name matches the existing per-feature convention.
+enum PanelTemplateScope {
+  PRIVATE
+  SHARED
+}
+
+// The reusable "shop policy and machine facts" a customer re-enters on every
+// panelization job — rib widths, tooling/fiducial sizes, drill format, output
+// format, routing (bit/tabs/mouse-bites), G-code (feeds/depths/spindle), and
+// Multi-Panel Array CNC batch settings. Deliberately does NOT store panel
+// row/column/gap (the genuine per-job input) or xyOverrides (keyed to one
+// panel's own generated hole/fiducial ids) — see
+// src/lib/panel-template/types.ts's PanelSectionSettings.
+model PanelTemplate {
+  id     String             @id @default(cuid())
+  scope  PanelTemplateScope @default(PRIVATE)
+  userId String? // owner of a PRIVATE template; null for the seeded system one
+  name   String
+
+  // ResolvedPanelTemplateSettings, but every section/field OPTIONAL on the way
+  // in (src/lib/panel-template/types.ts) — a JSON blob for the same reason
+  // DfmTemplate.rules is one, except here EVERY field is optional from day
+  // one so a new config field never needs a migration or backfill. Always
+  // validated through parsePanelTemplateSettings()/…Safe() before use.
+  settings Json
+
+  // PRIVATE: the owner's default pick (unique per userId).
+  // SHARED:  the single global default used when a user has no preference.
+  isDefault Boolean @default(false)
+  // The seeded baseline — cannot be deleted, so there is always at least one
+  // selectable template.
+  isSystem  Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([scope])
+  @@map("panel_templates")
 }

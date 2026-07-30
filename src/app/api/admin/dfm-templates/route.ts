@@ -1,17 +1,12 @@
 import { NextResponse } from "next/server"
 import { Prisma } from "@prisma/client"
-import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
+import { requireStaff } from "@/lib/require-staff"
 import { parseDfmRules } from "@/lib/dfm/types"
 import { clearOtherDefaults, toDfmTemplateDto } from "@/lib/dfm/templates"
 
 /** Staff-only management of the SHARED template tier — the templates every
  *  user (and anonymous visitors) can select. Mirrors /api/admin/products. */
-async function requireStaff() {
-  const session = await auth()
-  if (!session?.user || (session.user.role !== "ADMIN" && session.user.role !== "ENGINEER")) return null
-  return session
-}
 
 export async function GET() {
   const session = await requireStaff()

@@ -28,6 +28,7 @@ import {
   type PanelArrayConfig,
   type PanelArrayResult,
 } from './panel-array'
+import type { PanelTemplateSection, ResolvedPanelTemplateSettings } from './panel-template/types'
 
 export type { LayerType, LayerSide }
 
@@ -217,6 +218,26 @@ interface AppState {
   panelArrayFiles: PanelArrayFiles | null
   generatePanelArrayFilesAction: () => void
   clearPanelArrayFiles: () => void
+
+  // Panelization templates (src/lib/panel-template/) — reusable "shop policy
+  // and machine facts" bundles across panelConfig/outputFormat/routingConfig/
+  // gcodeContext/panelArrayConfig. Deliberately does NOT include an
+  // "applied settings" cache: selecting a template in the picker is
+  // display-only (matches the DFM picker's non-destructive selection), and
+  // `applyPanelTemplate` is the ONLY thing that ever writes — never on mount,
+  // never on selection change. See CLAUDE.md for why this differs from the
+  // DFM template picker's auto-apply-on-select behavior.
+  panelTemplateId: string | null
+  setPanelTemplateId: (id: string | null) => void
+  /**
+   * Writes only the selected sections from a resolved template into their
+   * corresponding store slices, leaving every other slice — and always
+   * `rows`/`cols`/`gapX`/`gapY`/`xyOverrides` within `panel` — untouched.
+   * `panelResult` is deliberately never recomputed here ("nothing
+   * auto-computes"); the caller is responsible for prompting a re-run of
+   * Create Panel/Generate Routing/Generate G-Code as appropriate.
+   */
+  applyPanelTemplate: (settings: ResolvedPanelTemplateSettings, sections: PanelTemplateSection[]) => void
 
   // UI state
   activeTab: CamTab
@@ -1895,6 +1916,46 @@ export const useAppStore = create<AppState>((set, get) => ({
     })
   },
   clearPanelArrayFiles: () => set({ panelArrayResult: null, panelArrayFiles: null }),
+
+  // Panelization templates
+  panelTemplateId: null,
+  setPanelTemplateId: (id) => set({ panelTemplateId: id }),
+  applyPanelTemplate: (settings, sections) => {
+    set(state => {
+      const patch: Partial<AppState> = {}
+      if (sections.includes('panel')) {
+        // Grid layout (rows/cols/gapX/gapY) and xyOverrides are never part of
+        // a template's `panel` section — spreading over the CURRENT
+        // panelConfig (not a fresh default) is what preserves them.
+        patch.panelConfig = { ...state.panelConfig, ...settings.panel }
+        // A stale routing plan carrying the previous panel geometry is a
+        // real fabrication-scrap risk — same discipline as updatePanelConfig.
+        patch.routingStale = true
+        // No panelArrayStale flag exists (see panel-array.ts's own docs), so
+        // a stale batch-drill file has no banner warning behind it — must be
+        // cleared outright rather than merely flagged.
+        patch.panelArrayFiles = null
+      }
+      if (sections.includes('output')) {
+        patch.outputFormat = { ...settings.output }
+        patch.panelArrayFiles = null
+      }
+      if (sections.includes('routing')) {
+        patch.routingConfig = { ...settings.routing }
+        patch.routingStale = true
+      }
+      if (sections.includes('gcode')) {
+        patch.gcodeContext = { ...settings.gcode }
+        patch.gcodeFiles = null
+      }
+      if (sections.includes('array')) {
+        patch.panelArrayConfig = { ...settings.array }
+        patch.panelArrayResult = null
+        patch.panelArrayFiles = null
+      }
+      return patch
+    })
+  },
 
   // UI state
   activeTab: 'layers',
