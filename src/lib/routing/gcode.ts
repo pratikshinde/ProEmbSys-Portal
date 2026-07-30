@@ -66,6 +66,17 @@ export interface GcodeContext {
    * choice, and what changed.
    */
   autoFeedByDiameter: boolean
+  /**
+   * true (default): reorder each drilling program's holes (and, chained on
+   * from wherever the holes leave off, its slots) by greedy nearest-neighbor
+   * instead of emitting them in raw file/panel order — see
+   * `nearestNeighborOrder`'s own doc comment. Off preserves the exact
+   * pass-through order the caller built (raw Gerber/Excellon flash order,
+   * PCB-by-PCB across a panel) — useful for comparing against a real sample
+   * file byte-for-byte, or if a shop's own post-processor already optimizes
+   * travel itself.
+   */
+  optimizeDrillOrder: boolean
 }
 
 /**
@@ -135,6 +146,7 @@ export const DEFAULT_GCODE_CONTEXT: GcodeContext = {
   routeXYFeedMmPerMin: 600,
   drillFeedMmPerMin: 1200,
   autoFeedByDiameter: true,
+  optimizeDrillOrder: true,
 }
 
 function fmtCoord(v: number): string {
@@ -216,6 +228,56 @@ export function generateRouteGcode(
 }
 
 /**
+ * Greedy nearest-neighbor travel order: repeatedly picks whichever remaining
+ * item's entry point is closest to the current position, then moves the
+ * current position to that item's exit point (identical to entry for a plain
+ * point — a hole — but a slot's own end, since that's genuinely where the
+ * tool is after cutting it). Starts from `start`, the machine's assumed home
+ * position when a fresh program begins — (0,0), the same convention
+ * `generateRouteGcode`'s explicit `G00 X0Y0` uses.
+ *
+ * Deliberately greedy nearest-neighbor, not a real TSP solve — full TSP is
+ * NP-hard and pointless overkill for minimizing drill travel; nearest-
+ * neighbor is the same practical shortcut real CAM posts use, and it's what
+ * "drill in nearest-first order" means in shop-floor terms.
+ *
+ * O(n²): the simplest correct implementation. Drilling programs run to at
+ * most a few thousand holes per diameter even on a large panel (nowhere near
+ * the tens-of-thousands-of-primitives regime that forced the spatial hash in
+ * `routing/geometry.ts`'s `dedupeCoincidentSegments`), so this stays well
+ * under a second — no spatial index needed here.
+ */
+function nearestNeighborOrder<T>(
+  items: T[],
+  start: Pt,
+  entryPoint: (item: T) => Pt,
+  exitPoint: (item: T) => Pt = entryPoint
+): T[] {
+  const remaining = items.slice()
+  const ordered: T[] = []
+  let current = start
+  while (remaining.length > 0) {
+    let bestIdx = 0
+    let bestDistSq = Infinity
+    for (let i = 0; i < remaining.length; i++) {
+      const p = entryPoint(remaining[i])
+      const dx = p.x - current.x
+      const dy = p.y - current.y
+      const distSq = dx * dx + dy * dy
+      if (distSq < bestDistSq) {
+        bestDistSq = distSq
+        bestIdx = i
+      }
+    }
+    const chosen = remaining[bestIdx]
+    ordered.push(chosen)
+    current = exitPoint(chosen)
+    remaining.splice(bestIdx, 1)
+  }
+  return ordered
+}
+
+/**
  * G-code for one tool's worth of holes (one file per diameter, matching the
  * shop's own workflow — LinuxCNC's manual tool change means separate programs
  * per bit rather than mid-file T-code changes).
@@ -271,14 +333,26 @@ export function generateDrillGcode(
   lines.push(`G04P${ctx.dwellSeconds}`)
   lines.push(`G00 Z${ctx.safeZmm.toFixed(3)}`)
 
-  for (const h of holes) {
+  // Travel-optimized (nearest-first) order by default — see
+  // `nearestNeighborOrder`'s doc comment. Slots continue the chain from
+  // wherever the last hole (or the (0,0) start, if there were none) left the
+  // tool, since that's the machine's real position when slot-cutting begins.
+  const orderedHoles = ctx.optimizeDrillOrder
+    ? nearestNeighborOrder(holes, { x: 0, y: 0 }, p => p)
+    : holes
+  const cursorAfterHoles = orderedHoles.length > 0 ? orderedHoles[orderedHoles.length - 1] : { x: 0, y: 0 }
+  const orderedSlots = ctx.optimizeDrillOrder
+    ? nearestNeighborOrder(slots, cursorAfterHoles, s => s.start, s => s.end)
+    : slots
+
+  for (const h of orderedHoles) {
     lines.push(`G00 ${xy(h)}`)
     lines.push('G00 Z#<Z_Retract> ')
     lines.push('G01 Z#<Z_Depth> F#<Z_Feed> ')
     lines.push('G00 Z#<Z_Retract> ')
   }
 
-  for (const slot of slots) {
+  for (const slot of orderedSlots) {
     lines.push(`G00 ${xy(slot.start)}`)
     lines.push('G00 Z#<Z_Retract> ')
     lines.push('G01 Z#<Z_Depth> F#<Z_Feed> ')

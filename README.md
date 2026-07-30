@@ -18,6 +18,10 @@ Actively developed. Core ordering flow, backend, and panelization tool are funct
 
 Reverse-chronological. Each entry is a real commit — see `git log` for full diffs.
 
+### 2026-07-31 — Nearest-first drill travel optimization for G-code
+- Drilling programs previously visited holes in whatever order they happened to arrive in — raw file order within one board, then board-by-board across a panel — with no regard for how far the bit had to travel between them. G-Code generation now defaults to reordering each program's holes (and any slots) by greedy nearest-neighbor travel, toggleable back to the old raw order (e.g. to diff against a real sample file, or if a shop's own post-processor already optimizes travel).
+- Verified headless: on a random 40-hole scatter, optimized travel came out ~70% shorter than raw order, with no holes lost or duplicated and the "off" toggle reproducing the exact original order byte-for-byte; a 4000-hole stress case sorted in ~40ms.
+
 ### 2026-07-31 — Save/load panelization templates
 - New **Panelization Template** picker at the top of the Panel Config tab: saves the ~60 rib/tooling/routing/G-code/CNC-batch-array settings a shop reuses across jobs as a named, reusable bundle — private per user, or published shared by staff (mirrors the existing DFM template system's private/shared/publicly-readable pattern, including a seeded undeletable "ProEmbSys Standard" baseline). Deliberately **excludes** panel rows/columns/gaps, since those are the genuine per-job input, not shop policy — confirmed by direct DB inspection that a saved template's stored settings structurally have no grid fields at all.
 - Loading a template is **selection, then a separate explicit "Apply to Settings" click**, with a checkbox per section (Panel / Output / Routing / G-Code / Array) — unlike the DFM picker's auto-apply-on-select, applying a panel template overwrites live config, so nothing is ever written just from picking a dropdown value. Verified live: applying a template with the G-Code section unchecked left a manually-set spindle RPM untouched while the Panel section's rib width reset as expected.

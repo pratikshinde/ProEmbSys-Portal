@@ -182,6 +182,7 @@ const gcodeSectionSchema = z.object({
   routeXYFeedMmPerMin: z.number().positive(),
   drillFeedMmPerMin: z.number().positive(),
   autoFeedByDiameter: z.boolean(),
+  optimizeDrillOrder: z.boolean(),
 }).partial()
 
 const arraySectionSchema = z.object({

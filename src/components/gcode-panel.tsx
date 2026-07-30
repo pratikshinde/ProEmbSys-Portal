@@ -210,6 +210,16 @@ export default function GcodePanel() {
               ? 'Each drilling program uses a feed rate interpolated from real shop measurements (smaller bits faster, larger bits slower) instead of one flat rate for every diameter.'
               : 'Drill feed applies uniformly to every tool diameter — adjust per your own feeds-and-speeds chart if a bit needs a different rate.'}
           </p>
+          <div className="flex items-center justify-between mt-2">
+            <Label className="text-xs text-[#94b8d4]" title="Reorders each drilling program's holes (and slots) by nearest-neighbor travel instead of raw file order, to cut down on wasted rapid moves between holes. Turn off to compare against a raw-order sample file, or if your own post-processor already optimizes travel.">
+              Optimize drill order (nearest-first)
+            </Label>
+            <Switch
+              checked={ctx.optimizeDrillOrder}
+              onCheckedChange={v => updateGcodeContext({ optimizeDrillOrder: v })}
+              className="scale-75"
+            />
+          </div>
         </div>
 
         <Separator className="bg-[#1a3a5c]" />
