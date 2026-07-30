@@ -25,6 +25,7 @@ import {
   emitExcellonToolBlock,
   BaseOffset,
   isRectangularOutline,
+  formatPanelDate,
 } from './panelization-engine'
 import { collectMouseBiteHoles, type RoutingResult } from './routing/types'
 import { generateRouteGerber } from './routing/emit-gerber'
@@ -148,7 +149,7 @@ export async function exportPanelizedGerbers(
   const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
   const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
   const version = sanitizeForFilename(info?.revision, 'v1')
-  const dateStr = sanitizeForFilename(info?.date, new Date().toISOString().slice(0, 10))
+  const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
 
   // Generate panel outline with 0.1mm width
   const outlineGerber = generatePanelOutlineGerber(panel, { ...config, panelBorderWidth: 0.1 }, fmt)
@@ -257,7 +258,7 @@ export async function exportRoutingFiles(
   const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
   const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
   const version = sanitizeForFilename(info?.revision, 'v1')
-  const dateStr = sanitizeForFilename(info?.date, new Date().toISOString().slice(0, 10))
+  const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
 
   const zip = new JSZip()
   const folder = zip.folder('routing')
@@ -281,7 +282,7 @@ export async function exportGcodeFiles(
   const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
   const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
   const version = sanitizeForFilename(info?.revision, 'v1')
-  const dateStr = sanitizeForFilename(info?.date, new Date().toISOString().slice(0, 10))
+  const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
 
   const zip = new JSZip()
   const folder = zip.folder('gcode')
@@ -670,6 +671,33 @@ function generatePanelizedDrill(
     }
   }
 
+  // Milled slots (Excellon G85) — same panel-position repeat as flash hits
+  // above, but each slot needs BOTH endpoints translated, not just one
+  // point. Kept as a separate pass because slots live outside `commands`
+  // (see `DrillSlot`'s own docs in gerber-parser.ts) — folding them into
+  // the flash loop above would require every reader of that loop to first
+  // check "is this actually a slot", which is exactly the kind of silent
+  // cross-contamination that design avoids.
+  for (const dl of drillLayers) {
+    if (!dl.parsedLayer?.drillSlots?.length) continue
+
+    const boX = globalBaseOffset ? globalBaseOffset.x : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minX : 0)
+    const boY = globalBaseOffset ? globalBaseOffset.y : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minY : 0)
+
+    for (const slot of dl.parsedLayer.drillSlots) {
+      if (slot.diameterMm <= 0) continue
+      const tCode = getTCode(slot.diameterMm)
+      lines.push(tCode)
+      for (const pos of panel.pcbPositions) {
+        const sx = slot.start.x + pos.x + boX
+        const sy = slot.start.y + pos.y + boY
+        const ex = slot.end.x + pos.x + boX
+        const ey = slot.end.y + pos.y + boY
+        lines.push(`X${fmtCoord(sx)}Y${fmtCoord(sy)}G85X${fmtCoord(ex)}Y${fmtCoord(ey)}`)
+      }
+    }
+  }
+
   // Tooling and reference holes
   if (config.enableToolingHoles) {
     const toolingByDia = new Map<number, PanelResult['toolingHoles']>()
@@ -752,6 +780,43 @@ export function collectPanelizedDrillHoles(
   return [...byDia.entries()]
     .sort(([a], [b]) => a - b)
     .map(([diameterMm, holes]) => ({ diameterMm, holes }))
+}
+
+/**
+ * Panelized drill SLOT positions grouped by diameter, in panel-absolute mm —
+ * the slot equivalent of `collectPanelizedDrillHoles` above, for the same
+ * reason (shared by the panelized Excellon drill file and the G-code layer,
+ * without duplicating the panel-position repeat logic). Each slot carries
+ * both its start and end point, translated together by the same offset.
+ */
+export function collectPanelizedDrillSlots(
+  drillLayers: LayerFile[],
+  panel: PanelResult,
+  globalBaseOffset?: BaseOffset
+): { diameterMm: number; slots: { start: { x: number; y: number }; end: { x: number; y: number } }[] }[] {
+  const byDia = new Map<number, { start: { x: number; y: number }; end: { x: number; y: number } }[]>()
+
+  for (const dl of drillLayers) {
+    if (!dl.parsedLayer?.drillSlots?.length) continue
+    const boX = globalBaseOffset ? globalBaseOffset.x : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minX : 0)
+    const boY = globalBaseOffset ? globalBaseOffset.y : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minY : 0)
+
+    for (const slot of dl.parsedLayer.drillSlots) {
+      if (slot.diameterMm <= 0) continue
+      if (!byDia.has(slot.diameterMm)) byDia.set(slot.diameterMm, [])
+      const slots = byDia.get(slot.diameterMm)!
+      for (const pos of panel.pcbPositions) {
+        slots.push({
+          start: { x: slot.start.x + pos.x + boX, y: slot.start.y + pos.y + boY },
+          end: { x: slot.end.x + pos.x + boX, y: slot.end.y + pos.y + boY },
+        })
+      }
+    }
+  }
+
+  return [...byDia.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([diameterMm, slots]) => ({ diameterMm, slots }))
 }
 
 /**

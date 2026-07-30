@@ -79,6 +79,26 @@ export interface RoutingPlanContext {
   outlineBoundsMm?: { minX: number; minY: number } | null
 }
 
+// Extra clearance a protective tab targets beyond the bare bit-radius +
+// hole-radius minimum, so the tab is centred with a little real margin
+// either side rather than exactly tangent to the danger zone.
+const HOLE_TAB_PROTECTION_MARGIN_MM = 0.5
+
+/**
+ * Perpendicular distance from `p` to the INFINITE line through `a`→`b`, plus
+ * how far along that line (from `a`, in `a`→`b` units) the perpendicular
+ * foot falls. Unlike `distancePointToSegment`, this is NOT clamped to the
+ * segment — callers that need the projection coordinate (to place a tab
+ * along an edge) must range-check `d` against `[0, edgeLen]` themselves.
+ */
+function projectPointOntoLine(p: Pt, a: Pt, b: Pt, edgeLen: number): { d: number; perpDist: number } {
+  const ux = (b.x - a.x) / (edgeLen || 1)
+  const uy = (b.y - a.y) / (edgeLen || 1)
+  const vx = p.x - a.x
+  const vy = p.y - a.y
+  return { d: vx * ux + vy * uy, perpDist: Math.abs(vx * uy - vy * ux) }
+}
+
 /**
  * Resolve which per-PCB outline mode is actually used. `'bbox'`/`'contour'`
  * pass through unchanged; `'auto'` prefers `'bbox'` ONLY when the outline is
@@ -93,6 +113,22 @@ export function resolveOutlineMode(
   if (mode === 'contour') return 'contour'
   if (outlineLayer && isRectangularOutline(outlineLayer)) return 'bbox'
   return 'contour'
+}
+
+/** Point-to-segment distance, clamped to the segment. Small and local rather
+ *  than sharing `offset.ts`'s own copy — same reasoning as that file's own
+ *  comment on this exact helper: small enough that a shared import isn't
+ *  worth a new cross-file dependency. */
+function distancePointToSegment(p: Pt, a: Pt, b: Pt): number {
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  const lenSq = dx * dx + dy * dy
+  if (lenSq === 0) return Math.hypot(p.x - a.x, p.y - a.y)
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq
+  t = Math.max(0, Math.min(1, t))
+  const cx = a.x + t * dx
+  const cy = a.y + t * dy
+  return Math.hypot(p.x - cx, p.y - cy)
 }
 
 /** The four edges of a rectangle, as (start, end) corner pairs plus a name. */
@@ -303,19 +339,6 @@ export function planRouting(
   const paths: RoutePath[] = []
   const tabs: RouteTab[] = []
 
-  // ---- Panel perimeter -----------------------------------------------------
-  // The panel is cut from a larger sheet, so it gets no tabs: one closed loop.
-  if (cfg.routePanelOutline && bit > 0) {
-    const corners = offsetRectOutward(0, 0, panel.panelWidth, panel.panelHeight, r)
-    paths.push({
-      id: 'panel-outline',
-      role: 'panel-outline',
-      points: [...corners, corners[0]],
-      closed: true,
-      toolDiameterMm: bit,
-    })
-  }
-
   // ---- Per-PCB perimeters --------------------------------------------------
   const resolvedMode = resolveOutlineMode(cfg.pcbOutlineMode, ctx.outlineLayer)
 
@@ -354,8 +377,32 @@ export function planRouting(
         const wantTabs = cfg.tabStyle !== 'none' && edgeEnabled(edge, cfg)
         if (wantTabs && edgeLen > 0) {
           const override = parseTabPositions(cfg.tabPositionsMm, edgeLen)
-          const centersAlong = override.length > 0 ? override : evenTabCenters(edgeLen, cfg.tabsPerEdge)
+          const autoCenters = override.length > 0 ? override : evenTabCenters(edgeLen, cfg.tabsPerEdge)
           const pathGap = cfg.tabWidthMm + bit
+
+          // ⚠ Protective tabs: a tooling/reference hole close enough to this
+          // edge's routed path that a continuous cut would run through it
+          // gets a forced tab instead — a tab means the cutter genuinely
+          // never removes material across that span, which protects the
+          // hole regardless of how tight the panel-compute-time clearance
+          // margin turned out to be (a narrow rib can't always afford one).
+          // Confirmed live: a real panel's bottom-left pinning hole sat
+          // right against the routed edge with only the bare theoretical
+          // minimum of clearance. `centersAlong` stays in the same
+          // "dGlobal" convention `override`/`evenTabCenters` already use —
+          // `projectPointOntoLine` is computed in the raw a→b walk
+          // direction, so it needs the same `isReversedEdge` correction
+          // applied everywhere else in this loop before being merged in.
+          const centersAlong = [...autoCenters]
+          for (const hole of panel.toolingHoles) {
+            const holeR = hole.diameter / 2
+            const { d, perpDist } = projectPointOntoLine(hole, a, b, edgeLen)
+            if (d < 0 || d > edgeLen) continue
+            if (perpDist >= r + holeR + HOLE_TAB_PROTECTION_MARGIN_MM) continue
+            const dGlobalForHole = isReversedEdge ? edgeLen - d : d
+            const alreadyCovered = centersAlong.some(c => Math.abs(c - dGlobalForHole) < pathGap)
+            if (!alreadyCovered) centersAlong.push(dGlobalForHole)
+          }
 
           for (const dGlobal of centersAlong) {
             const d = isReversedEdge ? edgeLen - dGlobal : dGlobal
@@ -543,6 +590,19 @@ export function planRouting(
             )
             const coincidenceToleranceMm = r + Math.max(cfg.contourToleranceMm, 0.05)
 
+            // ⚠ Protective tabs from tooling/reference holes — the contour
+            // generalisation of the bbox loop's own hole-protection above
+            // (see its comment for full rationale). Computed per-instance,
+            // same as `extraSilentDs` right below: a hole is only ever near
+            // ONE or TWO instances (the ones at that panel corner), so this
+            // can't be precomputed once in file space the way `tabPositions`
+            // itself is. Routed through `findSafeTabCenter` — same as the
+            // ring's own tab placement — so a hole sitting right at a sharp
+            // corner still nudges to a safe nearby spot rather than being
+            // silently dropped or placed across too much curvature.
+            const pathGap = cfg.tabWidthMm + bit
+            let holeTabsSkipped = 0
+
             for (const [pcbIndex] of panel.pcbPositions.entries()) {
               const { dx, dy } = instanceOffsets[pcbIndex]
               const extraSilentDs: number[] = []
@@ -554,9 +614,37 @@ export function planRouting(
                   if (distance < coincidenceToleranceMm) extraSilentDs.push(d)
                 }
               }
-              const inst = planContourPcb(geo, dx, dy, pcbIndex, bit, cfg, extraSilentDs)
+
+              const holeProtectiveDs: number[] = []
+              for (const hole of panel.toolingHoles) {
+                const holeR = hole.diameter / 2
+                const local = { x: hole.x - dx, y: hole.y - dy }
+                const { distance, d } = nearestArcLengthOnRing(geo.outerPts, geo.outerTable, local)
+                if (distance >= r + holeR + HOLE_TAB_PROTECTION_MARGIN_MM) continue
+                const covered = [...geo.tabPositions, ...extraSilentDs, ...holeProtectiveDs].some(existing => {
+                  const raw = Math.abs(existing - d)
+                  return Math.min(raw, geo.outerTable.perimeterMm - raw) < pathGap
+                })
+                if (covered) continue
+                const safe = findSafeTabCenter(geo.outerPts, geo.outerTable, d, pathGap)
+                if (safe === null) holeTabsSkipped++
+                else holeProtectiveDs.push(safe)
+              }
+
+              const inst = planContourPcb(geo, dx, dy, pcbIndex, bit, cfg, extraSilentDs, holeProtectiveDs)
               paths.push(...inst.paths)
               tabs.push(...inst.tabs)
+            }
+            if (holeTabsSkipped > 0) {
+              issues.push({
+                id: 'contour-tabs-skipped',
+                severity: 'warning',
+                title: `${holeTabsSkipped} protective tab${holeTabsSkipped > 1 ? 's' : ''} near a pinning/reference hole skipped`,
+                detail:
+                  `${holeTabsSkipped} tab(s) meant to protect a tooling/reference hole sat across a corner or ` +
+                  `tight curve (more than 20 degrees of turning) and were skipped rather than cut across it. That ` +
+                  `hole may still be close to the routed path — check the panel's Pinning Inset or move the hole.`,
+              })
             }
           } else if (geo && !ctx.outlineBoundsMm) {
             issues.push({
@@ -568,6 +656,113 @@ export function planRouting(
           }
         }
       }
+    }
+  }
+
+  // ---- Panel perimeter -------------------------------------------------------
+  // Generated AFTER per-PCB paths/tabs (not before, as originally written) —
+  // it needs to know where those tabs landed. Ordinarily the panel is cut
+  // from a larger sheet and gets no tabs of its own: one clean closed loop,
+  // since that cut is physically distinct from — offset further out than —
+  // any per-PCB edge (there's a rib of raw material between them). But when
+  // the corresponding side rib is REMOVED (`sideRib* === 0`), the panel's
+  // own outer edge and the outermost PCBs' edge on that side become the
+  // SAME line (both offset outward from the same physical boundary by the
+  // same bit radius) — so a panel-outline loop that's unconditionally
+  // uninterrupted cuts straight through whatever tab that PCB edge already
+  // has there, silently destroying it. Confirmed live: a real no-side-rib
+  // panel's left-edge break tab sat directly under the (fully continuous)
+  // panel-outline pass. Fixed by reusing each qualifying PCB's ALREADY-
+  // COMPUTED tab positions as silent interrupts here too — same idea as the
+  // contour per-instance loop's own `extraSilentDs` (a gap with no NEW
+  // `RouteTab` emitted, since the owning PCB's tab already represents this
+  // physical location) — rather than trying to independently re-derive tab
+  // placement for an edge this loop doesn't otherwise know anything about.
+  if (cfg.routePanelOutline && bit > 0) {
+    const corners = offsetRectOutward(0, 0, panel.panelWidth, panel.panelHeight, r)
+    const outlinePts = [...corners, corners[0]]
+    const outlineTable = buildArcLength(outlinePts)
+    const pathGap = cfg.tabWidthMm + bit
+
+    const maxCol = Math.max(0, ...panel.pcbPositions.map(p => p.col))
+    const maxRow = Math.max(0, ...panel.pcbPositions.map(p => p.row))
+    const coincidentEdges: { edge: RouteEdge; atBoundary: (col: number, row: number) => boolean }[] = [
+      { edge: 'left', atBoundary: (col) => col === 0 },
+      { edge: 'right', atBoundary: (col) => col === maxCol },
+      { edge: 'bottom', atBoundary: (_col, row) => row === 0 },
+      { edge: 'top', atBoundary: (_col, row) => row === maxRow },
+    ]
+    const sideRibByEdge: Record<RouteEdge, number> = {
+      left: panelConfig.sideRibLeft,
+      right: panelConfig.sideRibRight,
+      bottom: panelConfig.sideRibBottom,
+      top: panelConfig.sideRibTop,
+    }
+
+    const interruptDs: number[] = []
+    for (const { edge, atBoundary } of coincidentEdges) {
+      if (sideRibByEdge[edge] > 0) continue // rib present — physically separate cut, no interruption needed
+      for (const t of tabs) {
+        if (t.edge !== edge || t.pcbIndex === undefined) continue
+        const pos = panel.pcbPositions[t.pcbIndex]
+        if (!pos || !atBoundary(pos.col, pos.row)) continue
+        const { d } = nearestArcLengthOnRing(outlinePts, outlineTable, t.center)
+        interruptDs.push(d)
+      }
+    }
+
+    if (interruptDs.length === 0) {
+      paths.push({ id: 'panel-outline', role: 'panel-outline', points: outlinePts, closed: true, toolDiameterMm: bit })
+    } else {
+      const interrupts: Span[] = interruptDs.map(d => ({ start: d - pathGap / 2, end: d + pathGap / 2 }))
+      const cutSpans = splitClosedByTabs(outlineTable.perimeterMm, interrupts)
+      for (const span of cutSpans) {
+        paths.push({
+          id: `panel-outline-${span.start.toFixed(3)}`,
+          role: 'panel-outline',
+          points: extractArcSpan(outlinePts, outlineTable, span.start, span.end),
+          closed: false,
+          toolDiameterMm: bit,
+        })
+      }
+    }
+  }
+
+  // ---- Tooling/reference hole clearance -------------------------------------
+  // A depaneling router path runs offset outward from the PCB/panel edge by
+  // the bit radius, by design — so a tooling or reference hole placed too
+  // close to that same edge (see panelization-engine.ts's `toolingHoleInset`,
+  // which sizes the hole row's clearance from the grid edge) can end up
+  // inside the swept cut. That panel-compute-time default is tuned for a
+  // representative bit/hole size, but can't see the ACTUAL bit chosen here,
+  // nor a custom tooling/reference hole diameter, nor the slightly different
+  // corner geometry a contour-mode round join produces versus a bbox miter —
+  // confirmed live: even after correcting the panel-compute-time formula,
+  // one contour-routed corner still landed ~1mm inside a hole it should have
+  // cleared. This check is the authoritative, bit-aware backstop: it runs
+  // against the REAL computed paths (panel-outline, bbox, and contour alike,
+  // generically — no per-mode branching needed) rather than trying to
+  // predict geometry ahead of time.
+  for (const hole of panel.toolingHoles) {
+    const holeR = hole.diameter / 2
+    let closestMm = Infinity
+    for (const path of paths) {
+      for (let i = 0; i < path.points.length - 1; i++) {
+        closestMm = Math.min(closestMm, distancePointToSegment({ x: hole.x, y: hole.y }, path.points[i], path.points[i + 1]))
+      }
+    }
+    if (closestMm < r + holeR - 1e-9) {
+      issues.push({
+        id: 'hole-routing-collision',
+        severity: 'warning',
+        title: `${hole.type === 'tooling' ? 'Tooling' : 'Reference'} hole overlaps the routed cut`,
+        detail:
+          `${hole.id} at (${hole.x.toFixed(2)}, ${hole.y.toFixed(2)}) is only ${closestMm.toFixed(2)} mm from the ` +
+          `routed path, but the ${bit} mm bit's cut plus this ${hole.diameter} mm hole need ${(r + holeR).toFixed(2)} mm ` +
+          `of clearance. The router will cut through part of the hole. Increase the panel's Pinning Inset, or ` +
+          `use a smaller bit.`,
+        locations: [{ x: hole.x, y: hole.y }],
+      })
     }
   }
 
@@ -913,7 +1108,8 @@ function planContourPcb(
   pcbIndex: number,
   bit: number,
   cfg: RoutingConfig,
-  extraSilentDs: number[]
+  extraSilentDs: number[],
+  holeProtectiveDs: number[]
 ): { paths: RoutePath[]; tabs: RouteTab[] } {
   const translate = (p: Pt): Pt => ({ x: p.x + dx, y: p.y + dy })
   const paths: RoutePath[] = []
@@ -932,7 +1128,11 @@ function planContourPcb(
     })
   })
 
-  const allInterruptDs = [...geo.tabPositions, ...extraSilentDs]
+  // `holeProtectiveDs` gets REAL tabs emitted below (unlike `extraSilentDs`,
+  // which only silently extends the cut interruption because the OWNING
+  // instance already emits that tab) — there is no other instance that owns
+  // a tab protecting a hole near THIS one, so this instance has to emit it.
+  const allInterruptDs = [...geo.tabPositions, ...extraSilentDs, ...holeProtectiveDs]
   const interrupts: Span[] = allInterruptDs.map(d => ({ start: d - pathGap / 2, end: d + pathGap / 2 }))
   const cutSpans =
     interrupts.length > 0
@@ -952,7 +1152,7 @@ function planContourPcb(
     })
   }
 
-  for (const d of geo.tabPositions) {
+  for (const d of [...geo.tabPositions, ...holeProtectiveDs]) {
     const offsetPt = translate(sampleAt(geo.outerPts, geo.outerTable, d))
     const tangent = tangentAt(geo.outerPts, geo.outerTable, d)
     const outwardNormal = rightNormalOf(tangent)

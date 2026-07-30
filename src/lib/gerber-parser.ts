@@ -92,6 +92,27 @@ export interface GerberBounds {
   maxY: number;
 }
 
+/**
+ * A milled slot from an Excellon G85 canned slot cycle — `X<start>Y<start>
+ * G85X<end>Y<end>` mills a slot between two points at the current tool's
+ * diameter (the tool IS the slot width; no separate cutter-offset math is
+ * needed the way the depaneling router needs one). Kept OUT of `commands`
+ * deliberately: every existing consumer that walks `commands` looking for
+ * `type === 'flash'` (hole counting, drill-alignment pad matching, DFM
+ * unlanded-hole checks, the panelized-drill-file/G-code hole collectors)
+ * means "a single drilled point with a matching copper pad" — folding a
+ * two-point slot into that stream would silently corrupt all of them rather
+ * than just being ignored by ones that don't care about slots yet.
+ */
+export interface DrillSlot {
+  start: { x: number; y: number };
+  end: { x: number; y: number };
+  /** Excellon tool number (T-code) this slot was cut with. */
+  toolCode: number;
+  /** Tool diameter in mm — the slot's width. */
+  diameterMm: number;
+}
+
 /** Complete parsed Gerber layer */
 export interface GerberLayer {
   /** Source file name */
@@ -116,6 +137,10 @@ export interface GerberLayer {
   warnings: string[];
   /** Resolved Excellon format + stats. Only set for drill layers. */
   drillMeta?: DrillMeta;
+  /** Milled slots (Excellon G85). Only set for drill layers, and only when
+   *  the file actually contains any — see `DrillSlot`'s own docs for why
+   *  these are tracked separately from `commands`. */
+  drillSlots?: DrillSlot[];
 }
 
 // ============================================================================
@@ -906,6 +931,31 @@ function calculateBounds(
   return { minX, minY, maxX, maxY };
 }
 
+/**
+ * Widen a bounds box to also cover a set of drill slots (start/end ± tool
+ * radius each). Slots live outside `commands` (see `DrillSlot`'s own docs),
+ * so `calculateBounds` never sees them on its own — every caller that
+ * recomputes bounds for a drill layer with slots must fold this in, or a
+ * board whose only geometry is a slot (or whose slot pokes past its other
+ * holes) panelizes with a bounding box too small to actually contain it.
+ */
+function expandBoundsForSlots(bounds: GerberBounds | null, slots: DrillSlot[]): GerberBounds | null {
+  if (slots.length === 0) return bounds;
+  let { minX, minY, maxX, maxY } = bounds ?? {
+    minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity,
+  };
+  for (const slot of slots) {
+    const r = slot.diameterMm / 2;
+    for (const pt of [slot.start, slot.end]) {
+      minX = Math.min(minX, pt.x - r);
+      maxX = Math.max(maxX, pt.x + r);
+      minY = Math.min(minY, pt.y - r);
+      maxY = Math.max(maxY, pt.y + r);
+    }
+  }
+  return { minX, minY, maxX, maxY };
+}
+
 // ============================================================================
 // Main Parser Function
 // ============================================================================
@@ -1251,8 +1301,22 @@ export function convertLayerUnits(layer: GerberLayer, targetUnit: GerberUnit): v
     if (ap.holeDiameter !== undefined) ap.holeDiameter *= factor;
   }
 
+  // Drill slots (Excellon G85) live outside `commands` — see `DrillSlot`'s
+  // own docs — so they need their own conversion pass, or a drill layer's
+  // slots would silently go stale (wrong scale) relative to its now-
+  // converted holes the next time this function actually runs a real
+  // conversion (normally a no-op here since drill layers are always parsed
+  // straight to mm, but this must stay correct regardless of that).
+  if (layer.drillSlots) {
+    for (const slot of layer.drillSlots) {
+      slot.start.x *= factor; slot.start.y *= factor;
+      slot.end.x *= factor; slot.end.y *= factor;
+      slot.diameterMm *= factor;
+    }
+  }
+
   // Recalculate bounds
-  layer.bounds = calculateBounds(layer.commands, layer.apertures);
+  layer.bounds = expandBoundsForSlots(calculateBounds(layer.commands, layer.apertures), layer.drillSlots ?? []);
 
   // Update unit
   layer.units = targetUnit;
@@ -1431,6 +1495,7 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
   let inBody = false
   let lastDrillX: number | null = null
   let lastDrillY: number | null = null
+  const slots: DrillSlot[] = []
 
   // Altium: exports 9+ digit coordinates with no format declaration, which
   // would otherwise decode against the 2.4 default and land wildly off-board.
@@ -1706,6 +1771,40 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
         continue
       }
 
+      // G85 canned slot cycle: X<start>Y<start>G85X<end>Y<end> — a slot milled
+      // between two points at the current tool's diameter, not a single point
+      // hole. Must be checked BEFORE the generic coordinate-hit match below,
+      // which greedily captures only the digits immediately after each axis
+      // letter: on a G85 line it would silently keep just the start X/Y and
+      // drop everything from "G85" onward, turning a slot into a round hole
+      // at the wrong (start-only) position with no warning at all.
+      const slotMatch = clean.match(/X([+-]?\d*\.?\d*)Y([+-]?\d*\.?\d*)G85X([+-]?\d*\.?\d*)Y([+-]?\d*\.?\d*)/i)
+      if (slotMatch) {
+        if (currentTool === null) {
+          currentTool = 1
+          warnings.push('No tool selected before first drill slot — defaulting to T01')
+        }
+        const [, sx, sy, ex, ey] = slotMatch
+        const startXRaw = parseExcellonCoord(sx, fmtInt, fmtDec, declaredZeroSuppression, units, warnOnce)
+        const startYRaw = parseExcellonCoord(sy, fmtInt, fmtDec, declaredZeroSuppression, units, warnOnce)
+        const endXRaw = parseExcellonCoord(ex, fmtInt, fmtDec, declaredZeroSuppression, units, warnOnce)
+        const endYRaw = parseExcellonCoord(ey, fmtInt, fmtDec, declaredZeroSuppression, units, warnOnce)
+        if (startXRaw !== null && startYRaw !== null && endXRaw !== null && endYRaw !== null) {
+          const toMm = (v: number) => (units === 'mm' ? v : v * 25.4)
+          const startX = toMm(startXRaw)
+          const startY = toMm(startYRaw)
+          const endX = toMm(endXRaw)
+          const endY = toMm(endYRaw)
+          // Diameter resolved after the full tool table is known (aperture
+          // widths get their own inch→mm conversion pass further down) — 0
+          // here is a placeholder, corrected in that same pass.
+          slots.push({ start: { x: startX, y: startY }, end: { x: endX, y: endY }, toolCode: currentTool, diameterMm: 0 })
+          lastDrillX = endX
+          lastDrillY = endY
+        }
+        continue
+      }
+
       // Coordinate hit: X...Y...
       if (clean.includes('X') || clean.includes('Y')) {
         // Some files (notably Allegro) emit hits before any T-select, relying on
@@ -1894,8 +1993,19 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     }
   }
 
-  // Recalculate bounds after possible suppression correction
-  const finalBounds = calculateBounds(commands, apertures)
+  // Slots were pushed with a placeholder diameterMm (0) before the tool
+  // table's own units were finalized above — resolve the real diameter now
+  // from each slot's tool aperture, same source flash-command hole diameters
+  // already use downstream.
+  for (const slot of slots) {
+    const apt = apertures.get(slot.toolCode)
+    if (apt && apt.width !== undefined && apt.width > 0) slot.diameterMm = apt.width
+  }
+
+  // Recalculate bounds after possible suppression correction — folding in
+  // slots, which live outside `commands` (see `DrillSlot`'s docs) and so
+  // never reach `calculateBounds` on their own.
+  const boundsWithSlots = expandBoundsForSlots(calculateBounds(commands, apertures), slots)
 
   // Default format (3:3 metric) — not critical for drill layers
   const formatX: CoordinateFormat = { integer: 3, decimal: 3 }
@@ -1923,9 +2033,10 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     apertures,
     commands,
     regions: [],
-    bounds: finalBounds,
+    bounds: boundsWithSlots,
     warnings,
     drillMeta,
+    ...(slots.length > 0 ? { drillSlots: slots } : {}),
   }
 }
 
@@ -2553,6 +2664,19 @@ export function serializeParsedDrillToExcellon(parsedLayer: GerberLayer): string
         lines.push(`Y${y}`)
       }
     }
+  }
+
+  // Slots (Excellon G85) live outside `commands` (see `DrillSlot`'s own
+  // docs) so the loop above never sees them — without this pass, every
+  // caller of this function (drill align, drill rotate) would silently drop
+  // slots from the regenerated file, including the on-screen re-render
+  // (`gerberToSvg(newRaw)` in `alignDrillLayersToBoard`).
+  for (const slot of parsedLayer.drillSlots ?? []) {
+    if (slot.toolCode !== currentTool) {
+      currentTool = slot.toolCode
+      lines.push(`T${currentTool.toString().padStart(2, '0')}`)
+    }
+    lines.push(`X${slot.start.x.toFixed(4)}Y${slot.start.y.toFixed(4)}G85X${slot.end.x.toFixed(4)}Y${slot.end.y.toFixed(4)}`)
   }
 
   // End of program

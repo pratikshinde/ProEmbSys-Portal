@@ -224,11 +224,26 @@ export function generateRouteGcode(
  * trailing space after the retract/plunge lines and the space before the F
  * code — a different convention from the cutting template above, and kept
  * that way deliberately (see the file header comment).
+ *
+ * `slots` (Excellon G85 milled slots at this same tool diameter — see
+ * `DrillSlot` in gerber-parser.ts) get appended after the point holes, each
+ * as plunge → lateral cut → retract instead of plunge → retract: the tool
+ * diameter IS the slot width (no separate cutter-offset math the way the
+ * depaneling router needs), so the tool center just needs to trace the
+ * slot's own centerline from start to end. There is no real sample G85
+ * drilling file to match a machine's exact convention against (unlike every
+ * other template in this file), so the lateral move reuses
+ * `routeXYFeedMmPerMin` — the existing XY cutting feed this same context
+ * already carries for the router — rather than inventing a new field. The
+ * `#<XY_Feed>` header line and the slot block itself are only emitted when
+ * `slots` is non-empty, so every pre-existing pure-hole file stays
+ * byte-identical.
  */
 export function generateDrillGcode(
   holes: Pt[],
   toolDiameterMm: number,
-  ctx: GcodeContext
+  ctx: GcodeContext,
+  slots: { start: Pt; end: Pt }[] = []
 ): string {
   const lines: string[] = []
   lines.push(`(TOOLDIA ${toolDiameterMm.toFixed(4)})`)
@@ -248,6 +263,9 @@ export function generateDrillGcode(
   lines.push(`#<Z_Retract> = ${ctx.retractZmm.toFixed(4)}`)
   lines.push(`#<Z_Depth> = ${ctx.cutDepthMm.toFixed(4)}`)
   lines.push(`#<Z_Feed> = ${Math.round(feedMmPerMin)}`)
+  if (slots.length > 0) {
+    lines.push(`#<XY_Feed> = ${Math.round(ctx.routeXYFeedMmPerMin)}`)
+  }
   lines.push('(=================================)')
   lines.push(`M3 S${ctx.spindleRpm}`)
   lines.push(`G04P${ctx.dwellSeconds}`)
@@ -257,6 +275,14 @@ export function generateDrillGcode(
     lines.push(`G00 ${xy(h)}`)
     lines.push('G00 Z#<Z_Retract> ')
     lines.push('G01 Z#<Z_Depth> F#<Z_Feed> ')
+    lines.push('G00 Z#<Z_Retract> ')
+  }
+
+  for (const slot of slots) {
+    lines.push(`G00 ${xy(slot.start)}`)
+    lines.push('G00 Z#<Z_Retract> ')
+    lines.push('G01 Z#<Z_Depth> F#<Z_Feed> ')
+    lines.push(`G01 ${xy(slot.end)}F#<XY_Feed> `)
     lines.push('G00 Z#<Z_Retract> ')
   }
 
@@ -280,17 +306,22 @@ export interface GcodeFile {
 /**
  * The full set of G-code files for a routing plan: one cutting program per
  * router-bit diameter, and one drilling program per distinct hole diameter
- * across both mouse bites and the customer's own imported drill hits.
+ * across mouse bites, the customer's own imported drill hits, AND milled
+ * slots (Excellon G85) at that same diameter — a slot shares its tool's file
+ * with any round holes drilled at the same diameter, matching the shop's own
+ * "one program per bit" workflow the round-hole grouping already follows.
  *
- * `drillHoleGroups` is deliberately the caller's responsibility to collect
- * (via `collectPanelizedDrillHoles` in `gerber-exporter.ts`) rather than read
- * from the store here — this file stays pure, matching every other emitter.
+ * `drillHoleGroups` / `drillSlotGroups` are deliberately the caller's
+ * responsibility to collect (via `collectPanelizedDrillHoles` /
+ * `collectPanelizedDrillSlots` in `gerber-exporter.ts`) rather than read from
+ * the store here — this file stays pure, matching every other emitter.
  */
 export function generateGcodeFiles(
   result: RoutingResult,
   drillHoleGroups: { diameterMm: number; holes: Pt[] }[],
   partNumber: string,
-  ctx: GcodeContext
+  ctx: GcodeContext,
+  drillSlotGroups: { diameterMm: number; slots: { start: Pt; end: Pt }[] }[] = []
 ): GcodeFile[] {
   const files: GcodeFile[] = []
 
@@ -313,11 +344,21 @@ export function generateGcodeFiles(
     combined.get(group.diameterMm)!.push(...group.holes)
   }
 
+  // Slots tracked separately per diameter (a slot isn't a Pt), unioned with
+  // `combined`'s keys below so a diameter used ONLY for slots still gets a
+  // file — not just diameters that also happen to have a round hole.
+  const combinedSlots = new Map<number, { start: Pt; end: Pt }[]>()
+  for (const group of drillSlotGroups) {
+    if (!combinedSlots.has(group.diameterMm)) combinedSlots.set(group.diameterMm, [])
+    combinedSlots.get(group.diameterMm)!.push(...group.slots)
+  }
+
+  const allDiameters = new Set([...combined.keys(), ...combinedSlots.keys()])
   let idx = 1
-  for (const [dia, holes] of [...combined.entries()].sort(([a], [b]) => a - b)) {
+  for (const dia of [...allDiameters].sort((a, b) => a - b)) {
     files.push({
       filename: `${partNumber}_Drilling_${formatToolFileSuffix(dia)}_${idx}.NC`,
-      content: generateDrillGcode(holes, dia, ctx),
+      content: generateDrillGcode(combined.get(dia) ?? [], dia, ctx, combinedSlots.get(dia) ?? []),
     })
     idx++
   }

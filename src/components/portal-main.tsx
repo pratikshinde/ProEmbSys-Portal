@@ -1862,10 +1862,10 @@ function PanelizationPage() {
         <div style={{ display:"flex", gap:4, marginLeft:24 }}>
           {[
             { key: 'layers' as const, icon: Layers, label: 'Layers' },
+            { key: 'dfm' as const, icon: ShieldCheck, label: 'DFM Check' },
             { key: 'panel' as const, icon: LayoutGrid, label: 'Panel Config' },
             { key: 'routing' as const, icon: Scissors, label: 'Routing' },
             { key: 'gcode' as const, icon: Terminal, label: 'G-Code' },
-            { key: 'dfm' as const, icon: ShieldCheck, label: 'DFM Check' },
             { key: 'export' as const, icon: Download, label: 'Info & Export' },
           ].map(({ key, icon: Icon, label }) => (
             <button
@@ -1911,10 +1911,10 @@ function PanelizationPage() {
             <div style={{ flex:1, minHeight:0, overflowY:"auto" }}>
               <div style={{ padding:12, height:"100%" }}>
                 {activeTab === 'layers' && <LayerPanel />}
+                {activeTab === 'dfm' && <DfmPanel />}
                 {activeTab === 'panel' && <PanelConfigPanel />}
                 {activeTab === 'routing' && <RoutingPanel />}
                 {activeTab === 'gcode' && <GcodePanel />}
-                {activeTab === 'dfm' && <DfmPanel />}
                 {activeTab === 'export' && <ExportPanel />}
               </div>
             </div>

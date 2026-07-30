@@ -304,7 +304,8 @@ export default function ExportPanel() {
               <Input
                 value={panelInfo.date}
                 onChange={(e) => updatePanelInfo({ date: e.target.value })}
-                className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]"
+                className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff] placeholder-[#4a6f94]"
+                placeholder="29-JUL-2026"
               />
             </div>
           </div>

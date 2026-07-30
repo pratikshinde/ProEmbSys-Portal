@@ -1252,25 +1252,24 @@ export default function GerberViewer() {
                     className={`px-2 py-1 rounded transition-colors ${boardViewSide === 'bottom' ? 'bg-[#38bdf8] text-white' : 'text-[#94b8d4] hover:bg-[#0f2848]/50'}`}
                     title={botHasCopperOrSilk ? 'Bottom side' : 'Bottom side (no copper/silk layers)'}
                   >Bottom{!botHasCopperOrSilk && <span className="ml-0.5 opacity-50">∅</span>}</button>
+                  {/* Soldermask color swatches — Board view only (cosmetic preview, no effect on export) */}
+                  <span className="w-px bg-[#1a3a5c] mx-0.5" />
+                  <div className="flex items-center gap-1 px-0.5">
+                    {BOARD_COLOR_NAMES.map(name => (
+                      <button
+                        key={name}
+                        onClick={() => setBoardColor(name)}
+                        title={`${name} soldermask`}
+                        className={`w-4 h-4 rounded-full border transition-all ${
+                          boardColor === name ? 'border-white scale-110' : 'border-[#1a3a5c] hover:border-[#4a6f94]'
+                        }`}
+                        style={{ backgroundColor: BOARD_COLOR_PALETTE[name].swatch }}
+                      />
+                    ))}
+                  </div>
                 </>
               )}
             </div>
-            {/* Soldermask color swatches — Board view only (cosmetic preview, no effect on export) */}
-            {viewMode === 'board' && (
-              <div className="absolute top-11 left-2 flex gap-1 bg-[#020d1f]/85 rounded border border-[#1a3a5c] p-1">
-                {BOARD_COLOR_NAMES.map(name => (
-                  <button
-                    key={name}
-                    onClick={() => setBoardColor(name)}
-                    title={`${name} soldermask`}
-                    className={`w-4 h-4 rounded-full border transition-all ${
-                      boardColor === name ? 'border-white scale-110' : 'border-[#1a3a5c] hover:border-[#4a6f94]'
-                    }`}
-                    style={{ backgroundColor: BOARD_COLOR_PALETTE[name].swatch }}
-                  />
-                ))}
-              </div>
-            )}
             {/* Warn when viewing a side with no copper data */}
             {isBoardMode && currentSideEmpty && (
               <div className="absolute top-10 left-1/2 -translate-x-1/2 bg-[#1a1a00]/90 border border-yellow-500/50 text-yellow-300 text-xs px-3 py-1.5 rounded-lg pointer-events-none">

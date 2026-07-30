@@ -9,13 +9,13 @@ import { gerberToSvg, gerberRenderBoardView, checkCopperSpacing, BoardView, Gerb
 import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
 import { runDfm } from './dfm/run-dfm'
 import type { DfmContext, DfmLayerInput, DfmReport, DfmRules } from './dfm/types'
-import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DrillZeroSuppression, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber } from './panelization-engine'
+import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DrillZeroSuppression, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber, formatPanelDate } from './panelization-engine'
 import { LayerType, LayerSide, detectLayerType, detectLayerSide } from './gerber-analysis'
 import { planRouting, resolveOutlineMode } from './routing/plan-routing'
 import { DEFAULT_ROUTING_CONFIG, type BoardContour, type RoutingConfig, type RoutingResult } from './routing/types'
 import { generateGcodeFiles as buildGcodeFiles, DEFAULT_GCODE_CONTEXT, type GcodeContext, type GcodeFile } from './routing/gcode'
 import { isRoutGcodeFile, parseRoutSlots, routSlotsToGerber } from './routing/import-rout'
-import { collectPanelizedDrillHoles } from './gerber-exporter'
+import { collectPanelizedDrillHoles, collectPanelizedDrillSlots } from './gerber-exporter'
 import { traceBoardContour } from './board-contour'
 import { BoardColorName } from './board-colors'
 
@@ -24,7 +24,7 @@ export type { LayerType, LayerSide }
 /** The CAM tool's sidebar tabs. Previously this union was spelled out inline on
  *  both `activeTab` and `setActiveTab`, which meant adding a tab required
  *  editing two places that could silently drift apart. */
-export type CamTab = 'layers' | 'panel' | 'routing' | 'gcode' | 'dfm' | 'export'
+export type CamTab = 'layers' | 'dfm' | 'panel' | 'routing' | 'gcode' | 'export'
 
 /** Tabs whose canvas shows the whole *panel* rather than the single imported
  *  PCB. `gerber-viewer.tsx` gates five separate things on this (bounds, the
@@ -1304,6 +1304,18 @@ export const useAppStore = create<AppState>((set, get) => ({
         return { ...cmd, coordinate: newCoord }
       })
 
+      // Shift slots (Excellon G85) — live outside `commands` (see
+      // `DrillSlot`'s own docs), so the map above never touches them; without
+      // this a slot would stay at its pre-alignment position while every
+      // hole around it moved, throwing the two out of registration.
+      if (parsed.drillSlots) {
+        parsed.drillSlots = parsed.drillSlots.map(slot => ({
+          ...slot,
+          start: { x: slot.start.x + dx, y: slot.start.y + dy },
+          end: { x: slot.end.x + dx, y: slot.end.y + dy },
+        }))
+      }
+
       // Shift bounds
       parsed.bounds = {
         minX: b.minX + dx,
@@ -1378,7 +1390,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   panelInfo: {
     pcbName: 'PCB-001',
     customerRef: 'Customer Name',
-    date: new Date().toISOString().slice(0, 10),
+    date: formatPanelDate(),
     revision: '1.0',
     layers: 'GTL GBL GTS GBS GTO GBO',
   },
@@ -1742,8 +1754,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       .map(l => ({ name: l.name, fileName: l.fileName, content: l.rawContent, parsedLayer: l.parsedLayer, type: l.type, side: l.side }))
     const drillHoleGroups = collectPanelizedDrillHoles(drillLayers, panelResult, globalBaseOffset)
       .map(g => ({ diameterMm: g.diameterMm, holes: g.holes }))
+    const drillSlotGroups = collectPanelizedDrillSlots(drillLayers, panelResult, globalBaseOffset)
     const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
-    set({ gcodeFiles: buildGcodeFiles(routingResult, drillHoleGroups, partNumber, gcodeContext) })
+    set({ gcodeFiles: buildGcodeFiles(routingResult, drillHoleGroups, partNumber, gcodeContext, drillSlotGroups) })
   },
   clearGcodeFiles: () => set({ gcodeFiles: null }),
 

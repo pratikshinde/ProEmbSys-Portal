@@ -526,7 +526,7 @@ export interface PanelConfig {
   toolingHoleDiameter: number // pinning hole size (mm), e.g., 2mm
   referenceHoleDiameter: number // reference hole size (mm), e.g., 1mm
   referenceHoleInset: number // distance from outermost PCB edge to reference hole center (mm), default 3.0
-  toolingHoleInset: number // distance from panel edge to tooling hole center (mm)
+  toolingHoleInset: number // distance from PCB grid edge to tooling/reference hole row's center (mm) — must clear a router bit's swept path past the grid edge; see the routing-collision comment at its use in computePanel
   enableFiducials: boolean
   fiducialDiameter: number // copper fiducial size (mm)
   fiducialClearance: number // clearance around fiducial / mask opening size (mm)
@@ -561,6 +561,19 @@ export interface PanelInfo {
   date: string
   revision: string
   layers: string // e.g., "GTL GBL GTS GBS GTO GBO"
+}
+
+const MONTH_ABBR = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+
+// Panel-facing dates (PanelInfo.date default, and the export filename/README
+// fallback when the user leaves it blank) use DD-MMM-YYYY, e.g. "29-JUL-2026" —
+// unambiguous across locales, unlike DD/MM/YYYY vs MM/DD/YYYY on a fabricated
+// panel or its filename.
+export function formatPanelDate(d: Date = new Date()): string {
+  const dd = String(d.getDate()).padStart(2, '0')
+  const mmm = MONTH_ABBR[d.getMonth()]
+  const yyyy = d.getFullYear()
+  return `${dd}-${mmm}-${yyyy}`
 }
 
 export interface PanelResult {
@@ -614,7 +627,7 @@ export const DEFAULT_PANEL_CONFIG: PanelConfig = {
   toolingHoleDiameter: 2,
   referenceHoleDiameter: 1,
   referenceHoleInset: 3.0,
-  toolingHoleInset: 5,
+  toolingHoleInset: 3,
   enableFiducials: true,
   fiducialDiameter: 1.0,
   fiducialClearance: 2.0,
@@ -685,6 +698,10 @@ export function computePanel(
   // Coordinate system: CAM350 first quadrant (X+ right, Y+ up, origin at bottom-left)
   const toolingHoles: PanelResult['toolingHoles'] = []
   if (config.enableToolingHoles) {
+    // ⚠ `inset` is the hole row's clearance from the PCB grid edge (used for
+    // ALL corner tooling/reference hole Y-positions below), NOT a distance
+    // from the panel edge — see the routing-collision comment at the tlY/blY
+    // assignments for why this must be measured from the grid edge.
     const inset = config.toolingHoleInset
     // Minimum spacing between different hole types
     // The sample panel shows reference holes (1mm) can be ~2.5-3mm apart in top-left corner
@@ -764,7 +781,33 @@ export function computePanel(
 
     // Top-left corner (Y is high in CAM350 system) - moved to 14.5mm to avoid overlap with reference holes
     const tlX = config.sideRibLeft + toolingDistanceFromPCBEdge + 2.0  // 12.5 + 2.0 = 14.5mm from panel edge
-    const tlY = panelHeight - config.sideRibTop / 2  // From bottom edge (high Y in CAM350)
+    // ⚠ Y is measured as `inset` OUT from the PCB grid edge (`gridTop`),
+    // toward the panel's own outer edge — not dead-center of the rib
+    // (`sideRibTop/2`, the old formula), and not `inset` in from the PANEL
+    // edge either (this field's own doc comment used to claim that, but it
+    // was dead code — never actually read anywhere — so that claim was never
+    // exercised or verified). A depaneling router cuts a path offset OUTWARD
+    // from the grid edge by the bit radius, so a hole only centered in the
+    // rib leaves just `sideRibTop/2 − bitRadius` of clearance from that cut,
+    // not `sideRibTop/2` — at the default 5mm rib this measured out to only
+    // 1.5mm of actual gap against a 2mm bit + 2mm tooling hole (needs 2mm),
+    // a real collision confirmed both with a standalone routing-planner
+    // reproduction AND live on a real panel with no side ribs (where this
+    // same rib-half-width formula still governs the top/bottom ribs that DO
+    // remain) — the router path ran straight through the pinning hole.
+    // `toolingHoleInset` already existed as a user-facing "Pinning Inset"
+    // field for exactly this, just never actually wired up (`inset` was
+    // assigned and unused). At its new 3mm default, clearance from a 2mm
+    // bit is exactly 0 (tangent, not overlapping) for the default 2mm
+    // tooling hole — the tightest of the three bit presets — and a
+    // genuinely positive 0.5–1.0mm for the two smaller presets; a
+    // routing-plan-time check (`plan-routing.ts`'s hole-collision issue)
+    // is the authoritative backstop for whatever bit/hole-size combination
+    // is actually in use, since this default can't see the future bit
+    // choice. A rib narrower than `inset` simply won't fit a hole here at
+    // all — `addHole`'s existing grid-overlap/edge-distance rejection
+    // already skips it rather than placing something unsafe.
+    const tlY = gridTop + inset  // From bottom edge (high Y in CAM350)
     console.log(`[Tooling hole] Top-left: (${tlX.toFixed(2)}, ${tlY.toFixed(2)})`)
     addHole('tooling_tl', tlX, tlY, config.toolingHoleDiameter, 'tooling')
 
@@ -776,7 +819,7 @@ export function computePanel(
 
     // Bottom-left corner (Y is low in CAM350 system) - moved to 11mm as specified
     const blX = config.sideRibLeft + toolingDistanceFromPCBEdge - 1.5  // 12.5 - 1.5 = 11mm from panel edge
-    const blY = config.sideRibBottom / 2  // From bottom edge (low Y in CAM350)
+    const blY = gridBottom - inset  // From bottom edge (low Y in CAM350) — see tlY for why, not `sideRibBottom/2`
     addHole('tooling_bl', blX, blY, config.toolingHoleDiameter, 'tooling')
 
     // Bottom-right corner (Y is low in CAM350 system)
@@ -789,10 +832,16 @@ export function computePanel(
     // - Top-left corner: 2 holes at ~8mm and ~11mm (for PCB orientation understanding)
     // - Other corners: 1 hole each at ~8mm from panel edge
     // - CAM350 coordinate system: X+ right, Y+ up, origin at bottom-left
+    //
+    // Reference holes share the same routing-clearance Y as the tooling holes
+    // above (`inset`, not `sideRib*/2`) — they sit in the same rib "row" by
+    // design (same corner, aligned along one Y), so using a different Y here
+    // would both reintroduce the same routing collision for these holes AND
+    // break that alignment.
 
     // Bottom-left corner: 1 reference hole - moved to 7mm as specified
     if (config.sideRibBottom > 0) {
-      const yRef = config.sideRibBottom / 2  // From bottom edge (low Y in CAM350)
+      const yRef = gridBottom - inset  // From bottom edge (low Y in CAM350)
       const xLeft = config.sideRibLeft + refInset - 1.0           // 7mm from panel edge (5mm rib + 2mm)
       console.log(`[Reference holes] Bottom-left: (${xLeft.toFixed(2)}, ${yRef.toFixed(2)})`)
       addHole('ref_bl', xLeft, yRef, config.referenceHoleDiameter, 'reference')
@@ -800,7 +849,7 @@ export function computePanel(
 
     // Bottom-right corner: 1 reference hole
     if (config.sideRibBottom > 0) {
-      const yRef = config.sideRibBottom / 2  // From bottom edge (low Y in CAM350)
+      const yRef = gridBottom - inset  // From bottom edge (low Y in CAM350)
       const xRight = panelWidth - config.sideRibRight - refInset  // 102mm from panel edge
       console.log(`[Reference holes] Bottom-right: (${xRight.toFixed(2)}, ${yRef.toFixed(2)})`)
       addHole('ref_br', xRight, yRef, config.referenceHoleDiameter, 'reference')
@@ -808,7 +857,7 @@ export function computePanel(
 
     // Top-right corner: 1 reference hole
     if (config.sideRibTop > 0) {
-      const yRef = panelHeight - config.sideRibTop / 2  // From bottom edge (high Y in CAM350)
+      const yRef = gridTop + inset  // From bottom edge (high Y in CAM350)
       const xRight = panelWidth - config.sideRibRight - refInset  // 102mm from panel edge
       console.log(`[Reference holes] Top-right: (${xRight.toFixed(2)}, ${yRef.toFixed(2)})`)
       addHole('ref_tr', xRight, yRef, config.referenceHoleDiameter, 'reference')
@@ -816,7 +865,7 @@ export function computePanel(
 
     // Top-left corner: 2 reference holes (for PCB orientation understanding)
     if (config.sideRibTop > 0) {
-      const yRef = panelHeight - config.sideRibTop / 2  // From bottom edge (high Y in CAM350)
+      const yRef = gridTop + inset  // From bottom edge (high Y in CAM350)
       const xLeft1 = config.sideRibLeft + refInset - 1.0       // 7mm from panel edge (5mm rib + 2mm) - gives 3.5mm spacing
       const xLeft2 = config.sideRibLeft + refInset + 2.5      // ~10.5mm from panel edge
 
@@ -828,8 +877,18 @@ export function computePanel(
     }
   }
 
+  // Generate panel meta text (Customer/PCB name, revision, date, PCB size,
+  // panel size) BEFORE fiducials — it only needs `toolingHoles` (already
+  // computed above) and `info`, so hoisting it lets fiducial placement below
+  // avoid the real, measured text zone instead of guessing at one.
+  const infoTexts: InfoText[] = []
+  if (info) {
+    const topRibTexts = generatePanelMetaText(info, pcbWidth, pcbHeight, panelWidth, panelHeight, config, toolingHoles)
+    infoTexts.push(...topRibTexts)
+  }
+
   // Fiducials — placed ONLY on side ribs, near corners, no overlap with tooling holes or other features
-  const fiducials: PanelResult['fiducials'] = []
+  let fiducials: PanelResult['fiducials'] = []
   const fidsTop = config.fiducialsTop !== false
   const fidsBottom = config.fiducialsBottom !== false
   if (config.enableFiducials && (fidsTop || fidsBottom)) {
@@ -837,24 +896,156 @@ export function computePanel(
     const gridRight = config.sideRibLeft + gridWidth
     const gridBottom = config.sideRibBottom
     const gridTop = config.sideRibBottom + gridHeight
- 
+
     const radius = config.fiducialDiameter / 2
     const clearanceOffset = Math.max(0, (config.fiducialClearance - config.fiducialDiameter) / 2)
- 
-    function isValidPosition(x: number, y: number): boolean {
+    // Small explicit margin beyond the mask-clearance geometry itself, so a
+    // fiducial's clearance ring doesn't just barely graze a hole or a line
+    // of rib text — confirmed live on real panels: text and pinning holes
+    // were landing ~1mm from a fiducial's edge, technically clear but too
+    // tight to trust across real fab registration tolerance.
+    const marginBeyondClearanceMm = 1.5
+    const fidHalfSpan = radius + clearanceOffset + marginBeyondClearanceMm
+
+    // Fiducial-to-fiducial spacing floor — the physical minimum that keeps
+    // mask-clearance rings from touching. The actual TARGET spacing is
+    // found by a binary search near the bottom of this block (see its own
+    // comment) and written into `minFidSpacingMm`, read by check #4 in
+    // `isValidPosition` below as a closure variable.
+    const physicalMinFidSpacingMm = config.fiducialDiameter + clearanceOffset * 2 + 2.0
+    let minFidSpacingMm = physicalMinFidSpacingMm
+
+    // ⚠ Reserved zones for rib TEXT, so a fiducial can never land under a
+    // layer-name label or the customer/PCB-name legend. These two features
+    // were designed independently with no coordination between them — a
+    // real customer panel showed the bottom-right fiducial candidate
+    // (`panelWidth - sideRibRight - 40`) landing exactly at the START of
+    // the "Bottom Copper" layer-label text on the bottom rib (both sit at
+    // the same Y = sideRibBottom/2, and the hardcoded -40 offset happened
+    // to fall inside the text's real span). Rather than guess a new magic
+    // offset, reject candidates that collide with the text zone and let
+    // the existing fallback candidate (on the side rib instead, structurally
+    // clear of both rib-text zones) take over — see `addFiducial` below.
+    //
+    // Top-rib zone: `generatePanelMetaText`'s own measured output, above —
+    // the real customer/PCB-name string width, not a guess. Tracked as a
+    // list of INDIVIDUAL intervals (one per infoText entry), not merged into
+    // one [min,max] envelope — see the bottom-rib comment below for why that
+    // merge is a real bug, not just imprecision.
+    interface XInterval { min: number; max: number }
+    const topRibIntervals: XInterval[] = []
+    for (const t of infoTexts) {
+      if (t.location !== 'top-rib') continue
+      const { lo, hi } = infoTextSpanX(t)
+      topRibIntervals.push({ min: lo, max: hi })
+    }
+    const topRibBandY = { min: panelHeight - config.sideRibTop, max: panelHeight }
+
+    // Bottom-rib zone: layer names aren't known this early (they depend on
+    // which Gerber files the customer imported, resolved later in
+    // `generateLayerLabels`), so the RIGHT side reserves the WORST-CASE
+    // realistic label — see `worstCaseBottomRibLabelZone`'s own docs, shared
+    // with the panel-meta-text overflow placement below so the two
+    // reservations can't drift apart. The LEFT side, though, can already
+    // carry REAL text by this point — `generatePanelMetaText`'s bottom-rib
+    // overflow tier (revision/date/PCB size/panel size, once the top rib
+    // runs out of height) — so that gets added in from the real measured
+    // `infoTexts`.
+    //
+    // ⚠ Kept as SEPARATE intervals, never merged into one [min,max] span —
+    // the left overflow text and the right worst-case reservation are
+    // usually far apart with genuinely empty rib in between, and a merged
+    // envelope falsely marks that whole empty middle as reserved. Confirmed
+    // live on a real 176.5mm panel: left text at [9.5,47] and the worst-case
+    // right zone at [131,175] merged into one [9.5,175] span, leaving
+    // fid_bl/fid_br nowhere to go anywhere on the bottom rib — both got
+    // pushed all the way up to the top rib instead, which is exactly the
+    // "avoid clustering" fix above defeating itself: with nothing available
+    // on bottom, all three fiducials landed on the one rib that still had
+    // room, clustered together rather than spread across corners.
+    const worstCase = worstCaseBottomRibLabelZone(config, panelWidth, toolingHoles)
+    const bottomRibIntervals: XInterval[] = [{ min: worstCase.minX, max: worstCase.maxX }]
+    for (const t of infoTexts) {
+      if (t.location !== 'bottom-rib') continue
+      const { lo, hi } = infoTextSpanX(t)
+      bottomRibIntervals.push({ min: lo, max: hi })
+    }
+    const bottomRibBandY = { min: 0, max: config.sideRibBottom }
+
+    // Left/right-rib zone: the vertical "PCB WxHmm" / "Panel WxHmm" (etc.)
+    // meta text `generatePanelMetaText`'s tier 3 places on the SIDE ribs when
+    // both are present — rotation 90°, so its real extent runs along Y, not
+    // X (see `infoTextSpanY`). This was missing entirely until a real panel
+    // showed both `fid_bl`'s and `fid_br`'s side-rib FALLBACK candidate (the
+    // one that centers the fiducial inside the left/right rib once the
+    // primary bottom-rib candidate is rejected) landing directly on top of
+    // this text — `collidesWithRibText` only ever checked X-intervals within
+    // a Y-band for the horizontal top/bottom rib text, with no equivalent
+    // check for the side ribs at all. Mirrors that same X-interval-in-Y-band
+    // shape, transposed: a Y-interval-in-X-band, since the side ribs are
+    // narrow vertical strips rather than horizontal ones.
+    const leftRibBandX = { min: 0, max: config.sideRibLeft }
+    const leftRibIntervals: XInterval[] = []
+    for (const t of infoTexts) {
+      if (t.location !== 'left-rib') continue
+      const { lo, hi } = infoTextSpanY(t)
+      leftRibIntervals.push({ min: lo, max: hi })
+    }
+    const rightRibBandX = { min: panelWidth - config.sideRibRight, max: panelWidth }
+    const rightRibIntervals: XInterval[] = []
+    for (const t of infoTexts) {
+      if (t.location !== 'right-rib') continue
+      const { lo, hi } = infoTextSpanY(t)
+      rightRibIntervals.push({ min: lo, max: hi })
+    }
+
+    // ⚠ Band membership (which rib, if any, a candidate is even near) must be
+    // inflated by `fidHalfSpan` too, not just the interval check within the
+    // band — a fiducial's CENTER can sit just outside a rib's Y (or X) band
+    // while its clearance-inflated disc still physically reaches into the
+    // band and touches the text there. Confirmed live on a random panel
+    // sweep: `fid_tr` landed a few mm below `topRibBandY.min` (so it read as
+    // "on the PCB grid, not the rib" by a center-only check) while its own
+    // clearance radius still overlapped the bottom-most of several stacked
+    // top-rib text lines.
+    function collidesWithRibText(x: number, y: number): boolean {
+      if (y + fidHalfSpan >= topRibBandY.min && y - fidHalfSpan <= topRibBandY.max) {
+        for (const iv of topRibIntervals) {
+          if (x + fidHalfSpan >= iv.min && x - fidHalfSpan <= iv.max) return true
+        }
+      }
+      if (y + fidHalfSpan >= bottomRibBandY.min && y - fidHalfSpan <= bottomRibBandY.max) {
+        for (const iv of bottomRibIntervals) {
+          if (x + fidHalfSpan >= iv.min && x - fidHalfSpan <= iv.max) return true
+        }
+      }
+      if (x + fidHalfSpan >= leftRibBandX.min && x - fidHalfSpan <= leftRibBandX.max) {
+        for (const iv of leftRibIntervals) {
+          if (y + fidHalfSpan >= iv.min && y - fidHalfSpan <= iv.max) return true
+        }
+      }
+      if (x + fidHalfSpan >= rightRibBandX.min && x - fidHalfSpan <= rightRibBandX.max) {
+        for (const iv of rightRibIntervals) {
+          if (y + fidHalfSpan >= iv.min && y - fidHalfSpan <= iv.max) return true
+        }
+      }
+      return false
+    }
+
+    function isValidPosition(x: number, y: number, ignoreRibText = false): boolean {
       // 1. Must be within panel boundaries with at least margin
       const margin = radius + 1.0
       if (x < margin || x > panelWidth - margin || y < margin || y > panelHeight - margin) {
         return false
       }
- 
+
       // 2. Must be on a side rib (NOT in the PCB grid area)
       const inGridX = x >= gridLeft && x <= gridRight
       const inGridY = y >= gridBottom && y <= gridTop
       if (inGridX && inGridY) {
         return false
       }
- 
+
       // 3. Must not overlap with tooling/reference holes (including clearance)
       for (const hole of toolingHoles) {
         const dist = Math.hypot(hole.x - x, hole.y - y)
@@ -864,21 +1055,42 @@ export function computePanel(
           return false
         }
       }
- 
-      // 4. Must not overlap with other already placed fiducials
+
+      // 4. Must not overlap with other already placed fiducials — and stay
+      // at least `minFidSpacingMm` apart (see the tiered-retry loop below):
+      // the bare physical minimum here used to be the ONLY spacing rule, so
+      // a scan or a small panel could legally place two fiducials just a
+      // few mm apart — technically non-overlapping but useless for
+      // pick-and-place/AOI, which wants fiducials well spread out for an
+      // accurate affine fit. Confirmed live: three fiducials landing within
+      // a 25mm span, two of them under 20mm apart, after the "no side ribs"
+      // scan fallback above put all three on the same rib.
       for (const fid of fiducials) {
         const dist = Math.hypot(fid.x - x, fid.y - y)
-        const minSpacing = config.fiducialDiameter + clearanceOffset * 2 + 2.0
-        if (dist < minSpacing) {
+        if (dist < minFidSpacingMm) {
           return false
         }
       }
- 
+
+      // 5. Must not collide with rib text (layer-name labels or the
+      // customer/PCB-name legend) — see the reservation comment above.
+      // Skippable (`ignoreRibText`) for the absolute-last-resort fiducial
+      // scan tier: "minimum 3 fiducials" is a hard requirement, avoiding
+      // decorative text is only a preference, and on a single narrow rib
+      // carrying holes + meta text + the worst-case per-layer-label
+      // reservation all at once, that reservation can legitimately consume
+      // the whole rib and leave zero HOLE-clear spots that also miss text —
+      // in that case a fiducial slightly under some rib text beats only
+      // having one or two fiducials on the whole panel.
+      if (!ignoreRibText && collidesWithRibText(x, y)) {
+        return false
+      }
+
       return true
     }
  
-    function addFiducial(id: string, x: number, y: number) {
-      if (isValidPosition(x, y)) {
+    function addFiducial(id: string, x: number, y: number, ignoreRibText = false) {
+      if (isValidPosition(x, y, ignoreRibText)) {
         const override = config.xyOverrides?.[id]
         const finalX = override?.x !== undefined ? override.x : x
         const finalY = override?.y !== undefined ? override.y : y
@@ -890,49 +1102,213 @@ export function computePanel(
       return false
     }
 
-    // We place three fiducials near the corners (Bottom-Left, Bottom-Right, Top-Right)
-    // Try placing on the top/bottom ribs as requested:
-
-    // 1. Bottom-Left Corner:
-    const blCandidates = [
-      { x: config.sideRibLeft + 15, y: config.sideRibBottom / 2 },
-      { x: config.sideRibLeft / 2, y: config.sideRibBottom + 12 }
-    ]
-    for (const c of blCandidates) {
-      if (addFiducial('fid_bl', c.x, c.y)) {
-        break
+    // Scanning fallbacks — see `fiducialFallbackChain` below. Only reached
+    // once the two fixed candidates for a corner both fail, so the common
+    // case (all four ribs present) is byte-identical to before.
+    function scanHorizontalRib(y: number, xFrom: number, xTo: number, stepMm: number, ignoreRibText = false): { x: number; y: number } | null {
+      const dir = xTo >= xFrom ? 1 : -1
+      for (let x = xFrom; dir > 0 ? x <= xTo : x >= xTo; x += dir * stepMm) {
+        if (isValidPosition(x, y, ignoreRibText)) return { x, y }
       }
+      return null
+    }
+    function scanVerticalRib(x: number, yFrom: number, yTo: number, stepMm: number, ignoreRibText = false): { x: number; y: number } | null {
+      const dir = yTo >= yFrom ? 1 : -1
+      for (let y = yFrom; dir > 0 ? y <= yTo : y >= yTo; y += dir * stepMm) {
+        if (isValidPosition(x, y, ignoreRibText)) return { x, y }
+      }
+      return null
     }
 
-    // 2. Bottom-Right Corner:
-    const brCandidates = [
-      { x: panelWidth - config.sideRibRight - 40, y: config.sideRibBottom / 2 },
-      { x: panelWidth - config.sideRibRight / 2, y: config.sideRibBottom + 12 }
-    ]
-    for (const c of brCandidates) {
-      if (addFiducial('fid_br', c.x, c.y)) {
-        break
-      }
+    // "Minimum 3 fiducials" is a hard requirement — a panel is only useful
+    // for pick-and-place/AOI registration with all three present, and
+    // dropping to one or two is a real defect, not a cosmetic shortfall (the
+    // routing/DFM engines raise blocking errors for the fabrication-safety
+    // equivalent of this; rib text degrades gracefully because it's cosmetic
+    // branding — fiducials are neither). The two FIXED candidates per corner
+    // below were tuned for the common case (all four ribs present) and are
+    // kept first for byte-identical output there, but they structurally
+    // cannot succeed once the relevant side rib is removed: the fallback
+    // candidate centers the fiducial IN that rib (`sideRibLeft/2` /
+    // `panelWidth - sideRibRight/2`), which sits exactly on the panel edge
+    // — outside the margin check — once that rib's width is 0. Confirmed
+    // live: removing the left AND right ribs left only `fid_tr` placed (its
+    // primary candidate happens to live on the TOP rib, which was still
+    // present), fid_bl/fid_br both silently missing.
+    //
+    // `fiducialFallbackChain` scans whichever ribs still have nonzero width
+    // — first a narrower "stay on your own corner's side" range so the
+    // three fiducials remain usefully spread out for orientation, then (if
+    // that finds nothing — e.g. rib-text or an unusually dense hole layout
+    // fills that whole range) the FULL rib width as a last resort. This
+    // guarantees a valid spot whenever ANY horizontal rib (top or bottom)
+    // has room anywhere, regardless of which side ribs are enabled.
+    const scanStepMm = 2.0
+    interface FiducialScanAttempt {
+      scan: () => { x: number; y: number } | null
+      ignoreRibText: boolean
     }
 
-    // 3. Top-Right Corner:
-    const trCandidates = [
-      { x: panelWidth - config.sideRibRight - 20, y: panelHeight - config.sideRibTop / 2 },
-      { x: panelWidth - config.sideRibRight / 2, y: panelHeight - config.sideRibTop - 12 }
-    ]
-    for (const c of trCandidates) {
-      if (addFiducial('fid_tr', c.x, c.y)) {
-        break
-      }
-    }
-  }
+    function fiducialFallbackChain(preferLeft: boolean, preferTop: boolean): FiducialScanAttempt[] {
+      const bottomY = config.sideRibBottom / 2
+      const topY = panelHeight - config.sideRibTop / 2
+      const sideX = preferLeft ? config.sideRibLeft / 2 : panelWidth - config.sideRibRight / 2
+      const sideRibWidth = preferLeft ? config.sideRibLeft : config.sideRibRight
+      const xMargin = radius + 1.0
+      const xFar = panelWidth - radius - 1.0
+      const yMargin = radius + 1.0
+      const yFar = panelHeight - radius - 1.0
+      const ownSideNear = preferLeft ? xMargin : xFar
+      const ownSideFar = preferLeft ? panelWidth * 0.4 : panelWidth * 0.6
 
-  // Generate top rib text (Customer Name, PCB Name/Part Number)
-  // This text will appear on all appropriate layers (generic text)
-  const infoTexts: InfoText[] = []
-  if (info) {
-    const topRibTexts = generateTopRibText(info, pcbWidth, pcbHeight, panelWidth, panelHeight, config, toolingHoles, rows, cols)
-    infoTexts.push(...topRibTexts)
+      const ownSideBottom: FiducialScanAttempt = { scan: () => config.sideRibBottom > 0 ? scanHorizontalRib(bottomY, ownSideNear, ownSideFar, scanStepMm) : null, ignoreRibText: false }
+      const ownSideTop: FiducialScanAttempt = { scan: () => config.sideRibTop > 0 ? scanHorizontalRib(topY, ownSideNear, ownSideFar, scanStepMm) : null, ignoreRibText: false }
+      const ownSideRib = preferTop ? [ownSideTop, ownSideBottom] : [ownSideBottom, ownSideTop]
+
+      return [
+        ...ownSideRib,
+        { scan: () => sideRibWidth > 0 ? scanVerticalRib(sideX, yMargin, yFar, scanStepMm) : null, ignoreRibText: false },
+        { scan: () => config.sideRibBottom > 0 ? scanHorizontalRib(bottomY, xMargin, xFar, scanStepMm) : null, ignoreRibText: false },
+        { scan: () => config.sideRibTop > 0 ? scanHorizontalRib(topY, xMargin, xFar, scanStepMm) : null, ignoreRibText: false },
+        // Absolute last resort: same two full-width scans again, but this
+        // time ignoring the rib-text reservation (never the holes/grid/other
+        // fiducials, which are real physical constraints). On a single
+        // narrow rib carrying holes + meta text + the worst-case per-layer-
+        // label reservation all at once, that reservation can legitimately
+        // consume the whole rib — confirmed live (sideRibTop=0, only an 8mm
+        // bottom rib) — and a fiducial slightly under some rib text beats
+        // the panel having only one or two fiducials at all. `ignoreRibText`
+        // must carry through to the final `addFiducial` re-validation below,
+        // not just the scan — otherwise the scan approves a spot the
+        // re-check then silently rejects again, and the fallback never
+        // actually succeeds (confirmed live: the scan found x=11.5 on an
+        // 8mm bottom rib, but `addFiducial` re-validated without the flag
+        // and rejected that same spot).
+        { scan: () => config.sideRibBottom > 0 ? scanHorizontalRib(bottomY, xMargin, xFar, scanStepMm, true) : null, ignoreRibText: true },
+        { scan: () => config.sideRibTop > 0 ? scanHorizontalRib(topY, xMargin, xFar, scanStepMm, true) : null, ignoreRibText: true },
+      ]
+    }
+
+    function placeFiducial(id: string, fixedCandidates: { x: number; y: number }[], scanFallbacks: FiducialScanAttempt[]): boolean {
+      for (const c of fixedCandidates) {
+        if (addFiducial(id, c.x, c.y)) return true
+      }
+      for (const attempt of scanFallbacks) {
+        const spot = attempt.scan()
+        if (spot && addFiducial(id, spot.x, spot.y, attempt.ignoreRibText)) return true
+      }
+      return false
+    }
+
+    // We place three fiducials near the corners (Bottom-Left, Bottom-Right,
+    // Top-Right). Places all three from scratch at a given spacing —
+    // restarting together, rather than keeping whichever corners already
+    // succeeded and only retrying the failures, avoids an early corner
+    // greedily claiming a spot at a spacing that a LATER corner then can't
+    // match, when a slightly different (still-achievable) choice for the
+    // early corner would have left room for all three.
+    //
+    // `allowIgnoreRibText` gates whether the scan chain's absolute-last-
+    // resort tiers (which skip the rib-text collision check) are even
+    // offered — see the phased search below for why this has to be a
+    // separate axis from the spacing search, not just another fallback tier.
+    function attemptAllAtSpacing(spacingMm: number, allowIgnoreRibText: boolean): boolean {
+      minFidSpacingMm = spacingMm
+      fiducials = []
+      const chain = (preferLeft: boolean, preferTop: boolean) => {
+        const full = fiducialFallbackChain(preferLeft, preferTop)
+        return allowIgnoreRibText ? full : full.filter(a => !a.ignoreRibText)
+      }
+
+      const blOk = placeFiducial('fid_bl', [
+        { x: config.sideRibLeft + 15, y: config.sideRibBottom / 2 },
+        { x: config.sideRibLeft / 2, y: config.sideRibBottom + 12 }
+      ], chain(true, false))
+
+      const brOk = placeFiducial('fid_br', [
+        { x: panelWidth - config.sideRibRight - 40, y: config.sideRibBottom / 2 },
+        { x: panelWidth - config.sideRibRight / 2, y: config.sideRibBottom + 12 }
+      ], chain(false, false))
+
+      const trOk = placeFiducial('fid_tr', [
+        { x: panelWidth - config.sideRibRight - 20, y: panelHeight - config.sideRibTop / 2 },
+        { x: panelWidth - config.sideRibRight / 2, y: panelHeight - config.sideRibTop - 12 }
+      ], chain(false, true))
+
+      return blOk && brOk && trOk
+    }
+
+    // Search for the WIDEST fiducial-to-fiducial spacing this panel can
+    // actually achieve, rather than settling for the first of a few fixed
+    // tiers that merely clears a floor. Real pick-and-place/AOI vision
+    // systems compute panel rotation/skew from the ANGLE between fiducials —
+    // the further apart they are, the less a small pixel-measurement error
+    // amplifies into a large angle error, so "as far apart as the panel
+    // allows" is the actual industry-practice target, not just "far enough
+    // to not cluster."
+    //
+    // ⚠ This is deliberately a LINEAR descent over candidate spacings, not a
+    // binary search. A binary search needs `attemptAllAtSpacing(spacing)` to
+    // be monotonic — success at a wide spacing implying success at every
+    // narrower one — and that does NOT actually hold here. `fid_bl` is
+    // spacing-invariant (no other fiducial exists yet when it's placed), but
+    // `fid_br` and `fid_tr` each take the FIRST candidate that clears their
+    // deterministic scan order; as the spacing threshold changes, an EARLIER
+    // (closer) candidate can newly become valid and get chosen instead of
+    // the one used at a different threshold. That can shift `fid_br` into a
+    // position that leaves LESS room for `fid_tr` than a narrower spacing
+    // would have — success is not simply "wider threshold, more room."
+    // Confirmed live: a bisection here converged to 15.5mm minimum spacing
+    // on a small panel even though 20mm was directly achievable — the
+    // midpoints binary search happened to probe in between landed on a
+    // worse `fid_br` placement and falsely reported failure, permanently
+    // discarding the wider half of the range. A plain descending scan can't
+    // make that mistake: it tests real candidate spacings in order from
+    // widest to narrowest and keeps the first (i.e. widest) that actually
+    // works, so it can never do worse than any individual spacing it tests.
+    // `diagonalMm` is a safe, always-unreachable upper bound, since no two
+    // points inside the panel can be farther apart than its own diagonal,
+    // let alone three pairs simultaneously. The step count is a FRACTION of
+    // the full range, so resolution scales with panel size automatically —
+    // fine-grained on a small panel, coarser (but still sub-mm to a few mm)
+    // on a large one — while keeping the total number of placement attempts
+    // (and thus runtime) bounded regardless of panel size.
+    //
+    // ⚠ The search runs in TWO PHASES, not one search that happens to reach
+    // the `ignoreRibText` tiers when convenient. A single search across the
+    // full chain (spacing and text-avoidance both relaxing together)
+    // pushes the spacing *as wide as the loosest rule allows* — which
+    // routinely means landing on an `ignoreRibText` position purely to buy
+    // a few more mm of spread, even though a slightly tighter — but
+    // otherwise completely clean — spacing was available. Confirmed live:
+    // a 100mm-wide panel placed `fid_tr` directly under the customer/PCB
+    // name text, when backing off to a still-wide-enough spacing avoided
+    // it entirely. `ignoreRibText` exists ONLY to guarantee "minimum 3" as
+    // a last resort (see that section above) — it must never be spent on
+    // spacing that clean placement didn't need. So: search phase 1 with
+    // `allowIgnoreRibText: false` first; only if THAT fails even at the
+    // physical floor (i.e. clean placement is impossible at any spacing)
+    // does phase 2 re-run the same search allowing it.
+    const diagonalMm = Math.hypot(panelWidth, panelHeight)
+    const spacingSearchSteps = 48
+    function widestSpacingSearch(allowIgnoreRibText: boolean): boolean {
+      const range = diagonalMm - physicalMinFidSpacingMm
+      for (let i = 0; i <= spacingSearchSteps; i++) {
+        const spacing = i === spacingSearchSteps
+          ? physicalMinFidSpacingMm
+          : diagonalMm - (i / spacingSearchSteps) * range
+        if (attemptAllAtSpacing(spacing, allowIgnoreRibText)) return true
+      }
+      return false
+    }
+
+    if (!widestSpacingSearch(false)) {
+      widestSpacingSearch(true)
+    }
+
+    if (fiducials.length < 3) {
+      console.warn(`[Fiducial] Could only place ${fiducials.length}/3 fiducials even at the tightest spacing (${physicalMinFidSpacingMm.toFixed(1)}mm) — panel has no rib space left anywhere`)
+    }
   }
 
   return { pcbWidth, pcbHeight, panelWidth, panelHeight, pcbPositions, toolingHoles, fiducials, infoTexts, totalPCBs: rows * cols }
@@ -964,6 +1340,171 @@ export function computePanel(
  * @param config - Panel configuration (for rib dimensions)
  * @returns Array of InfoText items to be added to the panel result
  */
+/**
+ * The real world-space X span `[lo, hi]` an `InfoText` entry (rotation 0)
+ * covers, honoring `mirrored`. A non-mirrored entry grows RIGHT from its
+ * anchor (`[x, x+w]`, `align: 'left'`) — a mirrored one grows LEFT from its
+ * anchor instead (`transformPoint` flips `nx`), so its real span is
+ * `[x-w, x]`, not `[x, x+w]`. Reusing the non-mirrored formula for a
+ * mirrored entry silently reserves a second, phantom text-width of space on
+ * the WRONG side of the anchor — confirmed live: with both side ribs
+ * removed, the top-rib name line's mirrored copy inflated the fiducial
+ * text-reservation zone from its real ~50mm span out to ~100mm, consuming
+ * the entire rib and leaving `fid_tr` with nowhere valid to land at all.
+ */
+function infoTextSpanX(t: InfoText): { lo: number; hi: number } {
+  const w = measureRegionText(t.text) * t.fontSize
+  return t.mirrored ? { lo: t.x - w, hi: t.x } : { lo: t.x, hi: t.x + w }
+}
+
+/**
+ * The real world-space Y span `[lo, hi]` a `rotation: 90` `InfoText` entry
+ * (the `left-rib`/`right-rib` vertical meta text — see `generatePanelMetaText`'s
+ * tier 3) covers. `transformPoint` (region-font.ts) rotates the local reading
+ * axis onto world Y for a 90° entry (cosR=0, sinR=1: `ry = mx`), so the same
+ * mirrored/non-mirrored growth-direction rule `infoTextSpanX` uses for a
+ * horizontal entry's X span applies here to the Y span instead: a
+ * non-mirrored entry grows from its anchor toward +Y (`[y, y+len]`), a
+ * mirrored one grows toward -Y (`[y-len, y]`) — matching how
+ * `placeSideGroup` anchors its two copies of each line at `startY` and
+ * `endY = startY + textLen` respectively.
+ */
+function infoTextSpanY(t: InfoText): { lo: number; hi: number } {
+  const len = measureRegionText(t.text) * t.fontSize
+  return t.mirrored ? { lo: t.y - len, hi: t.y } : { lo: t.y, hi: t.y + len }
+}
+
+/**
+ * The free-width zone on the RIGHT side of the bottom rib that
+ * `generateLayerLabels`'s per-layer labels will eventually occupy. The real
+ * layer list isn't known this early (`computePanel` has no access to it —
+ * layer labels are generated later, in `store.ts`, once the customer's
+ * actual Gerber imports are known) so this is a worst-case reservation sized
+ * from the longest label string this codebase's naming ever produces
+ * ("Bottom Copper"/"Bottom Silk"/"Bottom Paste", all 13 characters), at the
+ * actual configured rib font size, anchored at the same fixed
+ * `panelWidth - 17` / `panelWidth - 30` positions `generateLayerLabels`
+ * itself uses. Shared by the fiducial rib-text reservation and by
+ * `generatePanelMetaText`'s bottom-rib-left overflow placement, so the two
+ * can't drift apart.
+ *
+ * ⚠ Must run the SAME `clearHolesAlongAxis` hole-avoidance `generateLayerLabels`
+ * itself applies, using the same worst-case width, direction, and
+ * `holeClearanceMm` — not just the raw unshifted `panelWidth - 17` /
+ * `panelWidth - 30` anchors. A real panel's `ref_br`/`tooling_br` can sit
+ * close enough to the bottom-right corner that `generateLayerLabels` shifts
+ * its real "Bottom Copper" label further left/right than this reservation
+ * assumed, letting a fiducial validated against the (too-narrow) unshifted
+ * zone land under the label once it's actually placed — confirmed via a
+ * randomized sweep across panel/rib sizes: `fid_br` landing within under
+ * 1mm of the real label's edge, a consistent gap regardless of panel size
+ * (the shift itself doesn't depend on panel size, only on hole geometry
+ * relative to the corner). Passing `toolingHoles` here and reusing the exact
+ * same shift logic keeps the two reservations honest instead of two
+ * independently-guessed anchors that can silently drift apart.
+ *
+ * ⚠ The reservation unions BOTH the unshifted anchor AND the
+ * `clearHolesAlongAxis`-shifted one (each spanned by the worst-case width),
+ * rather than trusting the shifted one alone. `clearHolesAlongAxis`'s
+ * retreat-vs-advance choice depends on the SPAN WIDTH — a real label is
+ * almost always narrower than the worst-case string, so it can collide with
+ * a hole the (wider) worst-case span doesn't, or resolve the same collision
+ * by shifting a different amount or even a different direction. A follow-up
+ * randomized sweep caught exactly this after the shift-aware fix above:
+ * "Top Copper" (real, narrower) shifted from its unshifted anchor while the
+ * worst-case-width span at that same anchor found no collision to shift
+ * for, so the single "shifted" span alone didn't cover the real label's
+ * position. Unioning both is a cheap superset that doesn't need to reason
+ * about which specific width would trigger which shift.
+ */
+function worstCaseBottomRibLabelZone(
+  config: PanelConfig,
+  panelWidth: number,
+  toolingHoles?: PanelResult['toolingHoles']
+): { minX: number; maxX: number } {
+  const bottomRibFontSizeMm = config.bottomRibFontSize ?? 1.8
+  const worstCaseLabelWidth = measureRegionText('Bottom Copper') * bottomRibFontSizeMm
+  const bottomGroupAnchorX = panelWidth - 17
+  const topGroupAnchorX = panelWidth - 30
+  const holeClearanceMm = 2.5
+  const ribHeight = config.sideRibBottom
+  const bottomRibHoles = (toolingHoles ?? []).filter(h => h.y >= -0.01 && h.y <= ribHeight + 0.01)
+  const clearedBottomAnchorX = clearHolesAlongAxis(bottomGroupAnchorX, worstCaseLabelWidth, bottomRibHoles, 'left', holeClearanceMm)
+  const clearedTopAnchorX = clearHolesAlongAxis(topGroupAnchorX, worstCaseLabelWidth, bottomRibHoles, 'right', holeClearanceMm)
+  return {
+    minX: Math.min(
+      bottomGroupAnchorX - worstCaseLabelWidth,
+      clearedBottomAnchorX - worstCaseLabelWidth,
+      topGroupAnchorX,
+      clearedTopAnchorX
+    ),
+    maxX: Math.max(
+      bottomGroupAnchorX,
+      clearedBottomAnchorX,
+      topGroupAnchorX + worstCaseLabelWidth,
+      clearedTopAnchorX + worstCaseLabelWidth
+    ),
+  }
+}
+
+/**
+ * Nudge a text anchor along one growth direction until it clears every hole
+ * in the list — `[anchor, anchor+width]` growing right, `[anchor-width,
+ * anchor]` growing left — iterating to a fixed point since clearing one hole
+ * can newly overlap another further along the same direction. Shared by
+ * `generateLayerLabels` (bottom-rib layer labels vs. tooling/reference
+ * holes) and `generatePanelMetaText` (top-rib and bottom-rib-left overflow
+ * text vs. the same holes).
+ *
+ * On a collision there are always two ways to clear a hole — retreat behind
+ * its near edge, or advance past its far edge — and this picks whichever
+ * needs LESS displacement from the current anchor, not always retreat. An
+ * earlier version always retreated, which is what `generateLayerLabels`'s
+ * right-growing labels happen to want (their anchor starts near the panel's
+ * right edge with open space to their left) but is the wrong choice for
+ * left-anchored, right-growing text with a hole close by (`
+ * generatePanelMetaText`'s bottom-rib-left overflow, and its top-rib name
+ * line on a small-rib panel): retreating from a small hole a few mm to the
+ * right of a left-edge anchor pushes the anchor negative — off the panel
+ * entirely — confirmed live (anchor landed at -32mm on a 110mm panel).
+ * Advancing past the hole instead needs only a few mm and stays on-panel.
+ */
+function clearHolesAlongAxis(
+  startX: number,
+  width: number,
+  holes: { x: number; diameter: number }[],
+  direction: 'right' | 'left',
+  clearanceMm: number
+): number {
+  let anchor = startX
+  for (let iter = 0; iter <= holes.length; iter++) {
+    let moved = false
+    for (const h of holes) {
+      const holeMin = h.x - h.diameter / 2 - clearanceMm
+      const holeMax = h.x + h.diameter / 2 + clearanceMm
+      if (direction === 'right') {
+        const spanLo = anchor, spanHi = anchor + width
+        if (spanHi > holeMin && spanLo < holeMax) {
+          const retreat = holeMin - width  // span entirely before the hole
+          const advance = holeMax          // span entirely after the hole
+          anchor = Math.abs(retreat - anchor) <= Math.abs(advance - anchor) ? retreat : advance
+          moved = true
+        }
+      } else {
+        const spanLo = anchor - width, spanHi = anchor
+        if (spanHi > holeMin && spanLo < holeMax) {
+          const advance = holeMax + width  // span entirely after the hole
+          const retreat = holeMin          // span entirely before the hole
+          anchor = Math.abs(advance - anchor) <= Math.abs(retreat - anchor) ? advance : retreat
+          moved = true
+        }
+      }
+    }
+    if (!moved) break
+  }
+  return anchor
+}
+
 export function generateLayerLabels(
   layers: LayerLabelInfo[],
   panelWidth: number,
@@ -1016,15 +1557,35 @@ export function generateLayerLabels(
   const topFirstCharX = panelWidth - 30  // "T" at 30mm from right border
   const bottomFirstCharX = panelWidth - 17  // "B" at 17mm from right border
 
-  // Calculate anchor points for positioning
-  // For TOP layers (normal left-aligned): anchor at first character position
-  // All top texts share the same anchor point for overlapping
-  const topAnchorX = topFirstCharX
+  // These hardcoded offsets were tuned against tooling/reference hole positions
+  // that are placed independently in the hole-placement block above (real
+  // examples: ref_br/tooling_br routinely land at ~97.5-102mm on a 110mm-wide
+  // panel) and can drill straight through the label text — a real hole punched
+  // through printed layer-ID text, not just a preview glitch. Unlike the
+  // fiducial/rib-text fix above (which reserves a zone before placement), here
+  // the real label strings and their measured widths are only known at this
+  // call (computePanel has no layer list), so the anchors are nudged clear of
+  // any hole on this rib using the REAL measured text width via
+  // measureRegionText, same source of truth the emitter and preview both use.
+  // 1.0mm used to leave the label text landing only ~1.1-1.2mm from a
+  // pinning hole's edge in real exports — technically clear but tight
+  // enough that a user reasonably read it as "placed near the hole".
+  // Widened for a safer real-world margin against fab registration
+  // tolerance.
+  const holeClearanceMm = 2.5
+  const bottomRibHoles = (toolingHoles ?? []).filter(h => h.y >= -0.01 && h.y <= ribHeight + 0.01)
+  const maxTopWidth = topLabels.reduce((max, l) => Math.max(max, measureRegionText(l.name) * fontSize), 0)
+  const maxBottomWidth = bottomLabels.reduce((max, l) => Math.max(max, measureRegionText(l.name) * fontSize), 0)
 
-  // For BOTTOM layers (mirrored right-aligned): anchor at first character position
-  // All bottom texts share the same anchor point for overlapping
-  const bottomAnchorX = bottomFirstCharX
+  const topAnchorX = topLabels.length > 0 ? clearHolesAlongAxis(topFirstCharX, maxTopWidth, bottomRibHoles, 'right', holeClearanceMm) : topFirstCharX
+  const bottomAnchorX = bottomLabels.length > 0 ? clearHolesAlongAxis(bottomFirstCharX, maxBottomWidth, bottomRibHoles, 'left', holeClearanceMm) : bottomFirstCharX
 
+  if (topAnchorX !== topFirstCharX) {
+    console.log(`[Label Position] TOP layers anchor shifted from ${topFirstCharX.toFixed(2)}mm to ${topAnchorX.toFixed(2)}mm to clear tooling/reference holes (widest label ${maxTopWidth.toFixed(2)}mm)`)
+  }
+  if (bottomAnchorX !== bottomFirstCharX) {
+    console.log(`[Label Position] BOTTOM layers anchor shifted from ${bottomFirstCharX.toFixed(2)}mm to ${bottomAnchorX.toFixed(2)}mm to clear tooling/reference holes (widest label ${maxBottomWidth.toFixed(2)}mm)`)
+  }
   console.log(`[Label Position] TOP layers: First char at ${topFirstCharX.toFixed(2)}mm (30mm from right border), Anchor at ${topAnchorX.toFixed(2)}mm`)
   console.log(`[Label Position] BOTTOM layers: First char at ${bottomFirstCharX.toFixed(2)}mm (17mm from right border), Anchor at ${bottomAnchorX.toFixed(2)}mm`)
 
@@ -1073,108 +1634,219 @@ export function generateLayerLabels(
 }
 
 /**
- * Generate panel info text for top rib (Customer Name, PCB Name/Part Number)
- * This text will appear on all appropriate layers (generic text, no specific layer targeting)
+ * Generate panel meta text — customer/PCB name, revision, date, PCB size,
+ * and panel size — across the panel's ribs.
  *
- * @param info - Panel information containing customer reference, PCB name, etc.
+ * The customer/PCB-name line is the one line that always exists and is
+ * never dropped; it keeps its original anchor (3.5mm right of the top-left
+ * tooling hole) so existing panels don't shift. The three new lines
+ * (revision+date, PCB size, panel size) are placed tier by tier, most
+ * important first, each tier only used once the previous one runs out of
+ * room:
+ *
+ *   1. TOP rib, stacked below the name line — as many lines as
+ *      `config.sideRibTop` has height for.
+ *   2. BOTTOM rib, LEFT side — clear of `ref_bl`/`tooling_bl` (via the same
+ *      `clearHolesAlongAxis` hole-avoidance `generateLayerLabels` uses) and
+ *      of the worst-case per-layer-label zone reserved on the right
+ *      (`worstCaseBottomRibLabelZone`) — as many as `config.sideRibBottom`
+ *      has height for and as fit before that zone.
+ *   3. LEFT/RIGHT side ribs, vertical text — only entered if the user has
+ *      actually given the panel side ribs (`sideRibLeft`/`sideRibRight` both
+ *      > 0), split between the two ribs, centered on the grid's own vertical
+ *      span. Rotation 90° (reads bottom-to-top), matching the `InfoText`
+ *      rotation convention already documented on the type.
+ *
+ * Anything that still doesn't fit after all three tiers is dropped with a
+ * console.warn rather than silently overlapping another feature — this is
+ * cosmetic panel branding, not a fabrication safety feature (contrast with
+ * the routing/DFM engines, which raise a blocking error instead: those are
+ * toolpaths that would scrap a board if wrong).
+ *
+ * @param info - Panel information containing customer reference, PCB name, revision, date
+ * @param pcbWidth - Single PCB width in mm
+ * @param pcbHeight - Single PCB height in mm
  * @param panelWidth - Full panel width in mm
  * @param panelHeight - Full panel height in mm
  * @param config - Panel configuration with side rib dimensions
- * @param toolingHoles - Tooling holes positions for positioning reference
- * @returns Array of InfoText items for top rib
+ * @param toolingHoles - Tooling/reference hole positions, for anchor + hole-avoidance
+ * @returns Array of InfoText items across whichever ribs had room
  */
-export function generateTopRibText(
+export function generatePanelMetaText(
   info: PanelInfo,
   pcbWidth: number,
   pcbHeight: number,
   panelWidth: number,
   panelHeight: number,
   config: PanelConfig,
-  toolingHoles?: PanelResult['toolingHoles'],
-  rows: number = 2,
-  cols: number = 3
+  toolingHoles?: PanelResult['toolingHoles']
 ): InfoText[] {
   const texts: InfoText[] = []
-
   if (!info) return texts
 
-  // Calculate Y position: center of top rib
-  const ribHeight = config.sideRibTop
-  const topRibY = panelHeight - ribHeight / 2  // Center of top rib
+  const topFontSize = config.topRibFontSize ?? 2.8
+  const bottomFontSize = config.bottomRibFontSize ?? 1.8
+  const lineHeightOf = (fontSize: number) => fontSize * 1.4
+  const marginMm = 1.0
+  // Matches generateLayerLabels' own widened margin — see that constant's
+  // comment for why 1.0mm wasn't enough real-world clearance.
+  const holeClearanceMm = 2.5
+  const measureTextWidth = (text: string, fontSize: number) => measureRegionText(text) * fontSize
 
-  // Text width for positioning, using the shared region-font metrics so the
-  // rib text lands exactly where the glyphs render (single source of truth —
-  // see measureRegionText in region-font.ts).
-  const measureTextWidth = (text: string) => measureRegionText(text) * fontSize
+  // Content lines, most important first — the name line is never dropped.
+  const dateText = info.date || ''
+  let remaining: string[] = [
+    `${info.customerRef || 'Customer Name'} : ${info.pcbName || 'PCB-001'}`,
+    `Rev ${info.revision || '1.0'}${dateText ? '  ' + dateText : ''}`,
+    `PCB ${pcbWidth.toFixed(1)}x${pcbHeight.toFixed(1)}mm`,
+    `Panel ${panelWidth.toFixed(1)}x${panelHeight.toFixed(1)}mm`,
+  ]
 
-  // Position: 3.5mm right of top left tooling hole (first character position)
+  const pushHorizontalPair = (
+    lineText: string, anchorX: number, y: number, fontSize: number, location: 'top-rib' | 'bottom-rib'
+  ) => {
+    const textWidth = measureTextWidth(lineText, fontSize)
+    texts.push({ x: anchorX, y, text: lineText, fontSize, align: 'left', rotation: 0, location, mirrored: false })
+    texts.push({ x: anchorX + textWidth, y, text: lineText, fontSize, align: 'left', rotation: 0, location, mirrored: true })
+  }
+
+  // --- Tier 1: TOP rib, stacked from the top-left tooling hole ---
   const textOffsetFromHole = 3.5
   let firstCharX = 10.0 // fallback position
-
-  if (toolingHoles && toolingHoles.length > 0) {
-    // Find top left tooling hole (lowest X, highest Y)
-    const topLeftHole = toolingHoles
-      .filter(h => h.type === 'tooling')
-      .reduce((topleft, hole) => {
-        // Prefer lowest X, then highest Y (top left corner)
-        if (hole.y > topleft.y) return hole
-        if (hole.y === topleft.y && hole.x < topleft.x) return hole
-        return topleft
-      }, toolingHoles[0])
-
-    if (topLeftHole) {
-      firstCharX = topLeftHole.x + textOffsetFromHole
-      console.log(`[Top Rib Position] Using top left tooling hole at (${topLeftHole.x.toFixed(2)}, ${topLeftHole.y.toFixed(2)}), text position: ${firstCharX.toFixed(2)}mm`)
-    }
+  // Reduce over the FILTERED array with its own [0] as the seed — reducing
+  // over the filtered list but seeding from the unfiltered `toolingHoles[0]`
+  // silently returns that seed untouched when no 'tooling'-type hole exists
+  // at all (e.g. small ribs reject tooling holes as too close to the edge —
+  // see `addHole`'s `minEdgeDistance` check — while the smaller reference
+  // holes still fit), landing on a 'reference' hole's position instead. Found
+  // via the tiny-rib regression test for the panel-meta-text tiers below.
+  const toolingOnly = (toolingHoles ?? []).filter(h => h.type === 'tooling')
+  if (toolingOnly.length > 0) {
+    const topLeftHole = toolingOnly.reduce((topleft, hole) => {
+      if (hole.y > topleft.y) return hole
+      if (hole.y === topleft.y && hole.x < topleft.x) return hole
+      return topleft
+    }, toolingOnly[0])
+    firstCharX = topLeftHole.x + textOffsetFromHole
+    console.log(`[Top Rib Position] Using top left tooling hole at (${topLeftHole.x.toFixed(2)}, ${topLeftHole.y.toFixed(2)}), text position: ${firstCharX.toFixed(2)}mm`)
   } else {
     console.log(`[Top Rib Position] No tooling holes found, using fallback position: ${firstCharX.toFixed(2)}mm`)
   }
 
-  // Prepare single line of text as requested: "Customer name: PCB name"
-  const linesOfText: string[] = [
-    `${info.customerRef || 'Customer Name'} : ${info.pcbName || 'PCB-001'}`
-  ]
+  const topRibY = panelHeight - config.sideRibTop / 2
+  const topLineHeight = lineHeightOf(topFontSize)
+  const topLinesFit = Math.max(1, Math.floor((config.sideRibTop - marginMm) / topLineHeight))
 
-  const fontSize = config.topRibFontSize ?? 2.8
-  const lineSpacing = 0 // Only one line
+  const placedOnTop = remaining.splice(0, Math.min(topLinesFit, remaining.length))
 
-  for (let i = 0; i < linesOfText.length; i++) {
-    const combinedText = linesOfText[i]
-    const currentLineY = topRibY - (i * lineSpacing)
+  // All lines in this tier share one X anchor (stacked at different Y) — clear
+  // it against every hole on the top rib (tooling AND reference; the fallback
+  // `firstCharX` above has no hole awareness at all, and even the tooling-hole
+  // anchor sits close enough to the top-left reference-hole pair that a wide
+  // enough line can still reach them) using the widest line that will actually
+  // land here, same `clearHolesAlongAxis` machinery `generateLayerLabels` uses.
+  const topRibHoles = (toolingHoles ?? []).filter(h => h.y >= panelHeight - config.sideRibTop - 0.01)
+  const maxTopMetaWidth = placedOnTop.reduce((max, l) => Math.max(max, measureTextWidth(l, topFontSize)), 0)
+  const clearedFirstCharX = clearHolesAlongAxis(firstCharX, maxTopMetaWidth, topRibHoles, 'right', holeClearanceMm)
+  // The name line is never dropped, so it must never be pushed off the panel
+  // (a wide enough name + a cramped top-left hole cluster can otherwise walk
+  // the anchor negative — clearing holes is only useful while it stays on
+  // the panel). Clamp to the margin and accept the residual hole overlap in
+  // that genuinely-too-tight case; this is cosmetic branding text, not a
+  // fabrication safety feature.
+  if (clearedFirstCharX < marginMm) {
+    console.warn(`[Top Rib] Widest line (${maxTopMetaWidth.toFixed(2)}mm) doesn't fit clear of top-left holes on this panel — clamping anchor to the margin instead of pushing it off-panel`)
+    firstCharX = marginMm
+  } else {
+    firstCharX = clearedFirstCharX
+  }
 
-    if (combinedText.trim()) {
-      const textWidth = measureTextWidth(combinedText)
-      const rightAnchorX = firstCharX + textWidth
+  placedOnTop.forEach((lineText, i) => {
+    // Stack downward, centered as a group around the rib's vertical middle.
+    const groupOffset = ((placedOnTop.length - 1) / 2) * topLineHeight
+    const lineY = topRibY + groupOffset - i * topLineHeight
+    console.log(`[Top Rib] Adding line ${i}: "${lineText}" at ${firstCharX.toFixed(2)}mm`)
+    pushHorizontalPair(lineText, firstCharX, lineY, topFontSize, 'top-rib')
+  })
+  console.log(`[Top Rib] Generated ${placedOnTop.length * 2} texts (${placedOnTop.length} per side) in ${placedOnTop.length} lines`)
 
-      console.log(`[Top Rib] Adding line ${i}: "${combinedText}" at ${firstCharX.toFixed(2)}mm`)
+  // --- Tier 2: BOTTOM rib, LEFT side (clear of ref_bl/tooling_bl and the
+  // worst-case per-layer-label zone the RIGHT side is reserved for) ---
+  if (remaining.length > 0) {
+    const ribHeight = config.sideRibBottom
+    const bottomLineHeight = lineHeightOf(bottomFontSize)
+    const bottomLinesFitByHeight = Math.max(0, Math.floor((ribHeight - marginMm) / bottomLineHeight))
+    const bottomRibHoles = (toolingHoles ?? []).filter(h => h.y >= -0.01 && h.y <= ribHeight + 0.01)
+    const zone = worstCaseBottomRibLabelZone(config, panelWidth, toolingHoles)
+    const bottomStartX = config.sideRibLeft + 2.0
+    const bottomCenterY = ribHeight / 2
 
-      // Add normal version for top layers (Start at LEFT, render right)
-      texts.push({
-        x: firstCharX,
-        y: currentLineY,
-        text: combinedText,
-        fontSize,
-        align: 'left',
-        rotation: 0,
-        location: 'top-rib',
-        mirrored: false,
+    const placedOnBottom: string[] = []
+    for (const lineText of remaining) {
+      if (placedOnBottom.length >= bottomLinesFitByHeight) break
+      const textWidth = measureTextWidth(lineText, bottomFontSize)
+      const anchorX = clearHolesAlongAxis(bottomStartX, textWidth, bottomRibHoles, 'right', holeClearanceMm)
+      if (anchorX + textWidth + marginMm > zone.minX) break // would run into the per-layer-label zone
+      placedOnBottom.push(lineText)
+    }
+    remaining = remaining.slice(placedOnBottom.length)
+
+    placedOnBottom.forEach((lineText, i) => {
+      const groupOffset = ((placedOnBottom.length - 1) / 2) * bottomLineHeight
+      const lineY = bottomCenterY + groupOffset - i * bottomLineHeight
+      const textWidth = measureTextWidth(lineText, bottomFontSize)
+      const anchorX = clearHolesAlongAxis(bottomStartX, textWidth, bottomRibHoles, 'right', holeClearanceMm)
+      console.log(`[Bottom Rib] Adding meta line: "${lineText}" at ${anchorX.toFixed(2)}mm`)
+      pushHorizontalPair(lineText, anchorX, lineY, bottomFontSize, 'bottom-rib')
+    })
+  }
+
+  // --- Tier 3: LEFT/RIGHT side ribs, vertical text — only if the user has
+  // actually given the panel side ribs (nonzero width) ---
+  if (remaining.length > 0 && config.sideRibLeft > 0 && config.sideRibRight > 0) {
+    const sideFontSize = bottomFontSize
+    const sideLineThickness = sideFontSize * 1.4 // horizontal thickness once rotated 90°
+    const leftOk = config.sideRibLeft >= sideFontSize + marginMm
+    const rightOk = config.sideRibRight >= sideFontSize + marginMm
+
+    if (leftOk || rightOk) {
+      const gridBottom = config.sideRibBottom
+      const gridTop = panelHeight - config.sideRibTop
+      const availableRun = gridTop - gridBottom
+      const midY = (gridBottom + gridTop) / 2
+
+      const fitting = remaining.filter(lineText => measureTextWidth(lineText, sideFontSize) + marginMm * 2 <= availableRun)
+      remaining = remaining.filter(l => !fitting.includes(l))
+
+      const leftLines: string[] = []
+      const rightLines: string[] = []
+      fitting.forEach((lineText, i) => {
+        if (leftOk && rightOk) (i % 2 === 0 ? leftLines : rightLines).push(lineText)
+        else if (leftOk) leftLines.push(lineText)
+        else rightLines.push(lineText)
       })
 
-      // Add mirrored version for bottom layers (Start at RIGHT, render left)
-      texts.push({
-        x: rightAnchorX,
-        y: currentLineY,
-        text: combinedText,
-        fontSize,
-        align: 'left',
-        rotation: 0,
-        location: 'top-rib',
-        mirrored: true,
-      })
+      const placeSideGroup = (lines: string[], location: 'left-rib' | 'right-rib', centerX: number) => {
+        lines.forEach((lineText, i) => {
+          const textLen = measureTextWidth(lineText, sideFontSize)
+          const groupOffset = ((lines.length - 1) / 2) * sideLineThickness
+          const lineX = centerX + groupOffset - i * sideLineThickness
+          const startY = midY - textLen / 2
+          const endY = startY + textLen
+          console.log(`[${location}] Adding vertical meta line: "${lineText}" at x=${lineX.toFixed(2)}mm`)
+          texts.push({ x: lineX, y: startY, text: lineText, fontSize: sideFontSize, align: 'left', rotation: 90, location, mirrored: false })
+          texts.push({ x: lineX, y: endY, text: lineText, fontSize: sideFontSize, align: 'left', rotation: 90, location, mirrored: true })
+        })
+      }
+      placeSideGroup(leftLines, 'left-rib', config.sideRibLeft / 2)
+      placeSideGroup(rightLines, 'right-rib', panelWidth - config.sideRibRight / 2)
     }
   }
 
-  console.log(`[Top Rib] Generated ${texts.length} texts (${texts.length / 2} per side) in ${linesOfText.length} lines`)
+  if (remaining.length > 0) {
+    console.warn(`[Panel Meta Text] ${remaining.length} line(s) dropped — no rib had room: ${remaining.join(' | ')}`)
+  }
+
   return texts
 }
 
