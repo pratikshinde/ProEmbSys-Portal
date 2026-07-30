@@ -298,6 +298,114 @@ export function generateDrillGcode(
   return lines.join('\n')
 }
 
+/**
+ * G-code that mills the meta-panelization array's corner-mark paths (from
+ * `panel-array.ts`'s `generateBorderMarkPaths`) directly into a sacrificial
+ * spoiler board — one plunge/cut/retract per corner, same sequencing as
+ * `generateRouteGcode`'s per-path loop, but deliberately duplicated rather
+ * than shared: there is no `RoutingResult`/tool-diameter filter here (these
+ * paths aren't cutter-compensated board edges, just centerline scoring), and
+ * `cutDepthMm` is a separate parameter — not `ctx.cutDepthMm` — because this
+ * cuts into a blank spoiler board, not the customer's own board + backer.
+ * Consistent with this file's existing precedent of keeping near-similar but
+ * physically-different templates separate (see the file header comment).
+ */
+export function generateMarkRoutingGcode(
+  paths: Pt[][],
+  ctx: GcodeContext,
+  cutDepthMm: number
+): string {
+  const lines: string[] = []
+  lines.push('(META-PANEL BORDER MARKS)')
+  lines.push('(HEADER_BEGIN)')
+  lines.push('')
+  lines.push('G90 (Absolute)')
+  lines.push(`G64 P${ctx.pathToleranceMm}`)
+  lines.push(`${ctx.workOffset} (Work Co ordinate system)`)
+  lines.push(`M3 S${ctx.spindleRpm} (Spindle On)`)
+  lines.push(`G04 P${ctx.dwellSeconds}`)
+  if (ctx.pressurePad) lines.push('M64 P0 (PRESSURE PAD DOWN)')
+  lines.push('(HEADER_END)')
+  lines.push('(=======================================)')
+  lines.push(`#<Z_Retract> = ${ctx.retractZmm.toFixed(4)}`)
+  lines.push(`#<Z_Depth> = ${cutDepthMm.toFixed(4)}`)
+  lines.push(`#<Z_Feed> = ${Math.round(ctx.routeZFeedMmPerMin)}`)
+  lines.push(`#<XY_Feed> = ${Math.round(ctx.routeXYFeedMmPerMin)}`)
+  lines.push('(=======================================)')
+  lines.push('G21')
+  lines.push(`M3 S${ctx.spindleRpm}`)
+  lines.push(`G00 Z${ctx.safeZmm.toFixed(3)}`)
+  lines.push('G00 X0Y0')
+  lines.push('G00 Z#<Z_Retract>')
+
+  for (const path of paths) {
+    if (path.length < 2) continue
+    const [first, second, ...tail] = path
+    lines.push(`G00 ${xy(first)}`)
+    lines.push('G01 Z#<Z_Depth>F#<Z_Feed>')
+    lines.push(`G01 ${xy(second)}F#<XY_Feed>`)
+    for (const pt of tail) lines.push(xy(pt))
+    lines.push('G00 Z#<Z_Retract>')
+  }
+
+  lines.push(`G00 Z${ctx.safeZmm.toFixed(2)}`)
+  lines.push('(FOOTER_BEGIN)')
+  if (ctx.pressurePad) lines.push('M65 P0 (PRESSURE PAD UP)')
+  lines.push(`G00 Z${ctx.safeZmm.toFixed(2)}`)
+  lines.push('(Move Spindle Initial position first)')
+  lines.push('M5 (Spindle Off)')
+  lines.push('G28 (If required move machine to parking position)')
+  lines.push('M30( End of program)')
+  lines.push('(FOOTER_END)')
+
+  return lines.join('\n')
+}
+
+/**
+ * G-code for one tool's worth of the meta-panelization array's tiled drill
+ * holes (component holes + tooling/reference holes, already tiled across
+ * every array cell by `panel-array.ts`'s `tileHolesAcrossArray`) — a thin
+ * wrapper over `generateDrillGcode` so the "one file per diameter" convention
+ * and the diameter-based feed lookup stay identical to the normal per-panel
+ * drilling output.
+ */
+export function generateMetaPanelGcodeFiles(
+  markPaths: Pt[][],
+  holeGroups: { diameterMm: number; holes: Pt[] }[],
+  partNumber: string,
+  ctx: GcodeContext,
+  markCutDepthMm: number,
+  slotGroups: { diameterMm: number; slots: { start: Pt; end: Pt }[] }[] = []
+): GcodeFile[] {
+  const files: GcodeFile[] = []
+
+  if (markPaths.length > 0) {
+    files.push({
+      filename: `${partNumber}_MetaPanel_BorderMarks.NC`,
+      content: generateMarkRoutingGcode(markPaths, ctx, markCutDepthMm),
+    })
+  }
+
+  const combinedSlots = new Map<number, { start: Pt; end: Pt }[]>()
+  for (const group of slotGroups) {
+    if (!combinedSlots.has(group.diameterMm)) combinedSlots.set(group.diameterMm, [])
+    combinedSlots.get(group.diameterMm)!.push(...group.slots)
+  }
+
+  const allDiameters = new Set([...holeGroups.map(g => g.diameterMm), ...combinedSlots.keys()])
+  let idx = 1
+  for (const dia of [...allDiameters].sort((a, b) => a - b)) {
+    const holes = holeGroups.find(g => Math.abs(g.diameterMm - dia) < 1e-6)?.holes ?? []
+    files.push({
+      filename: `${partNumber}_MetaPanel_Drilling_${formatToolFileSuffix(dia)}_${idx}.NC`,
+      content: generateDrillGcode(holes, dia, ctx, combinedSlots.get(dia) ?? []),
+    })
+    idx++
+  }
+
+  return files
+}
+
 export interface GcodeFile {
   filename: string
   content: string

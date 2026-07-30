@@ -744,14 +744,22 @@ export default function GerberViewer() {
 
   // Route overlay — router tool paths, tabs and mouse bites.
   //
-  // Deliberately separate from panelOverlayContent: it is gated on
-  // routingResult (an explicit user action) rather than on panelResult + tab, so
-  // a generated plan stays visible while you look at other tabs.
+  // ⚠ Must be gated on `isPanelViewTab(activeTab)`, same as panelOverlayContent
+  // — this used to be deliberately exempted ("stays visible while you look at
+  // other tabs"), but `routingResult.paths` are always PANEL-ABSOLUTE
+  // coordinates, and the single-PCB view a non-panel tab (Layers, DFM Check)
+  // renders is drawn in that board's own NATIVE file coordinates with no
+  // panel-position offset applied at all. The two frames only coincide by
+  // coincidence, so the overlay showed the whole panel-shaped route floating
+  // arbitrarily far from the one small board actually on screen — confirmed
+  // live: generate a routing plan, switch to Layers, see exactly that. This
+  // is the sixth thing `gerber-viewer.tsx` gates on `isPanelViewTab` (see the
+  // panel-overlay comment for the other five) — they must all agree.
   //
   // Y is negated throughout (screenY = −gerberY); the planner works in Gerber
   // Y-up mm and this viewer's space is Y-down.
   const routeOverlayContent = useMemo(() => {
-    if (!routingResult || routingResult.paths.length === 0) return null
+    if (!routingResult || routingResult.paths.length === 0 || !isPanelViewTab(activeTab)) return null
 
     const elements: React.ReactNode[] = []
     const bit = routingResult.config.bitDiameterMm
@@ -821,7 +829,7 @@ export default function GerberViewer() {
     }
 
     return elements
-  }, [routingResult])
+  }, [routingResult, activeTab])
 
   // Crosshair
   const crosshairContent = useMemo(() => {

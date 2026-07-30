@@ -26,11 +26,13 @@ import {
   BaseOffset,
   isRectangularOutline,
   formatPanelDate,
+  type DrillFormatConfig,
 } from './panelization-engine'
 import { collectMouseBiteHoles, type RoutingResult } from './routing/types'
 import { generateRouteGerber } from './routing/emit-gerber'
 import { generateRoutFile, generateMouseBiteDrill } from './routing/emit-excellon'
 import type { GcodeFile } from './routing/gcode'
+import type { PanelArrayResult } from './panel-array'
 
 export interface LayerFile {
   name: string
@@ -97,7 +99,12 @@ export async function exportPanelizedGerbers(
   outputFormat?: OutputFormat,
   /** Router tool paths, when the Routing tab has generated a plan. Optional so
    *  every existing caller is unaffected. */
-  routing?: RoutingResult | null
+  routing?: RoutingResult | null,
+  /** Meta-panelization (multi-panel-array CNC batch) files, when the G-Code
+   *  tab's array section has generated them. Optional so every existing
+   *  caller is unaffected. Written into their own `Meta-Panelization/`
+   *  subfolder rather than mixed in with the single panel's own layers. */
+  metaPanel?: { borderMarksGerberFilename: string; borderMarksGerber: string; drillFilename: string; drillContent: string } | null
 ): Promise<void> {
   // Clone: the auto-upgrade below writes fmt.integerDigits, and callers pass
   // the store's outputFormat object straight in — mutating it would compound
@@ -157,6 +164,18 @@ export async function exportPanelizedGerbers(
 
   // Routing (router tool paths + mouse bites), when a plan has been generated
   writeRouteFiles(folder, partNumber, routing, config, panel, fmt)
+
+  // Meta-panelization (multi-panel-array CNC batch drilling), when the
+  // G-Code tab's array section has generated it. Own subfolder — these files
+  // describe the WHOLE SHEET of tiled panel copies, a different coordinate
+  // space than every other file in this ZIP (which are all single-panel).
+  if (metaPanel) {
+    const metaFolder = folder.folder('Meta-Panelization')
+    if (metaFolder) {
+      metaFolder.file(metaPanel.borderMarksGerberFilename, metaPanel.borderMarksGerber)
+      metaFolder.file(metaPanel.drillFilename, metaPanel.drillContent)
+    }
+  }
 
   // Generate panelized drill file with user-selected drill format
   // Always generate drill file when there are drill layers OR tooling/reference holes are enabled
@@ -272,12 +291,75 @@ export async function exportRoutingFiles(
 }
 
 /**
+ * Meta-panelization-only ZIP — the Border_Marks Gerber, the batch-tiled
+ * Excellon drill file, and the mark-routing/batch-drilling G-code, all in one
+ * download for the CNC batch-drilling workflow (see `panel-array.ts`'s file
+ * header). The SAME files also ride along inside the main panel export's
+ * `Meta-Panelization/` subfolder (via `exportPanelizedGerbers`'s `metaPanel`
+ * param) — this is a standalone download for iterating on just the array
+ * config without re-zipping every panelized layer each time, mirroring the
+ * existing `exportRoutingFiles`/`exportGcodeFiles` precedent of multiple
+ * export granularities.
+ */
+export async function exportMetaPanelFiles(
+  files: {
+    borderMarksGerberFilename: string
+    borderMarksGerber: string
+    drillFilename: string
+    drillContent: string
+    gcodeFiles: GcodeFile[]
+  },
+  info?: PanelInfo
+): Promise<void> {
+  const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
+  const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
+  const version = sanitizeForFilename(info?.revision, 'v1')
+  const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
+
+  const zip = new JSZip()
+  const folder = zip.folder('meta_panelization')
+  if (!folder) throw new Error('Failed to create ZIP folder')
+
+  folder.file(files.borderMarksGerberFilename, files.borderMarksGerber)
+  folder.file(files.drillFilename, files.drillContent)
+  for (const f of files.gcodeFiles) folder.file(f.filename, f.content)
+
+  const lines: string[] = []
+  lines.push('=== Meta-Panelization (Multi-Panel Array CNC Batch) ===')
+  lines.push('')
+  lines.push(`Generated: ${new Date().toISOString()}`)
+  lines.push('')
+  lines.push('1. Rout the border-mark G-code into a blank sacrificial spoiler board.')
+  lines.push('2. Place each already-fabricated panel copy on the bed, registering its')
+  lines.push('   corners against the scored marks, and tape it down.')
+  lines.push('3. Run the batch drilling G-code (or the Excellon .drl on your own CAM/CNC')
+  lines.push('   post) to drill every copy\'s component + tooling holes in one pass.')
+  lines.push('')
+  lines.push('Depaneling each copy into individual PCBs is a separate, later, per-panel')
+  lines.push('step through the normal Routing tab — this batch only covers alignment')
+  lines.push('marks and drilling.')
+  lines.push('')
+  lines.push('--- Files ---')
+  lines.push(files.borderMarksGerberFilename)
+  lines.push(files.drillFilename)
+  for (const f of files.gcodeFiles) lines.push(f.filename)
+  folder.file('README.txt', lines.join('\n'))
+
+  const blob = await zip.generateAsync({ type: 'blob' })
+  saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_MetaPanel.zip`)
+}
+
+/**
  * G-code-only ZIP, for downloading the generated LinuxCNC programs without
  * re-zipping the Gerber/route files each time.
  */
 export async function exportGcodeFiles(
   gcodeFiles: GcodeFile[],
-  info?: PanelInfo
+  info?: PanelInfo,
+  /** Meta-panelization (multi-panel-array) G-code — border-mark routing +
+   *  batch drilling — written into its own subfolder alongside the normal
+   *  per-panel files. Optional so every existing caller is unaffected. */
+  metaPanelGcodeFiles?: GcodeFile[] | null
 ): Promise<void> {
   const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
   const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
@@ -289,6 +371,13 @@ export async function exportGcodeFiles(
   if (!folder) throw new Error('Failed to create ZIP folder')
 
   for (const f of gcodeFiles) folder.file(f.filename, f.content)
+
+  if (metaPanelGcodeFiles && metaPanelGcodeFiles.length > 0) {
+    const metaFolder = folder.folder('Meta-Panelization')
+    if (metaFolder) {
+      for (const f of metaPanelGcodeFiles) metaFolder.file(f.filename, f.content)
+    }
+  }
 
   const lines: string[] = []
   lines.push('=== G-Code Files ===')
@@ -303,6 +392,11 @@ export async function exportGcodeFiles(
   lines.push('')
   lines.push('--- Files ---')
   for (const f of gcodeFiles) lines.push(f.filename)
+  if (metaPanelGcodeFiles && metaPanelGcodeFiles.length > 0) {
+    lines.push('')
+    lines.push('--- Meta-Panelization/ (multi-panel-array CNC batch) ---')
+    for (const f of metaPanelGcodeFiles) lines.push(f.filename)
+  }
   folder.file('README.txt', lines.join('\n'))
 
   const blob = await zip.generateAsync({ type: 'blob' })
@@ -736,6 +830,63 @@ function generatePanelizedDrill(
   // End program — M30 only, no G05 (matching CAM350 reference)
   lines.push('M30')
 
+  return lines.join('\n')
+}
+
+/**
+ * Meta-panelization batch drill file — the array-tiled equivalent of
+ * `generatePanelizedDrill`, but built from already-collected, already-tiled
+ * `{diameterMm, holes}[]`/`{diameterMm, slots}[]` groups (see
+ * `tileHolesAcrossArray`/`tileSlotsAcrossArray` in `panel-array.ts`) instead
+ * of walking `LayerFile[]` apertures directly — the caller (the store action)
+ * has already merged the customer's own component holes with the panel's
+ * tooling/reference holes by diameter, so this function only needs to know
+ * about diameters and coordinates, not where they came from.
+ */
+export function generateMetaPanelDrill(
+  holeGroups: { diameterMm: number; holes: { x: number; y: number }[] }[],
+  slotGroups: { diameterMm: number; slots: { start: { x: number; y: number }; end: { x: number; y: number } }[] }[],
+  drillFormat: DrillFormatConfig,
+  panelArray: PanelArrayResult,
+  gerberUnit?: 'mm' | 'inches'
+): string {
+  const drillFmt = resolveExportDrillFormat(
+    drillFormat,
+    { panelWidth: panelArray.sheetWidthMm, panelHeight: panelArray.sheetHeightMm },
+    gerberUnit,
+    'Meta-Panel Export'
+  )
+
+  const lines: string[] = []
+  lines.push(...generateDrillFormatHeader(drillFmt))
+
+  const diameters = [...new Set([
+    ...holeGroups.map(g => g.diameterMm),
+    ...slotGroups.map(g => g.diameterMm),
+  ])].sort((a, b) => a - b)
+  lines.push(...emitExcellonToolBlock(diameters, drillFmt))
+
+  const fmtCoord = (v: number) => formatDrillCoordinate(v, drillFmt)
+  const getTCode = (dia: number): string => {
+    const idx = diameters.indexOf(dia)
+    return 'T' + (idx >= 0 ? idx + 1 : 1).toString().padStart(2, '0')
+  }
+
+  for (const g of holeGroups) {
+    if (g.holes.length === 0) continue
+    lines.push(getTCode(g.diameterMm))
+    for (const h of g.holes) lines.push(`X${fmtCoord(h.x)}Y${fmtCoord(h.y)}`)
+  }
+
+  for (const g of slotGroups) {
+    if (g.slots.length === 0) continue
+    lines.push(getTCode(g.diameterMm))
+    for (const s of g.slots) {
+      lines.push(`X${fmtCoord(s.start.x)}Y${fmtCoord(s.start.y)}G85X${fmtCoord(s.end.x)}Y${fmtCoord(s.end.y)}`)
+    }
+  }
+
+  lines.push('M30')
   return lines.join('\n')
 }
 

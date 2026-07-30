@@ -13,11 +13,21 @@ import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel
 import { LayerType, LayerSide, detectLayerType, detectLayerSide } from './gerber-analysis'
 import { planRouting, resolveOutlineMode } from './routing/plan-routing'
 import { DEFAULT_ROUTING_CONFIG, type BoardContour, type RoutingConfig, type RoutingResult } from './routing/types'
-import { generateGcodeFiles as buildGcodeFiles, DEFAULT_GCODE_CONTEXT, type GcodeContext, type GcodeFile } from './routing/gcode'
+import { generateGcodeFiles as buildGcodeFiles, generateMetaPanelGcodeFiles, DEFAULT_GCODE_CONTEXT, type GcodeContext, type GcodeFile } from './routing/gcode'
 import { isRoutGcodeFile, parseRoutSlots, routSlotsToGerber } from './routing/import-rout'
-import { collectPanelizedDrillHoles, collectPanelizedDrillSlots } from './gerber-exporter'
+import { collectPanelizedDrillHoles, collectPanelizedDrillSlots, generateMetaPanelDrill } from './gerber-exporter'
 import { traceBoardContour } from './board-contour'
 import { BoardColorName } from './board-colors'
+import {
+  DEFAULT_PANEL_ARRAY_CONFIG,
+  computePanelArray,
+  generateBorderMarkPaths,
+  generateBorderMarksGerber,
+  tileHolesAcrossArray,
+  tileSlotsAcrossArray,
+  type PanelArrayConfig,
+  type PanelArrayResult,
+} from './panel-array'
 
 export type { LayerType, LayerSide }
 
@@ -27,14 +37,27 @@ export type { LayerType, LayerSide }
 export type CamTab = 'layers' | 'dfm' | 'panel' | 'routing' | 'gcode' | 'export'
 
 /** Tabs whose canvas shows the whole *panel* rather than the single imported
- *  PCB. `gerber-viewer.tsx` gates five separate things on this (bounds, the
- *  overlay memo, the two `<use>`-repeat render paths, and the status readout) —
- *  they must all agree, so the membership test lives here rather than being
- *  re-spelled as an `||` chain at each site. */
+ *  PCB. `gerber-viewer.tsx` gates SIX separate things on this (bounds, the
+ *  panel-overlay memo, the route-overlay memo, the two `<use>`-repeat render
+ *  paths, and the status readout) — they must all agree, so the membership
+ *  test lives here rather than being re-spelled as an `||` chain at each site. */
 export const PANEL_VIEW_TABS: ReadonlySet<CamTab> = new Set<CamTab>(['panel', 'routing', 'gcode', 'export'])
 
 export function isPanelViewTab(tab: CamTab): boolean {
   return PANEL_VIEW_TABS.has(tab)
+}
+
+/** Every generated meta-panelization (multi-panel-array CNC batch) output —
+ *  see src/lib/panel-array.ts. Regenerated as one unit by
+ *  `generatePanelArrayFilesAction`; there's no intermediate "plan" step the
+ *  way routing/G-code have, since there's no per-file config to choose
+ *  between planning and generating. */
+export interface PanelArrayFiles {
+  borderMarksGerberFilename: string
+  borderMarksGerber: string
+  drillFilename: string
+  drillContent: string
+  gcodeFiles: GcodeFile[]
 }
 
 export interface LayerEntry {
@@ -179,6 +202,21 @@ interface AppState {
    *  the imported drill layers, requires a routingResult to exist. */
   generateGcodeFilesAction: () => void
   clearGcodeFiles: () => void
+
+  // Meta-panelization (multi-panel-array CNC batch drilling — see
+  // src/lib/panel-array.ts). Deliberately independent of RoutingResult: mark
+  // routing and batch drilling only need a computed PanelResult, not a
+  // generated routing plan — depaneling each panel copy into individual PCBs
+  // is a separate, later, per-panel step through the existing Routing tab.
+  panelArrayConfig: PanelArrayConfig
+  /** Shallow merge — PanelArrayConfig is deliberately FLAT, same discipline
+   *  as RoutingConfig/GcodeContext. */
+  updatePanelArrayConfig: (updates: Partial<PanelArrayConfig>) => void
+  resetPanelArrayConfig: () => void
+  panelArrayResult: PanelArrayResult | null
+  panelArrayFiles: PanelArrayFiles | null
+  generatePanelArrayFilesAction: () => void
+  clearPanelArrayFiles: () => void
 
   // UI state
   activeTab: CamTab
@@ -659,6 +697,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       layers: [], panelResult: null, boardView: null,
       dfmReport: null, dfmFocus: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
+      panelArrayResult: null, panelArrayFiles: null,
     })
   },
 
@@ -777,6 +816,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       layers: updatedLayers, panelResult: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
+      panelArrayResult: null, panelArrayFiles: null,
     })
     void get().rebuildBoardView()
   },
@@ -1342,9 +1382,12 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     // Drill alignment shifts drill geometry, which mouse-bite placement and the
     // routing preview are both measured against — replan rather than keep it.
+    // The meta-panel array's tiled drill positions are measured against the
+    // same geometry, so they're cleared here too.
     set({
       layers: updatedLayers,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
+      panelArrayFiles: null,
     })
     void get().rebuildBoardView()
   },
@@ -1382,6 +1425,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       routingFocus: null,
       gcodeFiles: null,
       boardContour: null,
+      // Tooling-hole/drill-format settings changed, which the meta-panel
+      // array's tiled drill file depends on — the array LAYOUT (cols/rows)
+      // doesn't depend on panelConfig though, so only the generated files
+      // need dropping here, not panelArrayResult itself.
+      panelArrayFiles: null,
     })
     // NOTE: Panel computation is now only triggered when user clicks "Create Panel" button
   },
@@ -1420,7 +1468,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   computePanelResult: () => {
     const { layers, panelConfig } = get()
     if (layers.length === 0) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null })
       return
     }
 
@@ -1445,7 +1493,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     if (!boundsLayer || !boundsLayer.parsedLayer.bounds) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null })
       return
     }
 
@@ -1454,7 +1502,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const pcbHeight = bounds.maxY - bounds.minY
 
     if (pcbWidth <= 0 || pcbHeight <= 0) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null })
       return
     }
 
@@ -1532,7 +1580,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // A fresh panel invalidates any existing routing plan outright: tool paths
     // are panel-absolute, so keeping them would let a .rou export carry the
     // PREVIOUS panel's coordinates — the worst failure this feature can produce.
-    set({ panelResult: result, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null })
+    set({ panelResult: result, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null })
   },
 
   // View state
@@ -1540,7 +1588,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setTargetUnit: (unit) => {
     // Layer geometry is about to be rescaled in place, so any planned routing
     // is measured against dimensions that no longer exist.
-    set({ targetUnit: unit, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null })
+    set({ targetUnit: unit, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null })
     // Convert all layers to new unit
     const { layers } = get()
     for (const layer of layers) {
@@ -1759,6 +1807,94 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ gcodeFiles: buildGcodeFiles(routingResult, drillHoleGroups, partNumber, gcodeContext, drillSlotGroups) })
   },
   clearGcodeFiles: () => set({ gcodeFiles: null }),
+
+  // Meta-panelization (multi-panel-array CNC batch)
+  panelArrayConfig: { ...DEFAULT_PANEL_ARRAY_CONFIG },
+  updatePanelArrayConfig: (updates) =>
+    set(state => ({ panelArrayConfig: { ...state.panelArrayConfig, ...updates } })),
+  resetPanelArrayConfig: () =>
+    set({ panelArrayConfig: { ...DEFAULT_PANEL_ARRAY_CONFIG }, panelArrayResult: null, panelArrayFiles: null }),
+  panelArrayResult: null,
+  panelArrayFiles: null,
+  generatePanelArrayFilesAction: () => {
+    const { panelResult, panelArrayConfig, layers, panelConfig, gcodeContext, panelInfo, outputFormat } = get()
+    if (!panelResult) {
+      set({ panelArrayResult: null, panelArrayFiles: null })
+      return
+    }
+    const array = computePanelArray(panelResult.panelWidth, panelResult.panelHeight, panelArrayConfig)
+    if (!array) {
+      set({ panelArrayResult: null, panelArrayFiles: null })
+      return
+    }
+
+    // Same globalBaseOffset convention as generateGcodeFilesAction/exportPanelizedGerbers.
+    const outlineLayer = findOutlineBoundsLayer(layers)
+    const globalBaseOffset = outlineLayer?.parsedLayer?.bounds
+      ? { x: -outlineLayer.parsedLayer.bounds.minX, y: -outlineLayer.parsedLayer.bounds.minY }
+      : undefined
+    const drillLayers = layers
+      .filter(l => l.type === 'drill' && l.parsedLayer?.bounds)
+      .map(l => ({ name: l.name, fileName: l.fileName, content: l.rawContent, parsedLayer: l.parsedLayer, type: l.type, side: l.side }))
+
+    const componentHoleGroups = collectPanelizedDrillHoles(drillLayers, panelResult, globalBaseOffset)
+    const componentSlotGroups = collectPanelizedDrillSlots(drillLayers, panelResult, globalBaseOffset)
+
+    // Tooling/reference holes join the same {diameterMm, holes} shape so they
+    // ride along in the same tiled drill program as the component holes —
+    // each array copy still needs its own pinning holes for its LATER,
+    // separate per-panel routing step.
+    let toolingHoleGroups: { diameterMm: number; holes: { x: number; y: number }[] }[] = []
+    if (panelConfig.enableToolingHoles) {
+      const byDia = new Map<number, { x: number; y: number }[]>()
+      for (const h of panelResult.toolingHoles) {
+        if (!byDia.has(h.diameter)) byDia.set(h.diameter, [])
+        byDia.get(h.diameter)!.push({ x: h.x, y: h.y })
+      }
+      toolingHoleGroups = [...byDia.entries()].map(([diameterMm, holes]) => ({ diameterMm, holes }))
+    }
+
+    const mergedByDia = new Map<number, { x: number; y: number }[]>()
+    for (const g of [...componentHoleGroups, ...toolingHoleGroups]) {
+      if (!mergedByDia.has(g.diameterMm)) mergedByDia.set(g.diameterMm, [])
+      mergedByDia.get(g.diameterMm)!.push(...g.holes)
+    }
+    const mergedHoleGroups = [...mergedByDia.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([diameterMm, holes]) => ({ diameterMm, holes }))
+
+    const tiledHoleGroups = tileHolesAcrossArray(mergedHoleGroups, array)
+    const tiledSlotGroups = tileSlotsAcrossArray(componentSlotGroups, array)
+
+    const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
+
+    const borderMarksGerber = generateBorderMarksGerber(array, panelArrayConfig, outputFormat)
+    const drillContent = generateMetaPanelDrill(
+      tiledHoleGroups, tiledSlotGroups, panelConfig.drillFormat, array, outputFormat.unit
+    )
+
+    const markPaths = generateBorderMarkPaths(array)
+    const gcodeFiles = generateMetaPanelGcodeFiles(
+      markPaths,
+      tiledHoleGroups,
+      partNumber,
+      gcodeContext,
+      panelArrayConfig.markCutDepthMm,
+      tiledSlotGroups
+    )
+
+    set({
+      panelArrayResult: array,
+      panelArrayFiles: {
+        borderMarksGerberFilename: `${partNumber}_Border_Marks.gbr`,
+        borderMarksGerber,
+        drillFilename: `${partNumber}_MetaPanel_Drill.drl`,
+        drillContent,
+        gcodeFiles,
+      },
+    })
+  },
+  clearPanelArrayFiles: () => set({ panelArrayResult: null, panelArrayFiles: null }),
 
   // UI state
   activeTab: 'layers',

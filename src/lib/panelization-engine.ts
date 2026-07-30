@@ -292,10 +292,16 @@ export function generateDrillFormatHeader(drillFmt: DrillFormatConfig): string[]
  *
  * @param label Prefix for the console warnings, so each caller's log messages
  *   stay distinguishable (e.g. 'Export' vs 'PINN Export').
+ *
+ * `panel` only needs `panelWidth`/`panelHeight` — typed as a `Pick` (not the
+ * full `PanelResult`) so callers sizing a DIFFERENT sheet than the actual
+ * single-PCB panel (e.g. the meta-panelization array's much larger sheet in
+ * `panel-array.ts`) can pass a plain `{ panelWidth, panelHeight }` literal
+ * instead of fabricating a fake `PanelResult`.
  */
 export function resolveExportDrillFormat(
   drillFormat: DrillFormatConfig,
-  panel: PanelResult,
+  panel: Pick<PanelResult, 'panelWidth' | 'panelHeight'>,
   gerberUnit: 'mm' | 'inches' | undefined,
   label: string
 ): DrillFormatConfig {
