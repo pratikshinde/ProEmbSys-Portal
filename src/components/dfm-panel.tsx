@@ -62,6 +62,23 @@ export default function DfmPanel() {
   const [dirty, setDirty] = React.useState(false)
   const [saving, setSaving] = React.useState(false)
   const [showEditor, setShowEditor] = React.useState(false)
+  // What's literally in each rule input right now, keyed by field id
+  // ("minTraceWidthMm.standard", "maxBoardMm", ...) — separate from
+  // `draftRules`, which only ever holds the last VALID parsed number.
+  // Without this, typing to replace "0.1" with "0.5" (select-all, type "0")
+  // passes through an intermediate state where the field is briefly "0" or
+  // empty; `Number('') === 0` and `0 <= 0` is rejected, so `draftRules` (and
+  // therefore the controlled `value` prop) never updates and the input
+  // visually snaps back to "0.1" on that keystroke — the classic
+  // fighting-the-user controlled-input bug. The up/down spinner buttons
+  // never hit this because they only ever produce already-valid numbers, so
+  // "typing doesn't work but the arrows do" was the exact reported symptom.
+  // Tracking the raw string here lets the input always show literally what
+  // was typed, even mid-edit, while `draftRules` only updates once the text
+  // parses to a valid positive number — and the entry is dropped again on
+  // blur so a value left invalid reverts to the last valid one instead of
+  // getting stuck showing "0" forever.
+  const [rawInputs, setRawInputs] = React.useState<Record<string, string>>({})
 
   // Only PERSISTING a template needs an account — /api/dfm-templates is
   // publicly readable so the CAM tool works fully logged-out (see
@@ -102,16 +119,49 @@ export default function DfmPanel() {
     if (selected) {
       setDraftRules(selected.rules)
       setDirty(false)
+      setRawInputs({})
     }
   }, [selected])
 
   const activeRules = dirty ? draftRules : selected?.rules ?? DEFAULT_DFM_RULES
 
-  function setLimit(key: keyof DfmRules, field: 'standard' | 'advanced', raw: string) {
+  /** Every keystroke updates the field's raw display text unconditionally;
+   *  `commit` (which writes to `draftRules`) only fires once that text
+   *  parses to a valid positive number, exactly mirroring `setLimit`'s old
+   *  validation but WITHOUT also gating the visible input value on it. */
+  function setNumericField(inputKey: string, raw: string, commit: (num: number) => void) {
+    setRawInputs(prev => ({ ...prev, [inputKey]: raw }))
     const num = Number(raw)
     if (!Number.isFinite(num) || num <= 0) return
-    setDraftRules(prev => ({ ...prev, [key]: { ...(prev[key] as DfmLimit), [field]: num } }))
-    setDirty(true)
+    commit(num)
+  }
+
+  /** What the input should show: the literal in-progress text if the user
+   *  is (or just was) typing in it, else the last committed value. */
+  function displayValue(inputKey: string, committed: number | undefined): string {
+    if (inputKey in rawInputs) return rawInputs[inputKey]
+    return committed === undefined ? '' : String(committed)
+  }
+
+  /** Drop the raw override on blur — if the last keystroke left the field
+   *  invalid (empty, "0", negative), this snaps it back to the last valid
+   *  committed value instead of leaving "0" displayed indefinitely. If the
+   *  last keystroke WAS valid, draftRules already matches it, so this is a
+   *  no-op visually. */
+  function clearRawOverride(inputKey: string) {
+    setRawInputs(prev => {
+      if (!(inputKey in prev)) return prev
+      const next = { ...prev }
+      delete next[inputKey]
+      return next
+    })
+  }
+
+  function setLimit(key: keyof DfmRules, field: 'standard' | 'advanced', raw: string) {
+    setNumericField(`${String(key)}.${field}`, raw, num => {
+      setDraftRules(prev => ({ ...prev, [key]: { ...(prev[key] as DfmLimit), [field]: num } }))
+      setDirty(true)
+    })
   }
 
   async function saveTemplate(mode: 'update' | 'new') {
@@ -335,6 +385,8 @@ export default function DfmPanel() {
             </div>
             {LIMIT_FIELDS.map(({ key, label, pending }) => {
               const limit = activeRules[key] as DfmLimit
+              const standardKey = `${String(key)}.standard`
+              const advancedKey = `${String(key)}.advanced`
               return (
                 <div key={String(key)} className="grid grid-cols-[1fr_auto_auto] items-center gap-2">
                   <Label className="text-xs">
@@ -347,16 +399,18 @@ export default function DfmPanel() {
                     type="number"
                     step="0.01"
                     className="h-8 w-16 text-xs"
-                    value={limit.standard}
+                    value={displayValue(standardKey, limit.standard)}
                     onChange={e => setLimit(key, 'standard', e.target.value)}
+                    onBlur={() => clearRawOverride(standardKey)}
                   />
                   <Input
                     type="number"
                     step="0.01"
                     className="h-8 w-16 text-xs"
                     placeholder="—"
-                    value={limit.advanced ?? ''}
+                    value={displayValue(advancedKey, limit.advanced)}
                     onChange={e => setLimit(key, 'advanced', e.target.value)}
+                    onBlur={() => clearRawOverride(advancedKey)}
                   />
                 </div>
               )
@@ -370,13 +424,12 @@ export default function DfmPanel() {
                 <Input
                   type="number"
                   className="mt-1 h-8 text-xs"
-                  value={activeRules.maxBoardMm}
-                  onChange={e => {
-                    const n = Number(e.target.value)
-                    if (!Number.isFinite(n) || n <= 0) return
+                  value={displayValue('maxBoardMm', activeRules.maxBoardMm)}
+                  onChange={e => setNumericField('maxBoardMm', e.target.value, n => {
                     setDraftRules(p => ({ ...p, maxBoardMm: n }))
                     setDirty(true)
-                  }}
+                  })}
+                  onBlur={() => clearRawOverride('maxBoardMm')}
                 />
               </div>
               <div>
@@ -384,13 +437,12 @@ export default function DfmPanel() {
                 <Input
                   type="number"
                   className="mt-1 h-8 text-xs"
-                  value={activeRules.maxAspectRatio}
-                  onChange={e => {
-                    const n = Number(e.target.value)
-                    if (!Number.isFinite(n) || n <= 0) return
+                  value={displayValue('maxAspectRatio', activeRules.maxAspectRatio)}
+                  onChange={e => setNumericField('maxAspectRatio', e.target.value, n => {
                     setDraftRules(p => ({ ...p, maxAspectRatio: n }))
                     setDirty(true)
-                  }}
+                  })}
+                  onBlur={() => clearRawOverride('maxAspectRatio')}
                 />
               </div>
             </div>
