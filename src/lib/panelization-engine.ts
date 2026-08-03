@@ -381,9 +381,18 @@ export function emitExcellonToolBlock(
  */
 function extractMacroDefinitions(rawContent: string): string[] {
   const macros: string[] = []
-  // Match %AM<name>*...*% blocks — they start with %AM and end with *%
-  // Name can contain letters, digits, underscores, and hyphens (CAM350 uses hyphens)
-  const regex = /%AM[A-Za-z0-9_-]+\*[^%]*\*%/g
+  // Match %AM<name>*...*% blocks — they start with %AM and end with *%.
+  // Name can contain letters, digits, underscores, and hyphens (CAM350 uses
+  // hyphens, e.g. "RoundRect-D12" — one uniquely-named, fully-instantiated
+  // macro per aperture, rather than KiCad's single shared parameterized
+  // macro). ⚠ The `\*\s*%` (not `\*%`) is deliberate: a real CAM350/
+  // DFMSTREAM export puts the closing `%` on its OWN line — `...0.0*\r\n%`,
+  // not `...0.0*%` — so requiring the two characters adjacent matched
+  // ZERO macro blocks in that file, which meant NO %AM definitions were
+  // ever copied into the exported panel at all (not just a truncated name)
+  // and every macro-referencing aperture came out undefined. Confirmed on
+  // a real CAM350 V14.6 re-export of a KiCad board.
+  const regex = /%AM[A-Za-z0-9_-]+\*[^%]*\*\s*%/g
   let match
   while ((match = regex.exec(rawContent)) !== null) {
     macros.push(match[0])
@@ -468,8 +477,19 @@ function generateApertureDefinitions(apertures: Map<number, GerberAperture>): st
             paramParts.push(ap.parameters[key].toFixed(6))
           }
         }
-        const paramStr = paramParts.length > 0 ? paramParts.join('X') : ''
-        adds.push(`%ADD${code}${name},${paramStr}*%`)
+        // A macro aperture can legitimately have ZERO modifiers — CAM350/
+        // DFMSTREAM re-exports emit exactly this (`%ADD12RoundRect-D12*%`,
+        // no comma at all) for a macro whose geometry is fully baked into
+        // its own %AM block rather than parameterized. Per spec the comma
+        // only appears when there's at least one modifier; emitting a
+        // trailing `,` with nothing after it is not what any real file
+        // does and risks a stricter parser treating the empty string as a
+        // malformed modifier.
+        adds.push(
+          paramParts.length > 0
+            ? `%ADD${code}${name},${paramParts.join('X')}*%`
+            : `%ADD${code}${name}*%`
+        )
         break
       }
     }

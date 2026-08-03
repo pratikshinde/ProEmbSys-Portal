@@ -385,7 +385,18 @@ function parseApertureDefinition(data: string, state: ParserState): void {
   // Aperture macro names may contain digits/underscores after the first letter
   // (e.g. KiCad's "FreePoly0") — a letters-only match truncates the name and
   // spills the trailing digit into the parameter string, corrupting $1.
-  const shapeMatch = body.match(/^([A-Za-z][A-Za-z0-9_]*)/);
+  // They may also contain hyphens: CAM350/DFMSTREAM re-exports give every
+  // macro-based aperture its own fully-instantiated, per-D-code macro name
+  // (e.g. "RoundRect-D12", "RoundRect-D18", ... one per pad, with the
+  // corner coordinates baked directly into the %AM block instead of KiCad's
+  // single shared parameterized macro) — `extractMacroDefinitions` in
+  // panelization-engine.ts already accepts hyphens for exactly this reason,
+  // but this regex didn't, so it truncated "RoundRect-D12" down to
+  // "RoundRect" here. The re-exported %ADD line then referenced a macro
+  // name that was never defined (only "RoundRect-D12" etc. exist as real
+  // %AM blocks) — surfacing as CAM350's own "Undefined apertures are used"
+  // on re-import, confirmed on a real CAM350/DFMSTREAM V14.6 export.
+  const shapeMatch = body.match(/^([A-Za-z][A-Za-z0-9_-]*)/);
   if (!shapeMatch) {
     state.warnings.push(`Malformed aperture definition: missing shape in "${data}"`);
     return;
@@ -1669,9 +1680,29 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
       }
 
       // Bare METRIC or INCH — no suppression suffix means fixed-width coords.
+      // ⚠ This is OUR assumption about the digit width (3:3 / 2:4), not
+      // something the file actually states — a bare "METRIC"/"INCH" token
+      // declares only the unit, nothing about integer/decimal digit counts
+      // or suppression. Despite `formatFromHeader = true` (it settles the
+      // question for OUR OWN parse), this must also set
+      // `formatGuessedFromContent` so `drillSvgSourceContent` (store.ts)
+      // renders the on-screen preview from our own corrected serialization
+      // instead of leaving tracespace to independently guess at the same
+      // ambiguous digits. Confirmed on a real CAM350/DFMSTREAM export (bare
+      // METRIC, no LZ/TZ, no explicit decimals): our parse correctly landed
+      // in the same coordinate range as the board's own outline layer, but
+      // tracespace's own independent Excellon interpretation of the raw
+      // upload put the drill holes an order of magnitude smaller and
+      // shifted near the origin — a completely disjoint coordinate range
+      // from every other layer. Unioning that into the Board view's overall
+      // bounds (used whenever the traced outline itself is untrustworthy)
+      // inflated the visible board footprint several times over, even
+      // though the actual panelization math (which uses our own parse) was
+      // correct the whole time.
       if (clean.toUpperCase() === 'METRIC') {
         if (!forceFormat) {
           formatFromHeader = true
+          formatGuessedFromContent = true
           units = 'mm'
           fmtInt = 3
           fmtDec = 3
@@ -1682,6 +1713,7 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
       if (clean.toUpperCase() === 'INCH') {
         if (!forceFormat) {
           formatFromHeader = true
+          formatGuessedFromContent = true
           units = 'inches'
           fmtInt = 2
           fmtDec = 4
