@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useRef, useState, useCallback, useEffect } from 'react'
+import React, { useRef, useState, useCallback, useEffect, useMemo } from 'react'
 import { useAppStore, ZipImportResult, LayerEntry, LayerType, LayerSide, detectOriginMismatch, detectDrillScaleMismatch } from '@/lib/store'
 import type { DrillZeroSuppressionMode } from '@/lib/gerber-parser'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -126,6 +126,10 @@ export default function LayerPanel() {
   const setAllLayersVisibility = useAppStore(s => s.setAllLayersVisibility)
   const reapplyDrillFormat = useAppStore(s => s.reapplyDrillFormat)
   const setHoveredLayerId = useAppStore(s => s.setHoveredLayerId)
+  const camMode = useAppStore(s => s.camMode)
+  const designs = useAppStore(s => s.designs)
+  const activeDesignId = useAppStore(s => s.activeDesignId)
+  const setActiveDesignId = useAppStore(s => s.setActiveDesignId)
 
   // Import & Rotate state
   const [importing, setImporting] = useState(false)
@@ -158,7 +162,31 @@ export default function LayerPanel() {
     setDrillFormatLayerId(layer.id)
   }
 
-  const scaleMismatchedIds = detectDrillScaleMismatch(layers)
+  /**
+   * The active design's layers. In SINGLE mode this IS the list — a design
+   * left over from a previous multi-mode session stays loaded but hidden.
+   * In MULTI mode the full list is rendered, grouped by design, but the two
+   * mismatch banners below still read this scoped list: `alignDrillLayersToBoard`
+   * (the button they offer) is itself active-design-scoped, so an all-designs
+   * banner would flag a mismatch the button cannot fix.
+   */
+  const scopedLayers = useMemo(
+    () => activeDesignId ? layers.filter(l => l.designId === activeDesignId) : layers,
+    [layers, activeDesignId]
+  )
+  /** What the layer list renders: one design in single mode, all in multi. */
+  const listedLayers = camMode === 'single' ? scopedLayers : layers
+
+  /** Multi mode only — the list grouped into per-design sections, in
+   *  `designs` order, skipping designs with no layers. */
+  const designGroups = useMemo(() => {
+    if (camMode === 'single') return []
+    return designs
+      .map(d => ({ design: d, layers: layers.filter(l => l.designId === d.id) }))
+      .filter(g => g.layers.length > 0)
+  }, [camMode, designs, layers])
+
+  const scaleMismatchedIds = detectDrillScaleMismatch(scopedLayers)
 
   // Track layers needing classification (type === 'other')
   const [unclassifiedIds, setUnclassifiedIds] = useState<Set<string>>(new Set())
@@ -334,9 +362,9 @@ export default function LayerPanel() {
           <CardTitle className="text-sm font-semibold flex items-center gap-2 text-[#f0f8ff] flex-shrink-0">
             <Layers className="w-4 h-4 text-[#0ea5e9]" />
             Gerber Layers
-            {layers.length > 0 && (
+            {listedLayers.length > 0 && (
               <Badge variant="secondary" className="text-[9px] px-1.5 py-0 h-4 bg-[#0f2848] text-[#94b8d4]">
-                {layers.length}
+                {listedLayers.length}
               </Badge>
             )}
           </CardTitle>
@@ -353,7 +381,7 @@ export default function LayerPanel() {
         </div>
 
         {/* Row 2: Layer tools (only when layers exist) */}
-        {layers.length > 0 && (
+        {listedLayers.length > 0 && (
           <div className="flex items-center gap-1 mt-2">
             <Button size="sm" variant="ghost" onClick={() => handleRotate('left')}
               className="h-6 w-6 p-0 text-[#0ea5e9] hover:text-white hover:bg-[#0f2848]" disabled={importing || rotating} title="Rotate Left 90°">
@@ -366,13 +394,13 @@ export default function LayerPanel() {
             <div className="w-px h-4 bg-[#1a3a5c]/50 mx-0.5" />
             <Button size="sm" variant="ghost"
               onClick={() => {
-                const allVisible = layers.every(l => l.visible)
+                const allVisible = listedLayers.every(l => l.visible)
                 setAllLayersVisibility(!allVisible)
               }}
               className="h-6 w-6 p-0 text-[#0ea5e9] hover:text-white hover:bg-[#0f2848]"
-              title={layers.every(l => l.visible) ? 'Hide All Layers' : 'Show All Layers'}
+              title={listedLayers.every(l => l.visible) ? 'Hide All Layers' : 'Show All Layers'}
             >
-              {layers.every(l => l.visible)
+              {listedLayers.every(l => l.visible)
                 ? <EyeOff className="w-3.5 h-3.5" />
                 : <Eye className="w-3.5 h-3.5" />
               }
@@ -484,8 +512,10 @@ export default function LayerPanel() {
           </div>
         )}
 
-        {/* Origin Mismatch Warning Banner */}
-        {detectOriginMismatch(layers) && !importing && (
+        {/* Origin Mismatch Warning Banner — scoped to the active design in
+            BOTH modes, since the "Align Drill to Board Center" button it
+            offers is itself active-design-scoped. */}
+        {detectOriginMismatch(scopedLayers) && !importing && (
           <div className="rounded-lg border border-amber-800/50 bg-amber-950/40 p-3 mb-3 space-y-2">
             <div className="flex items-center gap-2">
               <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
@@ -568,7 +598,7 @@ export default function LayerPanel() {
           className={`border-2 border-dashed rounded-lg p-4 text-center transition-colors ${
             importing
               ? 'border-[#0ea5e9]/40 bg-[#0ea5e9]/10'
-              : layers.length === 0
+              : listedLayers.length === 0
                 ? 'border-[#1a3a5c] hover:border-[#0ea5e9]/50 bg-[#061628]/30'
                 : 'border-[#1a3a5c]'
           }`}
@@ -578,7 +608,7 @@ export default function LayerPanel() {
               <Loader2 className="w-6 h-6 mx-auto mb-2 animate-spin text-[#0ea5e9]" />
               <p>Extracting and parsing Gerber files...</p>
             </div>
-          ) : layers.length === 0 ? (
+          ) : listedLayers.length === 0 ? (
             <div className="text-[#94b8d4] text-xs">
               <FolderArchive className="w-6 h-6 mx-auto mb-2 text-[#0ea5e9]/60" />
               <p>Drop <span className="text-[#0ea5e9] font-medium">.zip</span> or individual Gerber files</p>
@@ -595,7 +625,7 @@ export default function LayerPanel() {
         </div>
 
         {/* Global Show/Hide All Controls */}
-        {layers.length > 0 && (
+        {listedLayers.length > 0 && (
           <div className="flex items-center justify-between mt-2 px-1 text-xs text-[#94b8d4]">
             <span>Global Layer Control:</span>
             <div className="flex items-center gap-2.5">
@@ -616,11 +646,42 @@ export default function LayerPanel() {
           </div>
         )}
 
-        {/* Layer list */}
-        {layers.length > 0 && (
+        {/* Layer list — a flat list of the ACTIVE design's layers in single
+            mode; grouped under per-design headers in multi mode, so two
+            boards' layers never read as one jumbled list. */}
+        {listedLayers.length > 0 && (
           <ScrollArea className="flex-1 min-h-0 mt-2">
             <div className="space-y-1">
-              {layers.map((layer) => {
+              {camMode === 'multi' && designGroups.map(({ design, layers: groupLayers }) => (
+                <div key={design.id} className="space-y-1">
+                  <button
+                    onClick={() => setActiveDesignId(design.id)}
+                    className="w-full flex items-center gap-1.5 px-2 py-1 mt-2 first:mt-0 rounded-md bg-[#061628]/60 border border-[#1a3a5c]/60 hover:border-[#0ea5e9]/40 transition-colors text-left"
+                    title={design.id === activeDesignId ? 'Active design' : 'Make this the active design'}
+                  >
+                    <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: design.color }} />
+                    <span className="text-[11px] font-semibold text-[#f0f8ff] truncate">{design.name}</span>
+                    <span className="text-[9px] text-[#4a6f94] flex-shrink-0">{groupLayers.length} layers</span>
+                    {design.id === activeDesignId && (
+                      <Badge variant="secondary" className="ml-auto text-[8px] px-1 py-0 h-4 bg-[#0ea5e9]/20 text-[#0ea5e9] flex-shrink-0">Active</Badge>
+                    )}
+                  </button>
+                  <div className="space-y-1 pl-1">
+                    {groupLayers.map(layer => renderLayerRow(layer))}
+                  </div>
+                </div>
+              ))}
+              {camMode === 'single' && listedLayers.map(layer => renderLayerRow(layer))}
+            </div>
+          </ScrollArea>
+        )}
+      </CardContent>
+    </Card>
+  )
+
+  /** One layer row. Shared by the flat single-mode list and the grouped
+   *  multi-mode list so the two can't drift. */
+  function renderLayerRow(layer: LayerEntry) {
                 const compositeKey = makeCompositeKey(layer.type, layer.side)
                 const isOther = layer.type === 'other'
                 const badgeColor = getBadgeColor(layer.type, layer.side)
@@ -851,11 +912,5 @@ export default function LayerPanel() {
                     )}
                   </div>
                 )
-              })}
-            </div>
-          </ScrollArea>
-        )}
-      </CardContent>
-    </Card>
-  )
+  }
 }

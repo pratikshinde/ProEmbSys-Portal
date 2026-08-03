@@ -26,6 +26,10 @@ export default function PanelConfigPanel() {
   const showCrosshair = useAppStore(s => s.showCrosshair)
   const toggleCrosshair = useAppStore(s => s.toggleCrosshair)
   const computePanelResult = useAppStore(s => s.computePanelResult)
+  const setActiveTab = useAppStore(s => s.setActiveTab)
+  const camMode = useAppStore(s => s.camMode)
+  const designs = useAppStore(s => s.designs)
+  const isMulti = camMode === 'multi'
 
   return (
     <div className="space-y-4">
@@ -49,14 +53,26 @@ export default function PanelConfigPanel() {
         </div>
       </CardHeader>
       <CardContent className="pt-0 space-y-4">
-        {/* Create Panel Button - Top */}
+        {/* Create Panel Button - Top. In multi mode this re-runs the PACKER
+            (with whatever gaps/material are set now) rather than building a
+            grid — see computePanelResult's own doc for why re-applying the
+            stored candidate instead would be unsafe after a gap change. */}
         <Button
           onClick={computePanelResult}
           className="w-full bg-[#0ea5e9] hover:bg-[#0ea5e9]/80 text-white h-8 text-xs font-medium"
         >
           <Play className="w-3 h-3 mr-1.5" />
-          Create Panel
+          {isMulti ? 'Re-pack & Rebuild Panel' : 'Create Panel'}
         </Button>
+        {isMulti && (
+          <p className="text-[10px] text-[#4a6f94] -mt-2 leading-relaxed">
+            {designs.length === 0
+              ? <>Import each board as its own archive, then set quantities and find a layout on the{' '}
+                  <button onClick={() => setActiveTab('designs')} className="text-[#0ea5e9] hover:underline">Designs</button> tab.</>
+              : <>Re-runs the packer at the current gaps and material size. Pick a specific layout on the{' '}
+                  <button onClick={() => setActiveTab('designs')} className="text-[#0ea5e9] hover:underline">Designs</button> tab.</>}
+          </p>
+        )}
         {/* View settings */}
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2">
@@ -111,32 +127,38 @@ export default function PanelConfigPanel() {
           </TabsList>
 
           <TabsContent value="layout" className="space-y-4 pt-2">
-            {/* Grid layout */}
+            {/* Grid layout. Rows/Columns only drive the SINGLE-mode grid
+                path — the packer derives its own arrangement — but the gaps
+                feed both, so they stay visible in either mode. */}
             <div>
-              <Label className="text-xs text-[#94b8d4] mb-2 block">Grid Layout</Label>
+              <Label className="text-xs text-[#94b8d4] mb-2 block">{isMulti ? 'Board Spacing' : 'Grid Layout'}</Label>
               <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <Label className="text-[10px] text-[#4a6f94]">Rows</Label>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={20}
-                    value={panelConfig.rows}
-                    onChange={(e) => updatePanelConfig({ rows: Math.max(1, parseInt(e.target.value) || 1) })}
-                    className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]"
-                  />
-                </div>
-                <div>
-                  <Label className="text-[10px] text-[#4a6f94]">Columns</Label>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={20}
-                    value={panelConfig.cols}
-                    onChange={(e) => updatePanelConfig({ cols: Math.max(1, parseInt(e.target.value) || 1) })}
-                    className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]"
-                  />
-                </div>
+                {!isMulti && (
+                  <>
+                    <div>
+                      <Label className="text-[10px] text-[#4a6f94]">Rows</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={20}
+                        value={panelConfig.rows}
+                        onChange={(e) => updatePanelConfig({ rows: Math.max(1, parseInt(e.target.value) || 1) })}
+                        className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-[10px] text-[#4a6f94]">Columns</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={20}
+                        value={panelConfig.cols}
+                        onChange={(e) => updatePanelConfig({ cols: Math.max(1, parseInt(e.target.value) || 1) })}
+                        className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]"
+                      />
+                    </div>
+                  </>
+                )}
                 <div>
                   <Label className="text-[10px] text-[#4a6f94]">X Gap ({targetUnit})</Label>
                   <Input
@@ -847,7 +869,7 @@ export default function PanelConfigPanel() {
             <div className="text-[#94b8d4] font-medium mb-2">Panel Summary</div>
             <div className="grid grid-cols-2 gap-1 text-[#4a6f94]">
               <span>PCB Size:</span>
-              <span className="text-[#f0f8ff]">{panelResult.pcbWidth?.toFixed(1) ?? 'N/A'} × {panelResult.pcbHeight?.toFixed(1) ?? 'N/A'} {targetUnit}</span>
+              <span className="text-[#f0f8ff]">{panelResult.designs[0]?.widthMm?.toFixed(1) ?? 'N/A'} × {panelResult.designs[0]?.heightMm?.toFixed(1) ?? 'N/A'} {targetUnit}</span>
               <span>Panel Size:</span>
               <span className="text-emerald-400">{panelResult.panelWidth?.toFixed(1) ?? 'N/A'} × {panelResult.panelHeight?.toFixed(1) ?? 'N/A'} {targetUnit}</span>
               <span>Total PCBs:</span>

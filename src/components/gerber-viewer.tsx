@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useRef, useEffect, useLayoutEffect, useCallback, useState, useMemo } from 'react'
-import { useAppStore, getLayerZIndex, isPanelViewTab } from '@/lib/store'
+import { useAppStore, getLayerZIndex, isPanelViewTab, type LayerEntry } from '@/lib/store'
 import { mergeLayerBounds, GerberSvgResult } from '@/lib/gerber-svg'
 import { PanelResult, isRectangularOutline } from '@/lib/panelization-engine'
 import { getRegionTextPolygons } from '@/lib/region-font'
@@ -42,6 +42,7 @@ export default function GerberViewer() {
   const svgRef = useRef<SVGSVGElement>(null)
 
   const layers = useAppStore(s => s.layers)
+  const activeDesignId = useAppStore(s => s.activeDesignId)
   const panelResult = useAppStore(s => s.panelResult)
   const panelConfig = useAppStore(s => s.panelConfig)
   const showGrid = useAppStore(s => s.showGrid)
@@ -49,6 +50,7 @@ export default function GerberViewer() {
   const targetUnit = useAppStore(s => s.targetUnit)
   const activeTab = useAppStore(s => s.activeTab)
   const boardView = useAppStore(s => s.boardView)
+  const boardViewsByDesign = useAppStore(s => s.boardViewsByDesign)
   const boardViewSide = useAppStore(s => s.boardViewSide)
   const viewMode = useAppStore(s => s.viewMode)
   const setViewMode = useAppStore(s => s.setViewMode)
@@ -107,7 +109,9 @@ export default function GerberViewer() {
         maxY: vb.y + vb.height,
       }
     } else {
-      const svgLayers = layers.filter(l => l.visible && l.svgData && !l.svgData.isEmpty)
+      // Active-design-scoped, matching `visibleLayers` — the fit/zoom frame
+      // must describe what's actually drawn, not a hidden design's extents.
+      const svgLayers = layers.filter(l => l.visible && l.svgData && !l.svgData.isEmpty && (!activeDesignId || l.designId === activeDesignId))
       native = svgLayers.length > 0 ? mergeLayerBounds(svgLayers.map(l => l.svgData!)) : null
     }
 
@@ -117,7 +121,7 @@ export default function GerberViewer() {
       : native
 
     return { combinedBounds: combined, nativeSvgBounds: native }
-  }, [layers, activeTab, panelResult, isBoardMode, boardView])
+  }, [layers, activeTab, panelResult, isBoardMode, boardView, activeDesignId])
 
   const boundsCenterX = useMemo(() => {
     if (!combinedBounds) return 0
@@ -391,15 +395,25 @@ export default function GerberViewer() {
   // what a single layer contributes; moving the pointer away restores the
   // normal visible-layers view. Board mode composites everything into one
   // substrate render and isn't affected by hover.
+  //
+  // ⚠ Scoped to the ACTIVE DESIGN, in BOTH modes. The single-PCB view draws
+  // each layer at its own NATIVE file coordinates with no per-design offset,
+  // while the substrate/viewBox behind it (`boardView`, via
+  // `rebuildBoardView`) is already active-design-scoped — so an unscoped list
+  // superimposed a second design's artwork over the first design's substrate
+  // at unrelated coordinates. That superimposition WAS the confusion this
+  // separation is fixing; the Designs tab's active selection is now the one
+  // answer to "which board am I looking at". The hover-isolation branch stays
+  // unscoped so hovering any Layers-panel row still isolates that layer.
   const visibleLayers = useMemo(() => {
     if (viewMode === 'layers' && hoveredLayerId) {
       return layers.filter(l => l.id === hoveredLayerId && l.svgData && !l.svgData.isEmpty)
     }
     return layers
-      .filter(l => l.visible && l.svgData && !l.svgData.isEmpty)
+      .filter(l => l.visible && l.svgData && !l.svgData.isEmpty && (!activeDesignId || l.designId === activeDesignId))
       .slice()
       .sort((a, b) => getLayerZIndex(a.type) - getLayerZIndex(b.type))
-  }, [layers, viewMode, hoveredLayerId])
+  }, [layers, viewMode, hoveredLayerId, activeDesignId])
 
   // PCB-realistic colors for board mode compositing (replaces user-configurable colors).
   // Copper tint follows the selected soldermask color (copper as seen through the
@@ -421,6 +435,65 @@ export default function GerberViewer() {
         return l.side === boardViewSide || l.side === 'none'
       })
   }, [isBoardMode, visibleLayers, boardViewSide])
+
+  // Same board-mode filter as `boardModeLayers`, grouped by design — the
+  // panel view's multi-design rendering needs each placement to draw its
+  // OWN design's layers. Unlike `boardModeLayers`/`visibleLayers` (which
+  // scope to the ACTIVE design, since the single-PCB view shows exactly one
+  // board), this keeps every design: a packed panel legitimately shows all
+  // of them at once, each at its own placements. Reads straight from
+  // `layers` rather than `visibleLayers` to sidestep both that hook's
+  // active-design scoping and its hover-isolation special case, neither of
+  // which makes sense for the whole-panel view.
+  const boardModeLayersByDesign = useMemo(() => {
+    const map = new Map<string, LayerEntry[]>()
+    if (!isBoardMode) return map
+    for (const l of layers) {
+      if (!l.visible || !l.svgData || l.svgData.isEmpty) continue
+      if (l.type === 'fab' || l.type === 'other') continue
+      if (!(l.type === 'outline' || l.type === 'drill' || l.side === boardViewSide || l.side === 'none')) continue
+      const arr = map.get(l.designId)
+      if (arr) arr.push(l)
+      else map.set(l.designId, [l])
+    }
+    return map
+  }, [isBoardMode, layers, boardViewSide])
+
+  // Per-design analogue of `visibleLayers`, for the "Per-layer overlay"
+  // panel-view fallback (board view unavailable) — mirrors `visibleLayers`'s
+  // own two branches (including its hover-isolation special case) exactly,
+  // just grouped by design, so a single-design panel resolves to the same
+  // set `visibleLayers` itself would have produced.
+  const visibleLayersByDesign = useMemo(() => {
+    const map = new Map<string, LayerEntry[]>()
+    if (viewMode === 'layers' && hoveredLayerId) {
+      const hovered = layers.find(l => l.id === hoveredLayerId && l.svgData && !l.svgData.isEmpty)
+      if (hovered) map.set(hovered.designId, [hovered])
+      return map
+    }
+    for (const l of layers) {
+      if (!l.visible || !l.svgData || l.svgData.isEmpty) continue
+      const arr = map.get(l.designId)
+      if (arr) arr.push(l)
+      else map.set(l.designId, [l])
+    }
+    for (const arr of map.values()) arr.sort((a, b) => getLayerZIndex(a.type) - getLayerZIndex(b.type))
+    return map
+  }, [layers, viewMode, hoveredLayerId])
+
+  /** Native SVG bounds for one design's own board-mode composite — the
+   *  per-design analogue of `nativeSvgBounds`, used as the panel view's
+   *  per-placement translation datum. Falls back to whatever's available
+   *  (matching `nativeSvgBounds`'s own single-design fallback chain) when a
+   *  design's composite hasn't finished rendering yet. */
+  const designRefBounds = useCallback((designId: string) => {
+    const bv = boardViewsByDesign[designId]
+    if (bv) {
+      const vb = bv.viewBox
+      return { minX: vb.x, minY: vb.y, maxX: vb.x + vb.width, maxY: vb.y + vb.height }
+    }
+    return nativeSvgBounds
+  }, [boardViewsByDesign, nativeSvgBounds])
 
   // Check which types of layers are visible for panel overlay decisions
   const visibleLayerTypes = useMemo(() => {
@@ -473,11 +546,15 @@ export default function GerberViewer() {
       ? layers.find(l => l.type === 'outline' && l.visible && l.parsedLayer?.bounds)?.parsedLayer.bounds
       : null
 
-    // PCB positions (Y-inverted to match Gerber SVG coordinate system)
-    for (const pos of pr.pcbPositions) {
+    // PCB positions (Y-inverted to match Gerber SVG coordinate system).
+    // Keyed by array index, not row/col — row/col are grid-mode-only
+    // (`PanelPlacement.row`/`.col` are optional) and every packed placement
+    // shared the same `undefined-undefined` key, which both breaks React's
+    // reconciliation and collapses the on-screen labels to one repeated "1,1".
+    pr.placements.forEach((pos, posIdx) => {
       const screenY = -pos.y
-      const screenYBottom = -(pos.y + pr.pcbHeight)
-      const tx = pos.x + pr.pcbWidth / 2
+      const screenYBottom = -(pos.y + pos.h)
+      const tx = pos.x + pos.w / 2
       const textY = (screenY + screenYBottom) / 2
 
       if (contourOuter && outlineDatum) {
@@ -487,38 +564,38 @@ export default function GerberViewer() {
           .map(p => `${(p.x + dx).toFixed(4)},${(-(p.y + dy)).toFixed(4)}`)
           .join(' ')
         elements.push(
-          <polygon key={`pcb-${pos.row}-${pos.col}`}
+          <polygon key={`pcb-${posIdx}`}
             points={pointsAttr}
             fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth={0.1}
             strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />
         )
       } else {
         elements.push(
-          <rect key={`pcb-${pos.row}-${pos.col}`}
-            x={pos.x} y={screenYBottom} width={pr.pcbWidth} height={pr.pcbHeight}
+          <rect key={`pcb-${posIdx}`}
+            x={pos.x} y={screenYBottom} width={pos.w} height={pos.h}
             fill="none" stroke="rgba(255,255,255,0.3)" strokeWidth={0.1}
             strokeDasharray="1 1" vectorEffect="non-scaling-stroke" />
         )
       }
 
       const labelText = (
-        <text key={`pcb-label-${pos.row}-${pos.col}`}
+        <text key={`pcb-label-${posIdx}`}
           x={tx} y={textY}
           fill="rgba(255,255,255,0.5)" fontSize="2"
           textAnchor="middle" dominantBaseline="central"
           fontFamily="monospace" vectorEffect="non-scaling-stroke">
-          {`${pos.row + 1},${pos.col + 1}`}
+          {pos.row !== undefined && pos.col !== undefined ? `${pos.row + 1},${pos.col + 1}` : `${posIdx + 1}`}
         </text>
       )
 
       elements.push(
         isMirrored ? (
-          <g key={`pcb-label-g-${pos.row}-${pos.col}`} transform={`translate(${tx}, 0) scale(-1, 1) translate(${-tx}, 0)`}>
+          <g key={`pcb-label-g-${posIdx}`} transform={`translate(${tx}, 0) scale(-1, 1) translate(${-tx}, 0)`}>
             {labelText}
           </g>
         ) : labelText
       )
-    }
+    })
 
     // Panel outline (Y-inverted)
     elements.push(
@@ -603,11 +680,11 @@ export default function GerberViewer() {
       const outlineLayer = layers.find(l => l.type === 'outline' && l.parsedLayer?.bounds)
       const outlineOk = outlineLayer ? isRectangularOutline(outlineLayer.parsedLayer) : false
       const arm = pc.lShapeArmLength
-      const w = pr.pcbWidth
-      const h = pr.pcbHeight
+      const w = pr.placements[0]?.w ?? 0
+      const h = pr.placements[0]?.h ?? 0
       const maxArm = Math.min(w / 2, h / 2)
       if (outlineOk && arm > 0 && arm <= maxArm) {
-        for (const pos of pr.pcbPositions) {
+        pr.placements.forEach((pos, posIdx) => {
           const sy = (ly: number) => -(pos.y + ly)
           const gx = (lx: number) => pos.x + lx
           const corners = [
@@ -618,12 +695,12 @@ export default function GerberViewer() {
           ]
           for (const [ci, d] of corners.entries()) {
             elements.push(
-              <path key={`lshape-${pos.row}-${pos.col}-${ci}`}
+              <path key={`lshape-${posIdx}-${ci}`}
                 d={d} fill="none" stroke="rgba(255,20,147,0.85)" strokeWidth={0.15}
                 vectorEffect="non-scaling-stroke" />
             )
           }
-        }
+        })
       }
     }
 
@@ -929,13 +1006,19 @@ export default function GerberViewer() {
 
             if (isPanelViewTab(activeTab) && panelResult && nativeSvgBounds) {
               const pr = panelResult
-              const refBounds = nativeSvgBounds
-              const maskClipPairs = getMaskClipPairs(bLayers)
-              const maskClipByMaskId = new Map(maskClipPairs.map(p => [p.maskLayerId, p]))
+              // One design's worth of layers per placement, not `bLayers`
+              // (the active design's layers) repeated at every position —
+              // see `boardModeLayersByDesign`'s own docs. Single-design
+              // panels are unaffected: there's only one key in the map, so
+              // every placement resolves to the same `bLayers`-equivalent
+              // list this block already used, and `designRefBounds` falls
+              // back to `nativeSvgBounds` exactly as `refBounds` did before.
+              const designIds = [...new Set(pr.placements.map(p => p.designId))]
+              const maskClipPairsByDesign = new Map(designIds.map(id => [id, getMaskClipPairs(boardModeLayersByDesign.get(id) ?? [])]))
               return (
                 <>
                   <defs>
-                    {bLayers.map(layer => (
+                    {designIds.flatMap(id => (boardModeLayersByDesign.get(id) ?? []).map(layer => (
                       layer.svgData ? (
                         <RawSvgSymbol
                           key={`def-${layer.id}`}
@@ -943,33 +1026,61 @@ export default function GerberViewer() {
                           html={layer.svgData.svgFragment}
                         />
                       ) : null
-                    ))}
-                    {maskClipPairs.map(pair => (
+                    )))}
+                    {designIds.flatMap(id => (maskClipPairsByDesign.get(id) ?? []).map(pair => (
                       // colorInterpolation: 'sRGB' avoids the linearRGB luminance-mask
                       // dark-edge halo — see RawSvgMask in raw-svg-group.tsx for why.
                       <mask key={`mask-mask-${pair.maskLayerId}`} id={`mask-mask-${pair.maskLayerId}`} style={{ colorInterpolation: 'sRGB' }}>
                         <use href={`#layer-def-${pair.maskLayerId}`} style={{ color: '#fff' }} />
                       </mask>
-                    ))}
-                    {pr.pcbPositions.map((pos, idx) => (
+                    )))}
+                    {pr.placements.map((pos, idx) => (
                       <clipPath key={`pcb-clip-${idx}`} id={`pcb-clip-${idx}`}>
                         <rect
                           x={pos.x}
-                          y={-(pos.y + pr.pcbHeight)}
-                          width={pr.pcbWidth}
-                          height={pr.pcbHeight}
+                          y={-(pos.y + pos.h)}
+                          width={pos.w}
+                          height={pos.h}
                         />
                       </clipPath>
                     ))}
                   </defs>
-                  {pr.pcbPositions.map((pos, posIdx) => {
+                  {pr.placements.map((pos, posIdx) => {
+                    const refBounds = designRefBounds(pos.designId)
+                    if (!refBounds) return null
+                    const dLayers = boardModeLayersByDesign.get(pos.designId) ?? []
+                    const maskClipPairs = maskClipPairsByDesign.get(pos.designId) ?? []
+                    const maskClipByMaskId = new Map(maskClipPairs.map(p => [p.maskLayerId, p]))
+                    const dBoardView = boardViewsByDesign[pos.designId]
+                    const dOutlineShape = dBoardView?.shapePathD ?? null
+                    const rawDBgRect = (
+                      <rect
+                        x={refBounds.minX - 0.2} y={refBounds.minY - 0.2}
+                        width={refBounds.maxX - refBounds.minX + 0.4}
+                        height={refBounds.maxY - refBounds.minY + 0.4}
+                        fill={BOARD_COLOR_PALETTE[boardColor].substrate}
+                      />
+                    )
+                    const dBgRect = dOutlineShape ? (
+                      <g>
+                        <defs>
+                          <clipPath id={`board-outline-clip-${posIdx}`}>
+                            <path
+                              d={dOutlineShape}
+                              transform={dBoardView!.shapeScale !== 1 ? `scale(${dBoardView!.shapeScale})` : undefined}
+                            />
+                          </clipPath>
+                        </defs>
+                        <g clipPath={`url(#board-outline-clip-${posIdx})`}>{rawDBgRect}</g>
+                      </g>
+                    ) : rawDBgRect
                     const tx = pos.x - refBounds.minX
                     const ty = -pos.y - refBounds.maxY
                     return (
                       <g key={`panel-pos-${posIdx}`} clipPath={`url(#pcb-clip-${posIdx})`}>
                         <g transform={`translate(${tx.toFixed(6)}, ${ty.toFixed(6)})`}>
-                          {bgRect}
-                          {bLayers.map(layer => {
+                          {dBgRect}
+                          {dLayers.map(layer => {
                             const clipPair = maskClipByMaskId.get(layer.id)
                             if (clipPair) {
                               return (
@@ -977,14 +1088,12 @@ export default function GerberViewer() {
                                   {/* Exposed bare FR4 under the mask opening —
                                       see the single-PCB board view below for
                                       why this is needed. */}
-                                  {bounds && (
-                                    <rect
-                                      x={bounds.minX} y={bounds.minY}
-                                      width={bounds.maxX - bounds.minX} height={bounds.maxY - bounds.minY}
-                                      mask={`url(#mask-mask-${layer.id})`}
-                                      fill={EXPOSED_SUBSTRATE_COLOR}
-                                    />
-                                  )}
+                                  <rect
+                                    x={refBounds.minX} y={refBounds.minY}
+                                    width={refBounds.maxX - refBounds.minX} height={refBounds.maxY - refBounds.minY}
+                                    mask={`url(#mask-mask-${layer.id})`}
+                                    fill={EXPOSED_SUBSTRATE_COLOR}
+                                  />
                                   <use
                                     href={`#layer-def-${clipPair.copperLayerId}`}
                                     data-layer={layer.id}
@@ -1067,14 +1176,18 @@ export default function GerberViewer() {
             )
           })() : isPanelViewTab(activeTab) && panelResult && nativeSvgBounds ? (() => {
             // Per-layer overlay — fallback when board view is unavailable.
-            const outlineLayer = visibleLayers.find(l => l.type === 'outline' && l.svgData?.boundsObj)
-            const refBounds = (outlineLayer?.svgData?.boundsObj) || nativeSvgBounds
+            // Per-design layer sets + refBounds, same reasoning as the Board
+            // view branch above — single-design panels are unaffected since
+            // `visibleLayersByDesign` has only one key, resolving to the
+            // exact `visibleLayers` list and `refBounds` this block used
+            // before.
             const pr = panelResult
+            const designIds = [...new Set(pr.placements.map(p => p.designId))]
 
             return (
               <>
                 <defs>
-                  {visibleLayers.map(layer => (
+                  {designIds.flatMap(id => (visibleLayersByDesign.get(id) ?? []).map(layer => (
                     layer.svgData ? (
                       <RawSvgSymbol
                         key={`def-${layer.id}`}
@@ -1082,26 +1195,30 @@ export default function GerberViewer() {
                         html={layer.svgData.svgFragment}
                       />
                     ) : null
-                  ))}
-                  {pr.pcbPositions.map((pos, idx) => (
+                  )))}
+                  {pr.placements.map((pos, idx) => (
                     <clipPath key={`pcb-clip-${idx}`} id={`pcb-clip-${idx}`}>
                       <rect
                         x={pos.x}
-                        y={-(pos.y + pr.pcbHeight)}
-                        width={pr.pcbWidth}
-                        height={pr.pcbHeight}
+                        y={-(pos.y + pos.h)}
+                        width={pos.w}
+                        height={pos.h}
                       />
                     </clipPath>
                   ))}
                 </defs>
 
-                {pr.pcbPositions.map((pos, posIdx) => {
+                {pr.placements.map((pos, posIdx) => {
+                  const dLayers = visibleLayersByDesign.get(pos.designId) ?? []
+                  const outlineLayer = dLayers.find(l => l.type === 'outline' && l.svgData?.boundsObj)
+                  const refBounds = (outlineLayer?.svgData?.boundsObj) || designRefBounds(pos.designId)
+                  if (!refBounds) return null
                   const tx = pos.x - refBounds.minX
                   const ty = -pos.y - refBounds.maxY
                   return (
                     <g key={`panel-pos-${posIdx}`} clipPath={`url(#pcb-clip-${posIdx})`}>
                       <g transform={`translate(${tx.toFixed(6)}, ${ty.toFixed(6)})`}>
-                        {visibleLayers.map(layer => {
+                        {dLayers.map(layer => {
                           if (!layer.svgData) return null
                           return (
                             <use
@@ -1208,7 +1325,12 @@ export default function GerberViewer() {
       {/* Status bar */}
       <div className="absolute bottom-0 left-0 right-0 h-7 bg-[#020d1f]/90 text-xs text-[#94b8d4] flex items-center px-2 gap-4 font-mono rounded-b-lg border-t border-[#1a3a5c]">
         <span className="text-[#4a6f94]">
-          {layers.length === 0 ? 'Import Gerber files to start' : `${visibleLayers.length}/${layers.length} layers`}
+          {/* Denominator scoped to the active design, matching `visibleLayers`
+              — a hidden design's layers aren't drawn, so counting them would
+              read as "half my layers vanished". */}
+          {layers.length === 0
+            ? 'Import Gerber files to start'
+            : `${visibleLayers.length}/${layers.filter(l => !activeDesignId || l.designId === activeDesignId).length} layers`}
         </span>
         {cursorPos && (
           <span>

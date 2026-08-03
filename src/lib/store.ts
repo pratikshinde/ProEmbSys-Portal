@@ -9,8 +9,9 @@ import { gerberToSvg, gerberRenderBoardView, checkCopperSpacing, BoardView, Gerb
 import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
 import { runDfm } from './dfm/run-dfm'
 import type { DfmContext, DfmLayerInput, DfmReport, DfmRules } from './dfm/types'
-import { PanelConfig, PanelResult, PanelInfo, DEFAULT_PANEL_CONFIG, computePanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DrillZeroSuppression, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber, formatPanelDate } from './panelization-engine'
+import { PanelConfig, PanelResult, PanelInfo, PanelPlacement, PanelDesignSummary, DEFAULT_PANEL_CONFIG, computePanel, finishPackedPanel, OutputFormat, DEFAULT_OUTPUT_FORMAT, DrillFormatConfig, DrillFormatPreset, DrillZeroSuppression, DRILL_FORMAT_PRESETS, DEFAULT_DRILL_FORMAT, generateLayerLabels, LayerLabelInfo, generatePanelizedGerber, formatPanelDate, resolveDesignGeometry } from './panelization-engine'
 import { LayerType, LayerSide, detectLayerType, detectLayerSide } from './gerber-analysis'
+import { findPackCandidates, type PackCandidate, type PackInfeasibility, type PackItemSpec } from './packing/pack'
 import { planRouting, resolveOutlineMode } from './routing/plan-routing'
 import { DEFAULT_ROUTING_CONFIG, type BoardContour, type RoutingConfig, type RoutingResult } from './routing/types'
 import { generateGcodeFiles as buildGcodeFiles, generateMetaPanelGcodeFiles, DEFAULT_GCODE_CONTEXT, type GcodeContext, type GcodeFile } from './routing/gcode'
@@ -35,7 +36,7 @@ export type { LayerType, LayerSide }
 /** The CAM tool's sidebar tabs. Previously this union was spelled out inline on
  *  both `activeTab` and `setActiveTab`, which meant adding a tab required
  *  editing two places that could silently drift apart. */
-export type CamTab = 'layers' | 'dfm' | 'panel' | 'routing' | 'gcode' | 'export'
+export type CamTab = 'layers' | 'designs' | 'dfm' | 'panel' | 'routing' | 'gcode' | 'export'
 
 /** Tabs whose canvas shows the whole *panel* rather than the single imported
  *  PCB. `gerber-viewer.tsx` gates SIX separate things on this (bounds, the
@@ -85,7 +86,46 @@ export interface LayerEntry {
   opacity: number
   type: LayerType
   side: LayerSide
+  /** Which `DesignEntry` this layer belongs to. Every import path tags this —
+   *  a loose file joins the current `activeDesignId` (creating a default
+   *  design on the very first import); a ZIP/RAR archive creates a new design
+   *  in MULTI mode (one archive = one board) but appends to the active design
+   *  in SINGLE mode once one exists — see `resolveImportDesignId`. */
+  designId: string
+  /** Rotation this layer's content was materialized at, relative to its
+   *  design's original upload — always `0`, since rotated-variant
+   *  materialization is a deliberately deferred feature (see CLAUDE.md's
+   *  multi-design rotation note). Not the same as the whole-tool "Rotate
+   *  Left/Right" button (`rotateAllLayers`), which rotates content in place. */
+  variantRotationDeg: 0 | 90 | 180 | 270
 }
+
+/**
+ * One uploaded board design. In SINGLE mode there is exactly one (every
+ * import feeds it); in MULTI mode each archive becomes its own design and
+ * several coexist in `layers`, tagged via `LayerEntry.designId`, so the
+ * packer can place different boards on one panel.
+ * `minCount`/`maxCount`/`allowRotation`/`priority` only matter in multi mode
+ * — they're the packer's per-design inputs.
+ */
+export interface DesignEntry {
+  id: string
+  name: string
+  color: string
+  minCount: number
+  maxCount: number | null
+  allowRotation: boolean
+  /** Non-null blocks rotation for this design (e.g. a macro aperture that
+   *  `rotateGerberLayer` can't rotate) — reserved for whenever rotated-variant
+   *  materialization actually ships; nothing sets it today. */
+  rotationBlockedReason: string | null
+  priority: number
+}
+
+/** Palette for auto-assigning a new design a distinguishing color — cycles
+ *  once more designs exist than colors. Purely cosmetic (Designs tab, future
+ *  packer preview), never touches exported Gerbers. */
+const DESIGN_COLORS = ['#3b82f6', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16']
 
 /** Result of importing a zip file */
 export interface ZipImportResult {
@@ -102,6 +142,44 @@ interface AppState {
   addLayersFromZip: (zipFile: File) => Promise<ZipImportResult>
   addLayersFromRar: (rarFile: File) => Promise<ZipImportResult>
   alignDrillLayersToBoard: () => Promise<void>
+
+  // Designs — one per uploaded archive (or the shared default for loose
+  // files).
+  designs: DesignEntry[]
+  activeDesignId: string | null
+  setActiveDesignId: (id: string) => void
+  renameDesign: (id: string, name: string) => void
+  updateDesign: (id: string, updates: Partial<Pick<DesignEntry, 'minCount' | 'maxCount' | 'allowRotation' | 'priority'>>) => void
+  removeDesign: (id: string) => void
+
+  /**
+   * Tool-wide mode: 'single' (default) is the classic one-board grid
+   * workflow with EVERY multi-design surface hidden — no Designs tab, no
+   * packing UI, archive imports append to the one active design. 'multi'
+   * shows the full designs/packing workflow — one archive = one design,
+   * panels come from the packer ("Use This Layout" / re-pack), never the
+   * grid. `computePanelResult` branches on this, so "rebuild panel" call
+   * sites (Create Panel, Apply Changes to Gerber, routing one-click fixes)
+   * do the mode-correct thing instead of silently grid-panelizing a packed
+   * layout. Switching modes clears the computed panel and everything
+   * downstream (stale-plan discipline) but keeps layers/designs/DFM.
+   */
+  camMode: 'single' | 'multi'
+  setCamMode: (mode: 'single' | 'multi') => void
+
+  // Multi-design packing — material size + per-design min/max/rotation
+  // (on DesignEntry) feed `findPackCandidates`; "Use this layout" commits a
+  // chosen candidate through `finishPackedPanel`, the pack-mode counterpart
+  // to `computePanel`.
+  materialSizeMm: { widthMm: number; heightMm: number }
+  updateMaterialSize: (updates: Partial<{ widthMm: number; heightMm: number }>) => void
+  packCandidates: PackCandidate[] | null
+  selectedCandidateId: string | null
+  packInfeasible: PackInfeasibility[]
+  findPackCandidatesAction: () => void
+  selectPackCandidate: (id: string) => void
+  applyPackCandidateAction: () => void
+
   removeLayer: (id: string) => void
   toggleLayerVisibility: (id: string) => void
   setAllLayersVisibility: (visible: boolean) => void
@@ -136,6 +214,13 @@ interface AppState {
 
   // Board view (composited stack-up render via @tracespace/core)
   boardView: BoardView | null
+  /** One composite per design, keyed by designId — `boardView` above is
+   *  always `boardViewsByDesign[activeDesignId]` (kept as its own field so
+   *  the single-PCB Layers/DFM Check views need no lookup). The panel view's
+   *  multi-design rendering reads this map so each placement composites
+   *  its OWN design's layers instead of the active design's repeated at
+   *  every position. */
+  boardViewsByDesign: Record<string, BoardView>
   boardViewSide: 'top' | 'bottom'
   /** 'board' = composited PCB look, 'layers' = per-layer overlay (debug/inspection) */
   viewMode: 'board' | 'layers'
@@ -501,9 +586,324 @@ function findOutlineBoundsLayer(layers: LayerEntry[]): LayerEntry | undefined {
   return layers.find(l => l.type === 'outline' && l.visible && l.parsedLayer?.bounds)
 }
 
+/**
+ * Drill hole/slot collection, generalized across every design in the panel —
+ * used by the G-code and meta-panel-array actions, which (unlike the Gerber
+ * exporter's own drill file) call `collectPanelizedDrillHoles`/
+ * `collectPanelizedDrillSlots` directly rather than through
+ * `generatePanelizedDrill`. Each design's own drill layers are collected
+ * against a SUB-PANEL restricted to that design's own placements and offset
+ * by that design's own datum — the same per-design scoping
+ * `generatePanelizedDrill`'s `perDesignBaseOffset` parameter gives the
+ * Gerber exporter's drill file (see gerber-exporter.ts) — then merged by
+ * diameter. Before this existed, G-code/array generation was unreachable
+ * for a multi-design panel (routing itself refused one), so this scoping
+ * was never exercised; Stage 7 lifting that refusal makes it reachable, and
+ * without this fix it would silently stamp one design's own drill positions
+ * at every OTHER design's placements too.
+ */
+function collectAllDesignsDrillHoles(
+  layers: LayerEntry[],
+  panelResult: PanelResult
+): { diameterMm: number; holes: { x: number; y: number }[] }[] {
+  const merged = new Map<number, { x: number; y: number }[]>()
+  for (const design of panelResult.designs) {
+    const designLayers = layers.filter(l => l.designId === design.designId)
+    const globalBaseOffset = resolveDesignGeometry(designLayers)?.datum
+    const drillLayers = designLayers
+      .filter(l => l.type === 'drill' && l.parsedLayer?.bounds)
+      .map(l => ({ name: l.name, fileName: l.fileName, content: l.rawContent, parsedLayer: l.parsedLayer, type: l.type, side: l.side }))
+    const subPanel: PanelResult = { ...panelResult, placements: panelResult.placements.filter(p => p.designId === design.designId) }
+    for (const g of collectPanelizedDrillHoles(drillLayers, subPanel, globalBaseOffset)) {
+      if (!merged.has(g.diameterMm)) merged.set(g.diameterMm, [])
+      merged.get(g.diameterMm)!.push(...g.holes)
+    }
+  }
+  return [...merged.entries()].sort(([a], [b]) => a - b).map(([diameterMm, holes]) => ({ diameterMm, holes }))
+}
+
+/** Slot equivalent of `collectAllDesignsDrillHoles` — see its own docs. */
+function collectAllDesignsDrillSlots(
+  layers: LayerEntry[],
+  panelResult: PanelResult
+): { diameterMm: number; slots: { start: { x: number; y: number }; end: { x: number; y: number } }[] }[] {
+  const merged = new Map<number, { start: { x: number; y: number }; end: { x: number; y: number } }[]>()
+  for (const design of panelResult.designs) {
+    const designLayers = layers.filter(l => l.designId === design.designId)
+    const globalBaseOffset = resolveDesignGeometry(designLayers)?.datum
+    const drillLayers = designLayers
+      .filter(l => l.type === 'drill' && l.parsedLayer?.bounds)
+      .map(l => ({ name: l.name, fileName: l.fileName, content: l.rawContent, parsedLayer: l.parsedLayer, type: l.type, side: l.side }))
+    const subPanel: PanelResult = { ...panelResult, placements: panelResult.placements.filter(p => p.designId === design.designId) }
+    for (const g of collectPanelizedDrillSlots(drillLayers, subPanel, globalBaseOffset)) {
+      if (!merged.has(g.diameterMm)) merged.set(g.diameterMm, [])
+      merged.get(g.diameterMm)!.push(...g.slots)
+    }
+  }
+  return [...merged.entries()].sort(([a], [b]) => a - b).map(([diameterMm, slots]) => ({ diameterMm, slots }))
+}
+
+/**
+ * A 1-position "panel" of exactly one un-panelized copy at the origin, with
+ * every panel-overlay feature (L-shapes, tooling holes, fiducials) disabled —
+ * used to re-run a single layer's own content through `generatePanelizedGerber`
+ * as a plain coordinate-offset/re-serialize pass (rotate, drill-align) rather
+ * than duplicating that function's body. `rotateAllLayers` and
+ * `alignDrillLayersToBoard` both need exactly this and used to each construct
+ * their own byte-identical copy of it.
+ */
+function identityPanelContext(): { panel: PanelResult; config: PanelConfig } {
+  return {
+    panel: {
+      panelWidth: 0, panelHeight: 0, totalPCBs: 1,
+      placements: [{ row: 0, col: 0, x: 0, y: 0, w: 0, h: 0, rotationDeg: 0, designId: 'default' }],
+      designs: [],
+      toolingHoles: [], fiducials: [], infoTexts: [],
+      source: 'grid',
+    },
+    config: {
+      ...DEFAULT_PANEL_CONFIG,
+      enableLShapeMarks: false,
+      enableToolingHoles: false,
+      enableFiducials: false,
+    },
+  }
+}
+
+/**
+ * Returns the current active design, creating a default "Design 1" entry if
+ * none exists yet. Used by every loose-file import, and — in SINGLE mode —
+ * by archive imports too once a design already exists, so re-importing a
+ * revised ZIP of the same board appends to that board instead of silently
+ * spawning a second design (see `resolveImportDesignId`).
+ */
+function ensureActiveDesignId(get: () => AppState, set: (fn: (s: AppState) => Partial<AppState>) => void): string {
+  const { designs, activeDesignId } = get()
+  if (activeDesignId && designs.some(d => d.id === activeDesignId)) return activeDesignId
+  if (designs.length > 0) {
+    set(() => ({ activeDesignId: designs[0].id }))
+    return designs[0].id
+  }
+  const id = generateId()
+  const entry: DesignEntry = {
+    id, name: 'Design 1', color: DESIGN_COLORS[0],
+    // allowRotation defaults false — rotated packing isn't materialized yet
+    // (see findPackCandidatesAction's own doc). rotationBlockedReason is
+    // reserved for when it is.
+    minCount: 1, maxCount: null, allowRotation: false, rotationBlockedReason: null, priority: 0,
+  }
+  set(() => ({ designs: [entry], activeDesignId: id }))
+  return id
+}
+
+/**
+ * Which design an incoming ARCHIVE (ZIP/RAR) import belongs to.
+ *
+ * - Multi mode: one archive = one design, always. That's the whole point of
+ *   the mode — each archive is a different board to pack alongside others.
+ * - Single mode, no design yet: still create one from the archive name, so
+ *   the design carries a meaningful label if the user later switches to
+ *   multi mode.
+ * - Single mode, design exists: APPEND to the active design. This is the
+ *   headline fix for the reported confusion — previously every archive
+ *   import spawned a new design, so a user re-importing a revised ZIP of
+ *   the same board silently ended up with two, with only the newest one
+ *   panelized while both boards' layers showed mixed in the Layers list.
+ */
+function resolveImportDesignId(
+  get: () => AppState,
+  set: (fn: (s: AppState) => Partial<AppState>) => void,
+  archiveFileName: string
+): string {
+  const { camMode, designs } = get()
+  return camMode === 'multi' || designs.length === 0
+    ? createDesignFromArchiveName(get, set, archiveFileName)
+    : ensureActiveDesignId(get, set)
+}
+
+/** One archive = one design, named from the archive and made active. */
+function createDesignFromArchiveName(get: () => AppState, set: (fn: (s: AppState) => Partial<AppState>) => void, archiveFileName: string): string {
+  const { designs } = get()
+  const id = generateId()
+  const name = archiveFileName.replace(/\.[^.]+$/, '')
+  const entry: DesignEntry = {
+    id, name, color: DESIGN_COLORS[designs.length % DESIGN_COLORS.length],
+    minCount: 1, maxCount: null, allowRotation: false, rotationBlockedReason: null, priority: designs.length,
+  }
+  set(state => ({ designs: [...state.designs, entry], activeDesignId: id }))
+  return id
+}
+
+/**
+ * `PackItemSpec[]` from the current designs/layers — shared by
+ * `findPackCandidatesAction` (the Designs tab's "Find Layouts") and
+ * `computePanelResult`'s multi-mode re-pack, so the two can never drift on
+ * geometry resolution or the rotation lockout.
+ */
+function buildPackItemSpecs(designs: DesignEntry[], layers: LayerEntry[]): PackItemSpec[] {
+  const specs: PackItemSpec[] = []
+  for (const d of designs) {
+    const designLayers = layers.filter(l => l.designId === d.id)
+    const geometry = resolveDesignGeometry(designLayers)
+    if (!geometry || geometry.widthMm <= 0 || geometry.heightMm <= 0) continue
+    specs.push({
+      designId: d.id,
+      widthMm: geometry.widthMm,
+      heightMm: geometry.heightMm,
+      minCount: d.minCount,
+      maxCount: d.maxCount,
+      // Rotation is deliberately never allowed here regardless of
+      // `d.allowRotation` — the packer can propose a rotated placement,
+      // but nothing downstream (export/viewer/routing) actually rotates
+      // the design's own Gerber content to match, which would silently
+      // stamp UNROTATED artwork at a ROTATED slot. The Designs tab's
+      // Rotate toggle is disabled in the UI for the same reason; this is
+      // the belt to that belt-and-suspenders, in case `d.allowRotation`
+      // is ever `true` from stale state. See CLAUDE.md's multi-design
+      // rotation section — materializing real rotated geometry is a
+      // deliberately deferred, separate feature.
+      allowRotation: false,
+      priority: d.priority,
+    })
+  }
+  return specs
+}
+
+/**
+ * A chosen `PackCandidate` → a finished `PanelResult` (placements, design
+ * summaries, tooling holes/fiducials/rib text via `finishPackedPanel`) —
+ * shared by `applyPackCandidateAction` ("Use This Layout") and
+ * `computePanelResult`'s multi-mode re-pack.
+ */
+function buildPackedPanelResult(
+  candidate: PackCandidate,
+  designs: DesignEntry[],
+  layers: LayerEntry[],
+  panelConfig: PanelConfig,
+  panelInfo: PanelInfo
+): PanelResult {
+  const placements: PanelPlacement[] = candidate.items.map(it => ({
+    x: it.x, y: it.y, w: it.w, h: it.h, rotationDeg: it.rotationDeg, designId: it.designId,
+  }))
+
+  const designSummaries: PanelDesignSummary[] = designs
+    .filter(d => (candidate.countsByDesign[d.id] ?? 0) > 0)
+    .map(d => {
+      const geometry = resolveDesignGeometry(layers.filter(l => l.designId === d.id))
+      return {
+        designId: d.id,
+        name: d.name,
+        widthMm: geometry?.widthMm ?? 0,
+        heightMm: geometry?.heightMm ?? 0,
+        count: candidate.countsByDesign[d.id] ?? 0,
+        rotationsDeg: [...new Set(candidate.items.filter(it => it.designId === d.id).map(it => it.rotationDeg))],
+      }
+    })
+
+  return finishPackedPanel(placements, designSummaries, candidate.panelWidthMm, candidate.panelHeightMm, panelConfig, panelInfo)
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   // Layers
   layers: [],
+
+  designs: [],
+  activeDesignId: null,
+  setActiveDesignId: (id: string) => set({ activeDesignId: id }),
+  renameDesign: (id: string, name: string) =>
+    set(state => ({ designs: state.designs.map(d => d.id === id ? { ...d, name } : d) })),
+
+  updateDesign: (id, updates) =>
+    set(state => ({
+      designs: state.designs.map(d => d.id === id ? { ...d, ...updates } : d),
+      // Min/max/rotation feed findPackCandidates directly — an existing
+      // candidate list no longer reflects reality once these change.
+      packCandidates: null,
+      selectedCandidateId: null,
+    })),
+
+  removeDesign: (id: string) => {
+    const { designs, activeDesignId } = get()
+    const remaining = designs.filter(d => d.id !== id)
+    const newActiveId = activeDesignId === id ? (remaining[0]?.id ?? null) : activeDesignId
+    set(state => ({
+      designs: remaining,
+      layers: state.layers.filter(l => l.designId !== id),
+      activeDesignId: newActiveId,
+      packCandidates: null,
+      selectedCandidateId: null,
+    }))
+    void get().rebuildBoardView()
+  },
+
+  camMode: 'single',
+  setCamMode: (mode) => {
+    if (get().camMode === mode) return
+    set(state => ({
+      camMode: mode,
+      // A grid panel is meaningless in multi mode and a packed panel in
+      // single mode — stale-plan discipline: clear, never keep (same list
+      // as computePanelResult's success path, plus the pack-search state).
+      // Deliberately KEPT: layers, designs, activeDesignId (multi → single
+      // is non-destructive — other designs' layers stay in memory, hidden,
+      // until the user switches back), dfmReport (scoped to the active
+      // design, whose geometry is untouched by the switch), boardView(s),
+      // every config slice, materialSizeMm.
+      panelResult: null,
+      routingResult: null, routingStale: false, routingFocus: null,
+      gcodeFiles: null, boardContour: null,
+      panelArrayResult: null, panelArrayFiles: null,
+      packCandidates: null, selectedCandidateId: null, packInfeasible: [],
+      // The Designs tab doesn't exist in single mode — don't strand the
+      // user on a hidden tab.
+      ...(mode === 'single' && state.activeTab === 'designs' ? { activeTab: 'layers' as CamTab } : {}),
+    }))
+  },
+
+  materialSizeMm: { widthMm: 300, heightMm: 300 },
+  updateMaterialSize: (updates) =>
+    set(state => ({
+      materialSizeMm: { ...state.materialSizeMm, ...updates },
+      packCandidates: null,
+      selectedCandidateId: null,
+    })),
+
+  packCandidates: null,
+  selectedCandidateId: null,
+  packInfeasible: [],
+
+  findPackCandidatesAction: () => {
+    const { designs, layers, materialSizeMm, panelConfig } = get()
+    const result = findPackCandidates(buildPackItemSpecs(designs, layers), {
+      materialWidthMm: materialSizeMm.widthMm,
+      materialHeightMm: materialSizeMm.heightMm,
+      gapXMm: panelConfig.gapX,
+      gapYMm: panelConfig.gapY,
+    })
+    set({
+      packCandidates: result.candidates,
+      packInfeasible: result.infeasible,
+      selectedCandidateId: result.candidates[0]?.id ?? null,
+    })
+  },
+
+  selectPackCandidate: (id: string) => set({ selectedCandidateId: id }),
+
+  applyPackCandidateAction: () => {
+    const { packCandidates, selectedCandidateId, designs, layers, panelConfig, panelInfo } = get()
+    const candidate = packCandidates?.find(c => c.id === selectedCandidateId)
+    if (!candidate) return
+
+    const result = buildPackedPanelResult(candidate, designs, layers, panelConfig, panelInfo)
+
+    // Same invalidation as computePanelResult: a fresh panel makes any
+    // existing routing plan / G-code stale.
+    set({
+      panelResult: result,
+      routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
+      panelArrayResult: null, panelArrayFiles: null,
+    })
+  },
 
   addLayer: async (file: File) => {
     const content = await file.text()
@@ -546,6 +946,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       const color = getDefaultLayerColorByType(type, side)
 
+      // A loose file joins the active design (creating the default "Design 1"
+      // on the very first import) — computed before the drill auto-detect
+      // below so that comparison only ever looks at THIS design's own board
+      // layers, never another design's.
+      const designId = ensureActiveDesignId(get, set)
+
       // Convert to target unit if needed
       const targetUnit = get().targetUnit
       convertLayerUnits(parsedLayer, targetUnit)
@@ -557,7 +963,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       let finalParsed = parsedLayer
       let finalSvg = svgData
       if (type === 'drill' && drillOrRout?.kind !== 'rout' && parsedLayer.bounds) {
-        const existingLayers = get().layers
+        const existingLayers = get().layers.filter(l => l.designId === designId)
         const boardLayers = existingLayers.filter(l => l.type !== 'drill' && l.type !== 'fab' && l.type !== 'other' && l.parsedLayer?.bounds)
         if (boardLayers.length > 0) {
           let boardMinX = Infinity, boardMinY = Infinity, boardMaxX = -Infinity, boardMaxY = -Infinity
@@ -611,9 +1017,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         opacity: getDefaultOpacityByType(type),
         type,
         side,
+        designId,
+        variantRotationDeg: 0,
       }
 
-      set(state => ({ layers: [...state.layers, entry] }))
+      set(state => ({ layers: [...state.layers, entry], packCandidates: null, selectedCandidateId: null }))
       if (type === 'drill') maybeSyncExportDrillFormat(get, set, finalParsed.drillMeta)
       void get().rebuildBoardView()
       // NOTE: Panel computation is now only triggered when user clicks "Panel Config" button
@@ -638,9 +1046,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setAllLayersVisibility: (visible: boolean) => {
-    set(state => ({
-      layers: state.layers.map(l => ({ ...l, visible })),
-    }))
+    set(state => {
+      // In SINGLE mode the Layers panel only shows (and the viewer only
+      // draws) the active design, so "Hide All"/"Show All" must not silently
+      // flip a hidden design's layers the user can't see or undo. Multi mode
+      // shows every design, so it stays global.
+      const scoped = state.camMode === 'single' && state.activeDesignId
+      return {
+        layers: state.layers.map(l =>
+          !scoped || l.designId === state.activeDesignId ? { ...l, visible } : l
+        ),
+      }
+    })
   },
 
   reapplyDrillFormat: async (layerId: string, unit: 'mm' | 'inches', integer: number, decimal: number, zeroSuppression: DrillZeroSuppressionMode) => {
@@ -715,26 +1132,30 @@ export const useAppStore = create<AppState>((set, get) => ({
     // their canvas markers) or router tool paths pointing at geometry that's no
     // longer loaded would be misleading, and a stale route would still export.
     set({
-      layers: [], panelResult: null, boardView: null,
+      layers: [], designs: [], activeDesignId: null, panelResult: null, boardView: null, boardViewsByDesign: {},
       dfmReport: null, dfmFocus: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
+      packCandidates: null, selectedCandidateId: null,
     })
   },
 
   rotateAllLayers: async (direction: 'left' | 'right') => {
-    const { layers, outputFormat } = get()
-    if (layers.length === 0) return
+    const { layers, outputFormat, activeDesignId } = get()
+    // Scoped to the active design — "Rotate Left/Right" rotates the design
+    // you're looking at, not every design ever imported into the tool.
+    const targetLayers = activeDesignId ? layers.filter(l => l.designId === activeDesignId) : layers
+    if (targetLayers.length === 0) return
 
     // 1. Rotate the parsedLayer objects
-    for (const layer of layers) {
+    for (const layer of targetLayers) {
       if (layer.parsedLayer) {
         rotateGerberLayer(layer.parsedLayer, direction)
       }
     }
 
     // 2. Find the new global base offset so all layers stay aligned
-    const outlineLayer = layers.find(l => l.type === 'outline' && l.parsedLayer?.bounds)
+    const outlineLayer = targetLayers.find(l => l.type === 'outline' && l.parsedLayer?.bounds)
     let globalBaseOffset: { x: number; y: number } | undefined
     if (outlineLayer?.parsedLayer?.bounds) {
       globalBaseOffset = {
@@ -744,7 +1165,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     } else {
       let minX = Infinity
       let minY = Infinity
-      for (const l of layers) {
+      for (const l of targetLayers) {
         if (l.parsedLayer?.bounds) {
           minX = Math.min(minX, l.parsedLayer.bounds.minX)
           minY = Math.min(minY, l.parsedLayer.bounds.minY)
@@ -756,20 +1177,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     // 3. Generate new raw content and re-render SVG
-    const dummyPanel: PanelResult = {
-      panelWidth: 0, panelHeight: 0, pcbWidth: 0, pcbHeight: 0, totalPCBs: 1,
-      pcbPositions: [{ row: 0, col: 0, x: 0, y: 0 }],
-      toolingHoles: [], fiducials: [], infoTexts: []
-    }
-    
-    const dummyConfig: PanelConfig = { 
-      ...DEFAULT_PANEL_CONFIG, 
-      enableLShapeMarks: false, 
-      enableToolingHoles: false, 
-      enableFiducials: false,
-    }
+    const { panel: dummyPanel, config: dummyConfig } = identityPanelContext()
 
-    const updatedLayers = await Promise.all(layers.map(async (layer) => {
+    const updatedTargetLayers = await Promise.all(targetLayers.map(async (layer) => {
       if (!layer.parsedLayer) return layer
 
       // Generate new content for the rotated layer
@@ -831,13 +1241,18 @@ export const useAppStore = create<AppState>((set, get) => ({
         svgData: newSvgData
       }
     }))
-    
+
+    // Merge back into the full layer list — other designs' layers pass through untouched.
+    const updatedById = new Map(updatedTargetLayers.map(l => [l.id, l]))
+    const updatedLayers = layers.map(l => updatedById.get(l.id) ?? l)
+
     // Rotation changes every layer's geometry and drops the panel, so any
     // planned routing is against dimensions that no longer apply.
     set({
       layers: updatedLayers, panelResult: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
+      packCandidates: null, selectedCandidateId: null,
     })
     void get().rebuildBoardView()
   },
@@ -881,6 +1296,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         result.errors.push('No Gerber files found in the zip archive')
         return result
       }
+
+      // One archive = one design, named from the archive itself.
+      const designId = resolveImportDesignId(get, set, zipFile.name)
 
       const newLayers: LayerEntry[] = []
 
@@ -959,6 +1377,8 @@ export const useAppStore = create<AppState>((set, get) => ({
             opacity: getDefaultOpacityByType(type),
             type,
             side,
+            designId,
+            variantRotationDeg: 0,
           }
 
           newLayers.push(layerEntry)
@@ -1036,7 +1456,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           }
         }
 
-        set(state => ({ layers: [...state.layers, ...newLayers] }))
+        set(state => ({ layers: [...state.layers, ...newLayers], packCandidates: null, selectedCandidateId: null }))
         const firstDrillLayer = newLayers.find(l => l.type === 'drill')
         if (firstDrillLayer) maybeSyncExportDrillFormat(get, set, firstDrillLayer.parsedLayer?.drillMeta)
         void get().rebuildBoardView()
@@ -1095,6 +1515,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       const extractedFiles = [...extracted.files]
 
       const targetUnit = get().targetUnit
+      // One archive = one design, named from the archive itself.
+      const designId = resolveImportDesignId(get, set, rarFile.name)
       const newLayers: LayerEntry[] = []
 
       for (const file of extractedFiles) {
@@ -1168,6 +1590,8 @@ export const useAppStore = create<AppState>((set, get) => ({
             opacity: getDefaultOpacityByType(type),
             type,
             side,
+            designId,
+            variantRotationDeg: 0,
           }
 
           newLayers.push(layerEntry)
@@ -1253,7 +1677,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           }
         }
 
-        set(state => ({ layers: [...state.layers, ...newLayers] }))
+        set(state => ({ layers: [...state.layers, ...newLayers], packCandidates: null, selectedCandidateId: null }))
         const firstDrillLayer = newLayers.find(l => l.type === 'drill')
         if (firstDrillLayer) maybeSyncExportDrillFormat(get, set, firstDrillLayer.parsedLayer?.drillMeta)
         void get().rebuildBoardView()
@@ -1267,9 +1691,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   alignDrillLayersToBoard: async () => {
-    const { layers, outputFormat } = get()
-    const drillLayers = layers.filter(l => l.type === 'drill' && l.parsedLayer?.bounds)
-    const boardLayers = layers.filter(l => l.type !== 'drill' && l.type !== 'fab' && l.type !== 'other' && l.parsedLayer?.bounds)
+    const { layers, outputFormat, activeDesignId } = get()
+    // Scoped to the active design — the hole↔pad vector vote below assumes
+    // every drill hit and copper pad belongs to the SAME board. Mixing in
+    // another design's layers would either fail the ≥50% match gate or,
+    // worse, land the vote on a wrong-but-plausible bucket.
+    const designLayers = activeDesignId ? layers.filter(l => l.designId === activeDesignId) : layers
+    const drillLayers = designLayers.filter(l => l.type === 'drill' && l.parsedLayer?.bounds)
+    const boardLayers = designLayers.filter(l => l.type !== 'drill' && l.type !== 'fab' && l.type !== 'other' && l.parsedLayer?.bounds)
 
     if (drillLayers.length === 0 || boardLayers.length === 0) return
 
@@ -1298,18 +1727,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const boardCenterX = (boardMinX + boardMaxX) / 2
     const boardCenterY = (boardMinY + boardMaxY) / 2
 
-    const dummyPanel: PanelResult = {
-      panelWidth: 0, panelHeight: 0, pcbWidth: 0, pcbHeight: 0, totalPCBs: 1,
-      pcbPositions: [{ row: 0, col: 0, x: 0, y: 0 }],
-      toolingHoles: [], fiducials: [], infoTexts: []
-    }
-    
-    const dummyConfig: PanelConfig = { 
-      ...DEFAULT_PANEL_CONFIG, 
-      enableLShapeMarks: false, 
-      enableToolingHoles: false, 
-      enableFiducials: false,
-    }
+    const { panel: dummyPanel, config: dummyConfig } = identityPanelContext()
 
     const updatedLayers = [...layers]
 
@@ -1429,7 +1847,20 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Panel geometry drives routing geometry, so any config change makes an
       // existing routing plan potentially wrong — flag it rather than silently
       // keeping stale tool paths that would export as a fabrication file.
-      return { panelConfig: newConfig, routingStale: true }
+      //
+      // ⚠ Gaps additionally invalidate the PACK CANDIDATES: the packer bakes
+      // gapX/gapY into each placement (inflate-then-pack), so a candidate
+      // found at the old gap describes spacing the new config no longer
+      // asks for. Same reasoning as `updateDesign`/`updateMaterialSize`,
+      // which already null these — gaps were simply missed there.
+      const gapChanged =
+        (updates.gapX !== undefined && updates.gapX !== state.panelConfig.gapX) ||
+        (updates.gapY !== undefined && updates.gapY !== state.panelConfig.gapY)
+      return {
+        panelConfig: newConfig,
+        routingStale: true,
+        ...(gapChanged ? { packCandidates: null, selectedCandidateId: null } : {}),
+      }
     })
     // NOTE: Panel computation is now only triggered when user clicks "Create Panel" button
   },
@@ -1487,51 +1918,121 @@ export const useAppStore = create<AppState>((set, get) => ({
   panelResult: null,
 
   computePanelResult: () => {
-    const { layers, panelConfig } = get()
-    if (layers.length === 0) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null })
-      return
-    }
+    const { layers, panelConfig, activeDesignId, camMode } = get()
 
-    // Find the outline layer for PCB dimensions.
-    // Priority: 1) Explicitly typed 'outline' layer, 2) Layer with the largest bounding area
-    // (the outline/profile is typically the outermost layer that encompasses all others).
-    const outlineLayer = findOutlineBoundsLayer(layers)
-    let boundsLayer = outlineLayer
-    if (!boundsLayer) {
-      // Fallback: pick the visible layer with the largest bounding area as the PCB outline.
-      // This handles cases where outline layers use non-standard names (e.g., Eagle's "profile.gbr").
-      const visibleWithBounds = layers.filter(l => l.visible && l.parsedLayer.bounds)
-      if (visibleWithBounds.length > 0) {
-        boundsLayer = visibleWithBounds.reduce((best, layer) => {
-          const b = layer.parsedLayer.bounds!
-          const bestB = best.parsedLayer.bounds!
-          const area = (b.maxX - b.minX) * (b.maxY - b.minY)
-          const bestArea = (bestB.maxX - bestB.minX) * (bestB.maxY - bestB.minY)
-          return area > bestArea ? layer : best
-        })
+    // ⚠ MULTI MODE NEVER GRID-PANELIZES. Every "rebuild the panel" call site
+    // funnels through here — Panel Config's button, Info & Export's "Apply
+    // Changes to Gerber", and the Routing tab's one-click fixes that carry
+    // `rebuildPanel: true`. Before this branch existed, all three silently
+    // replaced a packed multi-design panel with a single-design grid panel.
+    //
+    // The multi-mode answer is RE-PACK, not "re-apply the stored candidate":
+    // a candidate's placements have the gaps BAKED IN (the packer's
+    // inflate-then-pack technique), while `validateRouting` measures gap
+    // conflicts against `panelConfig.gapX/gapY`. So the routing gap fix —
+    // which patches those config gaps and then rebuilds — must actually
+    // re-run the packer at the new gap, or the "fixed" panel would still
+    // carry the old, too-tight spacing while the pre-flight check reports
+    // clean. That is a fabrication-scrap risk, not a cosmetic mismatch.
+    if (camMode === 'multi') {
+      const { designs, materialSizeMm, panelInfo, packCandidates, selectedCandidateId } = get()
+      const clearAll = {
+        panelResult: null, routingResult: null, routingStale: false, routingFocus: null,
+        gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null,
       }
-    }
 
-    if (!boundsLayer || !boundsLayer.parsedLayer.bounds) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null })
+      const specs = buildPackItemSpecs(designs, layers)
+      if (specs.length === 0) {
+        set({ ...clearAll, packCandidates: null, selectedCandidateId: null, packInfeasible: [] })
+        return
+      }
+
+      const packed = findPackCandidates(specs, {
+        materialWidthMm: materialSizeMm.widthMm,
+        materialHeightMm: materialSizeMm.heightMm,
+        gapXMm: panelConfig.gapX,
+        gapYMm: panelConfig.gapY,
+      })
+
+      if (packed.candidates.length === 0) {
+        // Never keep the old panel against a config the packer can no longer
+        // satisfy — the Designs tab's "No layout fits" banner surfaces why.
+        set({ ...clearAll, packCandidates: [], selectedCandidateId: null, packInfeasible: packed.infeasible })
+        return
+      }
+
+      // Preserve the user's LAYOUT CHOICE across a re-pack, but by
+      // (strategy, fillOrder) rather than raw id: `PackCandidate.id` ends in
+      // a positional index that shifts as the candidate set changes, so
+      // matching on it would silently pick an unrelated layout.
+      const previous = packCandidates?.find(c => c.id === selectedCandidateId)
+      const chosen = (previous && packed.candidates.find(c => c.strategy === previous.strategy && c.fillOrder === previous.fillOrder))
+        ?? packed.candidates[0]
+
+      set({
+        ...clearAll,
+        panelResult: buildPackedPanelResult(chosen, designs, layers, panelConfig, panelInfo),
+        packCandidates: packed.candidates,
+        selectedCandidateId: chosen.id,
+        packInfeasible: packed.infeasible,
+      })
       return
     }
 
-    const bounds = boundsLayer.parsedLayer.bounds
-    const pcbWidth = bounds.maxX - bounds.minX
-    const pcbHeight = bounds.maxY - bounds.minY
+    // --- Single mode: the classic one-board grid path, unchanged. ---
+    // Always panelizes the ACTIVE design — with a hidden design still loaded
+    // from a previous multi-mode session, sizing from every design's layers
+    // combined would silently pick whichever design's outline `.find()`
+    // happened to see first.
+    const designLayers = activeDesignId ? layers.filter(l => l.designId === activeDesignId) : layers
+    if (designLayers.length === 0) {
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, packCandidates: null, selectedCandidateId: null })
+      return
+    }
+
+    // Find the layer that sizes the PCB — explicit 'outline' first, else the
+    // largest visible layer (handles non-standard exports like Eagle's
+    // "profile.gbr" that don't declare themselves as an outline). Shared with
+    // the exporter and the G-code/array actions via `resolveDesignGeometry`
+    // so all four agree on the same datum — see that function's own docs.
+    const geometry = resolveDesignGeometry(designLayers)
+
+    if (!geometry) {
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, packCandidates: null, selectedCandidateId: null })
+      return
+    }
+
+    const pcbWidth = geometry.widthMm
+    const pcbHeight = geometry.heightMm
 
     if (pcbWidth <= 0 || pcbHeight <= 0) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, packCandidates: null, selectedCandidateId: null })
       return
     }
 
     const panelInfo = get().panelInfo
     const result = computePanel(pcbWidth, pcbHeight, panelConfig, panelInfo)
+    // computePanel's 4-arg (pre-multi-design) signature always stamps the
+    // internal SINGLE_DESIGN_ID sentinel on every placement/design summary —
+    // it has no way to know the real design id. Grid mode always panelizes
+    // exactly ONE design (the active one), so remap the sentinel to that
+    // design's REAL id: `boardViewsByDesign`/`generateMergedPanelizedGerber`/
+    // routing's per-design context are all keyed by real design ids, and a
+    // panel still carrying the sentinel would silently match none of them —
+    // confirmed live: with 2+ designs loaded, clicking "Create Panel" (or any
+    // one-click fix with rebuildPanel:true) while on the Grid Layout tab
+    // produced a correctly-SIZED panel that rendered as bare, contentless
+    // rectangles, because no `boardViewsByDesign` entry is ever keyed
+    // `'default'`. `activeDesignId` is guaranteed non-null here — `designLayers`
+    // above only has entries when it is (the `layers.filter(l => l.designId
+    // === activeDesignId)` scoping a few lines up).
+    if (activeDesignId) {
+      result.placements = result.placements.map(p => ({ ...p, designId: activeDesignId }))
+      result.designs = result.designs.map(d => ({ ...d, designId: activeDesignId }))
+    }
 
     // Generate descriptive layer names for panel info (e.g., "Top Copper Bottom Copper Top Mask")
-    const descriptiveLayerNames = layers
+    const descriptiveLayerNames = designLayers
       .filter(l => l.visible && l.type !== 'outline' && l.type !== 'drill' && l.type !== 'fab')
       .map(l => {
         // Generate descriptive layer name based on type and side
@@ -1589,8 +2090,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         panelConfig,
         pcbWidth,
         pcbHeight,
-        result.pcbPositions,
-        result.toolingHoles
+        result.placements,
+        result.toolingHoles,
+        result.fiducials
       )
 
       // Append layer labels to the panel result's info texts
@@ -1620,17 +2122,22 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   // Board view (composited PCB stack-up via @tracespace/core)
   boardView: null,
+  boardViewsByDesign: {},
   boardViewSide: 'top',
   viewMode: 'board',
   setViewMode: (mode) => set({ viewMode: mode }),
   setBoardViewSide: (side) => set({ boardViewSide: side }),
   rebuildBoardView: async () => {
-    const { layers } = get()
-    if (layers.length === 0) {
-      set({ boardView: null })
+    const { layers, activeDesignId, designs } = get()
+    // Scoped to the active design — this is the single-PCB (non-panel) view,
+    // so compositing every design's layers together would mix, e.g., one
+    // design's copper with another's silkscreen into one nonsensical board.
+    const designLayers = activeDesignId ? layers.filter(l => l.designId === activeDesignId) : layers
+    if (designLayers.length === 0) {
+      set({ boardView: null, boardViewsByDesign: {} })
       return
     }
-    const files = layers.map(l => ({ filename: l.fileName, contents: l.rawContent, type: l.type, side: l.side }))
+    const files = designLayers.map(l => ({ filename: l.fileName, contents: l.rawContent, type: l.type, side: l.side }))
     console.log('[rebuildBoardView] files:', files.map(f => `${f.filename} type=${f.type} side=${f.side}`))
     const board = await gerberRenderBoardView(files)
     console.log('[rebuildBoardView] result:', board.error ?? `ok (top=${board.topFragment.length} bot=${board.bottomFragment.length})`)
@@ -1643,8 +2150,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     console.log('[rebuildBoardView] content score top:', topContentScore, 'bottom:', botContentScore)
 
     // Count top vs bottom copper/silk layers
-    const topLayers = layers.filter(l => (l.type === 'copper' || l.type === 'silk' || l.type === 'mask') && l.side === 'top')
-    const botLayers = layers.filter(l => (l.type === 'copper' || l.type === 'silk' || l.type === 'mask') && l.side === 'bottom')
+    const topLayers = designLayers.filter(l => (l.type === 'copper' || l.type === 'silk' || l.type === 'mask') && l.side === 'top')
+    const botLayers = designLayers.filter(l => (l.type === 'copper' || l.type === 'silk' || l.type === 'mask') && l.side === 'bottom')
 
     let newSide: 'top' | 'bottom' = get().boardViewSide
     if (topLayers.length === 0 && botLayers.length > 0) {
@@ -1653,7 +2160,24 @@ export const useAppStore = create<AppState>((set, get) => ({
       newSide = 'top'
     }
 
-    set({ boardView: board, boardViewSide: newSide })
+    // Per-design composites for the panel view's multi-design rendering
+    // (Stage 5 of the multi-design plan) — reuses the active design's
+    // composite just computed above rather than rendering it twice.
+    const otherDesigns = designs.filter(d => d.id !== activeDesignId)
+    const otherBoards = await Promise.all(otherDesigns.map(async d => {
+      const dLayers = layers.filter(l => l.designId === d.id)
+      if (dLayers.length === 0) return null
+      const dFiles = dLayers.map(l => ({ filename: l.fileName, contents: l.rawContent, type: l.type, side: l.side }))
+      const dBoard = await gerberRenderBoardView(dFiles)
+      return { designId: d.id, board: dBoard }
+    }))
+    const boardViewsByDesign: Record<string, BoardView> = {}
+    if (activeDesignId) boardViewsByDesign[activeDesignId] = board
+    for (const entry of otherBoards) {
+      if (entry) boardViewsByDesign[entry.designId] = entry.board
+    }
+
+    set({ boardView: board, boardViewSide: newSide, boardViewsByDesign })
   },
 
   hoveredLayerId: null,
@@ -1676,10 +2200,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   setDfmFocus: (p) => set({ dfmFocus: p }),
 
   runDfmCheck: async (rules) => {
-    const { layers, panelResult, dfmContext } = get()
+    const { layers, panelResult, dfmContext, activeDesignId } = get()
+    // Scoped to the active design — DFM checks one board at a time, never an
+    // aggregate across every design loaded into the tool.
+    const designLayers = activeDesignId ? layers.filter(l => l.designId === activeDesignId) : layers
     // LayerEntry already carries exactly the four fields DfmLayerInput needs,
     // so no adapter is required (the order flow's DetectedLayer matches too).
-    const input: DfmLayerInput[] = layers.map(l => ({
+    const input: DfmLayerInput[] = designLayers.map(l => ({
       fileName: l.fileName,
       type: l.type,
       side: l.side,
@@ -1700,7 +2227,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Copper clearance is the only check that can't be computed inline — it
       // needs tracespace's plot tree and is heavy enough to belong in the
       // worker. Everything else stays synchronous inside runDfm.
-      const copperLayers = layers.filter(l => l.type === 'copper')
+      const copperLayers = designLayers.filter(l => l.type === 'copper')
       const spacing = await Promise.all(
         copperLayers.map(l =>
           checkCopperSpacing({
@@ -1731,17 +2258,32 @@ export const useAppStore = create<AppState>((set, get) => ({
   boardContour: null,
   routingGenerating: false,
   generateRouting: async () => {
-    const { panelResult, panelConfig, routingConfig, layers } = get()
+    const { panelResult, panelConfig, routingConfig, layers, activeDesignId } = get()
     if (!panelResult) {
       set({ routingResult: null, routingStale: false, boardContour: null, gcodeFiles: null })
       return
     }
 
-    const outlineLayer = findOutlineBoundsLayer(layers)
-    const resolvedMode = resolveOutlineMode(routingConfig.pcbOutlineMode, outlineLayer?.parsedLayer ?? null)
+    // One outline layer + resolved mode PER DESIGN — a multi-design panel's
+    // placements are not all the same board, so tracing only the active
+    // design's outline (as this action did pre-Stage-7) and applying it to
+    // every OTHER design's placements too would be a real fabrication
+    // defect, not a preview glitch. `panel.designs` (not `layers` grouped
+    // ad hoc) is the source of truth for which designs actually have
+    // placements in THIS panel.
+    const designIds = panelResult.designs.map(d => d.designId)
+    const outlineLayerByDesign = new Map<string, LayerEntry | undefined>()
+    for (const designId of designIds) {
+      outlineLayerByDesign.set(designId, findOutlineBoundsLayer(layers.filter(l => l.designId === designId)))
+    }
 
-    let boardContour: BoardContour | null = null
-    if (resolvedMode === 'contour' && outlineLayer) {
+    const needsTrace = designIds.filter(id => {
+      const outlineLayer = outlineLayerByDesign.get(id)
+      return outlineLayer && resolveOutlineMode(routingConfig.pcbOutlineMode, outlineLayer.parsedLayer ?? null) === 'contour'
+    })
+
+    let boardContourByDesign = new Map<string, BoardContour>()
+    if (needsTrace.length > 0) {
       set({ routingGenerating: true })
 
       let unionMinX = Infinity, unionMinY = Infinity, unionMaxX = -Infinity, unionMaxY = -Infinity
@@ -1751,19 +2293,21 @@ export const useAppStore = create<AppState>((set, get) => ({
         unionMinX = Math.min(unionMinX, b.minX); unionMinY = Math.min(unionMinY, b.minY)
         unionMaxX = Math.max(unionMaxX, b.maxX); unionMaxY = Math.max(unionMaxY, b.maxY)
       }
+      const unionBoundsMm = Number.isFinite(unionMinX) ? { minX: unionMinX, minY: unionMinY, maxX: unionMaxX, maxY: unionMaxY } : null
 
-      boardContour = await traceBoardContour(
-        { fileName: outlineLayer.fileName, contents: outlineLayer.rawContent },
-        {
-          toleranceMm: routingConfig.contourToleranceMm,
-          unionBoundsMm: Number.isFinite(unionMinX) ? { minX: unionMinX, minY: unionMinY, maxX: unionMaxX, maxY: unionMaxY } : null,
-          sourceFileName: outlineLayer.fileName,
-        }
-      )
+      // Traced in parallel — each design's trace is fully independent.
+      const traced = await Promise.all(needsTrace.map(async designId => {
+        const outlineLayer = outlineLayerByDesign.get(designId)!
+        const contour = await traceBoardContour(
+          { fileName: outlineLayer.fileName, contents: outlineLayer.rawContent },
+          { toleranceMm: routingConfig.contourToleranceMm, unionBoundsMm, sourceFileName: outlineLayer.fileName }
+        )
+        return [designId, contour] as const
+      }))
 
       // Reference-identity staleness guard. Every mutating store action
       // replaces `layers`/`panelResult` wholesale (never mutates in place),
-      // so if either has moved on while this awaited the trace, the layer
+      // so if either has moved on while this awaited the traces, the layer
       // set or panel this was planned against no longer exists — discard
       // rather than plan routing against geometry that isn't current
       // anymore (the same "never keep a stale plan" discipline as every
@@ -1772,19 +2316,33 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ routingGenerating: false })
         return
       }
+
+      boardContourByDesign = new Map(traced)
     }
 
-    const outlineBoundsMm = outlineLayer?.parsedLayer?.bounds
-      ? { minX: outlineLayer.parsedLayer.bounds.minX, minY: outlineLayer.parsedLayer.bounds.minY }
-      : null
+    const designsCtx: Record<string, { outlineLayer: GerberLayer | null; boardContour: BoardContour | null; outlineBoundsMm: { minX: number; minY: number } | null }> = {}
+    for (const designId of designIds) {
+      const outlineLayer = outlineLayerByDesign.get(designId)
+      designsCtx[designId] = {
+        outlineLayer: outlineLayer?.parsedLayer ?? null,
+        boardContour: boardContourByDesign.get(designId) ?? null,
+        outlineBoundsMm: outlineLayer?.parsedLayer?.bounds
+          ? { minX: outlineLayer.parsedLayer.bounds.minX, minY: outlineLayer.parsedLayer.bounds.minY }
+          : null,
+      }
+    }
+
+    // The single `boardContour` store field only ever drove the VIEWER's
+    // contour-outline-rect preview for ONE board (see gerber-viewer.tsx) —
+    // kept pointed at the active design's own trace so that preview is
+    // unaffected; other designs' route overlays render as plain lines
+    // without the special contour clip treatment, a documented cosmetic gap
+    // (routing itself is fully correct for every design regardless).
+    const activeBoardContour = activeDesignId ? boardContourByDesign.get(activeDesignId) ?? null : null
 
     set({
-      routingResult: planRouting(panelResult, panelConfig, routingConfig, {
-        outlineLayer: outlineLayer?.parsedLayer ?? null,
-        boardContour,
-        outlineBoundsMm,
-      }),
-      boardContour,
+      routingResult: planRouting(panelResult, panelConfig, routingConfig, { designs: designsCtx }),
+      boardContour: activeBoardContour,
       routingStale: false,
       routingFocus: null,
       routingGenerating: false,
@@ -1811,19 +2369,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ gcodeFiles: null })
       return
     }
-    // Same globalBaseOffset convention as exportPanelizedGerbers: derived from
-    // the outline layer's own bounds so drill hits land in the same
-    // panel-absolute space as the route paths, which are already there.
-    const outlineLayer = findOutlineBoundsLayer(layers)
-    const globalBaseOffset = outlineLayer?.parsedLayer?.bounds
-      ? { x: -outlineLayer.parsedLayer.bounds.minX, y: -outlineLayer.parsedLayer.bounds.minY }
-      : undefined
-    const drillLayers = layers
-      .filter(l => l.type === 'drill' && l.parsedLayer?.bounds)
-      .map(l => ({ name: l.name, fileName: l.fileName, content: l.rawContent, parsedLayer: l.parsedLayer, type: l.type, side: l.side }))
-    const drillHoleGroups = collectPanelizedDrillHoles(drillLayers, panelResult, globalBaseOffset)
+    // Every design's own drill hits, each against its own datum/placements
+    // then merged by diameter — panelResult.designs is the source of truth
+    // for which designs actually have placements on THIS panel (matching
+    // routing's own per-design scoping, not a single active design).
+    const drillHoleGroups = collectAllDesignsDrillHoles(layers, panelResult)
       .map(g => ({ diameterMm: g.diameterMm, holes: g.holes }))
-    const drillSlotGroups = collectPanelizedDrillSlots(drillLayers, panelResult, globalBaseOffset)
+    const drillSlotGroups = collectAllDesignsDrillSlots(layers, panelResult)
     const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
     set({ gcodeFiles: buildGcodeFiles(routingResult, drillHoleGroups, partNumber, gcodeContext, drillSlotGroups) })
   },
@@ -1849,17 +2401,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       return
     }
 
-    // Same globalBaseOffset convention as generateGcodeFilesAction/exportPanelizedGerbers.
-    const outlineLayer = findOutlineBoundsLayer(layers)
-    const globalBaseOffset = outlineLayer?.parsedLayer?.bounds
-      ? { x: -outlineLayer.parsedLayer.bounds.minX, y: -outlineLayer.parsedLayer.bounds.minY }
-      : undefined
-    const drillLayers = layers
-      .filter(l => l.type === 'drill' && l.parsedLayer?.bounds)
-      .map(l => ({ name: l.name, fileName: l.fileName, content: l.rawContent, parsedLayer: l.parsedLayer, type: l.type, side: l.side }))
-
-    const componentHoleGroups = collectPanelizedDrillHoles(drillLayers, panelResult, globalBaseOffset)
-    const componentSlotGroups = collectPanelizedDrillSlots(drillLayers, panelResult, globalBaseOffset)
+    // Every design's own drill hits, each against its own datum/placements
+    // then merged by diameter — same reasoning as generateGcodeFilesAction.
+    const componentHoleGroups = collectAllDesignsDrillHoles(layers, panelResult)
+    const componentSlotGroups = collectAllDesignsDrillSlots(layers, panelResult)
 
     // Tooling/reference holes join the same {diameterMm, holes} shape so they
     // ride along in the same tiled drill program as the component holes —

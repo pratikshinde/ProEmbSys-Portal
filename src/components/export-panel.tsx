@@ -18,7 +18,19 @@ export default function ExportPanel() {
   const panelResult = useAppStore(s => s.panelResult)
   const panelConfig = useAppStore(s => s.panelConfig)
   const updatePanelConfig = useAppStore(s => s.updatePanelConfig)
-  const layers = useAppStore(s => s.layers)
+  const allLayers = useAppStore(s => s.layers)
+  const camMode = useAppStore(s => s.camMode)
+  const activeDesignId = useAppStore(s => s.activeDesignId)
+  // MULTI mode exports every design — `exportPanelizedGerbers` merges them by
+  // (type, side) into one file per layer, which is the whole point of packing
+  // several boards onto one panel. SINGLE mode exports only the ACTIVE
+  // design: a design left loaded from a previous multi-mode session is hidden
+  // everywhere else in the tool, so shipping its layers in the ZIP (as extra
+  // drill tools and merge contributors) would be a silent surprise.
+  const exportLayers = React.useMemo(
+    () => (camMode === 'single' && activeDesignId ? allLayers.filter(l => l.designId === activeDesignId) : allLayers),
+    [camMode, activeDesignId, allLayers]
+  )
   const outputFormat = useAppStore(s => s.outputFormat)
   const updateOutputFormat = useAppStore(s => s.updateOutputFormat)
   const resetOutputFormat = useAppStore(s => s.resetOutputFormat)
@@ -32,17 +44,18 @@ export default function ExportPanel() {
   const [exporting, setExporting] = React.useState(false)
 
   const handleExport = async () => {
-    if (!panelResult || layers.length === 0) return
+    if (!panelResult || exportLayers.length === 0) return
 
     setExporting(true)
     try {
-      const layerFiles: LayerFile[] = layers.map(l => ({
+      const layerFiles: LayerFile[] = exportLayers.map(l => ({
         name: l.name,
         fileName: `panel_${l.type}_${l.id}.gerber`,
         content: l.rawContent,
         parsedLayer: l.parsedLayer,
         type: l.type,
         side: l.side,
+        designId: l.designId,
       }))
 
       const metaPanel = panelArrayFiles
@@ -350,7 +363,7 @@ export default function ExportPanel() {
             <div className="text-[#94b8d4] font-medium text-xs mb-2">Panel Text Preview</div>
             <div className="break-all">PCB: {panelInfo.pcbName} | Rev: {panelInfo.revision}</div>
             <div className="break-all">Customer: {panelInfo.customerRef}</div>
-            <div>Date: {panelInfo.date} | Size: {panelResult.pcbWidth.toFixed(1)}×{panelResult.pcbHeight.toFixed(1)}mm</div>
+            <div>Date: {panelInfo.date} | Size: {(panelResult.designs[0]?.widthMm ?? 0).toFixed(1)}×{(panelResult.designs[0]?.heightMm ?? 0).toFixed(1)}mm</div>
             <div>Panel: {panelResult.panelWidth.toFixed(1)}×{panelResult.panelHeight.toFixed(1)}mm | Qty: {panelResult.totalPCBs}</div>
             <div className="break-all">Layers: {panelInfo.layers}</div>
           </div>
@@ -362,7 +375,7 @@ export default function ExportPanel() {
         <div className="space-y-2">
           <Button
             onClick={handleExport}
-            disabled={!panelResult || layers.length === 0 || exporting}
+            disabled={!panelResult || exportLayers.length === 0 || exporting}
             className="w-full h-9 bg-[#0ea5e9] hover:bg-[#0ea5e9]/80 text-white text-sm"
           >
             <Package className="w-4 h-4 mr-2" />

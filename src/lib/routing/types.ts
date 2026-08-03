@@ -228,7 +228,7 @@ export type RouteEdge = 'top' | 'bottom' | 'left' | 'right'
 export interface RoutePath {
   id: string
   role: RouteRole
-  /** Index into `PanelResult.pcbPositions`; absent for the panel outline. */
+  /** Index into `PanelResult.placements`; absent for the panel outline. */
   pcbIndex?: number
   points: Pt[]
   /** True only when no tab interrupts the loop. */

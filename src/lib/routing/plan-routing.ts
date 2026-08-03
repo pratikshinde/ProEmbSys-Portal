@@ -12,7 +12,7 @@
  * ⚠ `planRouting` must never mutate the `PanelResult` handed to it.
  */
 
-import type { PanelConfig, PanelResult } from '../panelization-engine'
+import type { PanelConfig, PanelPlacement, PanelResult } from '../panelization-engine'
 import type { GerberLayer } from '../gerber-parser'
 import { isRectangularOutline } from '../panelization-engine'
 import {
@@ -54,8 +54,8 @@ import type {
   RoutingResult,
 } from './types'
 
-/** Optional extra context the validator can use but the geometry does not need. */
-export interface RoutingPlanContext {
+/** One design's own outline/contour context — see `RoutingPlanContext.designs`. */
+export interface DesignRoutingContext {
   /** The outline layer, if one was imported — used for the
    *  rectangular-outline honesty warning AND to resolve `'auto'` mode. */
   outlineLayer?: GerberLayer | null
@@ -64,13 +64,13 @@ export interface RoutingPlanContext {
    * never traces one itself — tracing is async and this function is
    * synchronous/pure — so contour mode with no `boardContour` supplied (or
    * one still carrying `failureReason`) raises `contour-unavailable` /
-   * `contour-trace-failed` and emits no per-PCB contour paths.
+   * `contour-trace-failed` and emits no per-PCB contour paths for that design.
    */
   boardContour?: BoardContour | null
   /**
    * Translation datum for instancing the (traced-once, file-space) contour
-   * onto each panel position. ⚠ Must be the outline layer's OWN
-   * `GerberLayer.bounds` (arc-blind), NOT `boardContour.boundsMm`
+   * onto each of THIS design's own panel positions. ⚠ Must be the outline
+   * layer's OWN `GerberLayer.bounds` (arc-blind), NOT `boardContour.boundsMm`
    * (arc-accurate) — they differ by the arc bulge, and registration with the
    * copper/mask artwork (which the exporter positions from `bounds`) matters
    * more than agreement with an idealised bbox. See `gerber-exporter.ts`'s
@@ -79,10 +79,48 @@ export interface RoutingPlanContext {
   outlineBoundsMm?: { minX: number; minY: number } | null
 }
 
+/** Optional extra context the validator can use but the geometry does not need. */
+export interface RoutingPlanContext extends DesignRoutingContext {
+  /**
+   * Per-design outline/contour context, keyed by `designId` — a multi-design
+   * panel's placements are NOT all the same board, so `outlineLayer`/
+   * `boardContour`/`outlineBoundsMm` above (which describe ONE board) can't
+   * describe all of them. When a design has no entry here, it falls back to
+   * this object's own singular fields — which keeps every existing
+   * single-design caller (nothing here ever sets `designs`) byte-identical,
+   * since a single design's own context IS "the" context those fields
+   * already described. See CLAUDE.md's routing section for the full
+   * per-design instancing story.
+   */
+  designs?: Record<string, DesignRoutingContext>
+}
+
 // Extra clearance a protective tab targets beyond the bare bit-radius +
 // hole-radius minimum, so the tab is centred with a little real margin
 // either side rather than exactly tangent to the danger zone.
 const HOLE_TAB_PROTECTION_MARGIN_MM = 0.5
+
+/** Resolve one design's own outline/contour context, falling back to the
+ *  singular top-level fields for callers that never populated `designs`
+ *  (every pre-multi-design caller, and single-design panels generally). */
+function contextForDesign(ctx: RoutingPlanContext, designId: string): DesignRoutingContext {
+  return ctx.designs?.[designId] ?? { outlineLayer: ctx.outlineLayer, boardContour: ctx.boardContour, outlineBoundsMm: ctx.outlineBoundsMm }
+}
+
+/** Group placements by design, preserving each placement's ORIGINAL index
+ *  into `panel.placements` as `pcbIndex` — that index is only ever used
+ *  internally by this file (grouping/IDs), never to look a placement back up
+ *  elsewhere, but keeping it stable makes a single-design panel's output
+ *  byte-identical to before this function existed (same indices, same order). */
+function groupPlacementsByDesign(placements: PanelPlacement[]): Map<string, { pos: PanelPlacement; pcbIndex: number }[]> {
+  const map = new Map<string, { pos: PanelPlacement; pcbIndex: number }[]>()
+  placements.forEach((pos, pcbIndex) => {
+    const arr = map.get(pos.designId)
+    if (arr) arr.push({ pos, pcbIndex })
+    else map.set(pos.designId, [{ pos, pcbIndex }])
+  })
+  return map
+}
 
 /**
  * Perpendicular distance from `p` to the INFINITE line through `a`→`b`, plus
@@ -232,18 +270,18 @@ export function validateRouting(
       })
     }
 
-    // --- Rib margins. Derived from pcbPositions + panel size, NEVER from
+    // --- Rib margins. Derived from placements + panel size, NEVER from
     // config.sideRib*: computePanel places PCBs using sideRibTop for the Y
     // origin but positions the tooling-hole band from sideRibBottom, so with
     // asymmetric ribs the two disagree. Measuring the real layout sidesteps it.
-    const first = panel.pcbPositions[0]
+    const first = panel.placements[0]
     if (first) {
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-      for (const p of panel.pcbPositions) {
+      for (const p of panel.placements) {
         minX = Math.min(minX, p.x)
         minY = Math.min(minY, p.y)
-        maxX = Math.max(maxX, p.x + panel.pcbWidth)
-        maxY = Math.max(maxY, p.y + panel.pcbHeight)
+        maxX = Math.max(maxX, p.x + p.w)
+        maxY = Math.max(maxY, p.y + p.h)
       }
       const margins = {
         left: minX,
@@ -266,10 +304,14 @@ export function validateRouting(
   }
 
   // --- Tab fit. Mirrors the arm-length guards the L-shape emitters already use.
+  // Worst case across every placement (not just the first) — a multi-design
+  // panel's designs can be different sizes, and the SAME tabsPerEdge/tabWidthMm
+  // apply panel-wide (no per-design override), so whichever design is
+  // tightest is the one that could actually fail.
   if (cfg.routeIndividualPcbs && cfg.tabStyle !== 'none') {
     const pathGap = cfg.tabWidthMm + bit
-    const shortest = Math.min(panel.pcbWidth, panel.pcbHeight)
-    if (cfg.tabsPerEdge * pathGap >= shortest) {
+    const shortest = panel.placements.reduce((min, p) => Math.min(min, p.w, p.h), Infinity)
+    if (Number.isFinite(shortest) && cfg.tabsPerEdge * pathGap >= shortest) {
       issues.push({
         id: 'tabs-dont-fit',
         severity: 'error',
@@ -301,20 +343,28 @@ export function validateRouting(
   // --- Honesty constraint: bbox mode routes bounding boxes, not the real
   // profile. Mode-aware: only fires when bbox mode is what's ACTUALLY going
   // to run (contour/auto-resolved-to-contour follow the real outline, so
-  // this warning would be actively wrong there).
-  if (ctx.outlineLayer && !isRectangularOutline(ctx.outlineLayer)) {
-    const resolvedMode = resolveOutlineMode(cfg.pcbOutlineMode, ctx.outlineLayer)
-    if (resolvedMode === 'bbox') {
-      issues.push({
-        id: 'outline-not-rectangular',
-        severity: 'warning',
-        title: 'Board outline is not a plain rectangle',
-        detail:
-          'Route paths follow each PCB’s bounding box because outline mode is set to Bounding box. A shaped ' +
-          'board will be over-cut at its non-rectangular features — switch outline mode to Contour or Auto to ' +
-          'follow the real board profile instead.',
-      })
-    }
+  // this warning would be actively wrong there). Checked PER DESIGN — a
+  // multi-design panel can mix a plain-rectangle design with a shaped one,
+  // and only the shaped one under bbox mode is actually over-cut.
+  const designIdsForOutlineCheck = [...new Set(panel.placements.map(p => p.designId))]
+  const offendingDesigns: string[] = []
+  for (const designId of designIdsForOutlineCheck) {
+    const outlineLayer = contextForDesign(ctx, designId).outlineLayer
+    if (!outlineLayer || isRectangularOutline(outlineLayer)) continue
+    if (resolveOutlineMode(cfg.pcbOutlineMode, outlineLayer) === 'bbox') offendingDesigns.push(designId)
+  }
+  if (offendingDesigns.length > 0) {
+    const designSummary = panel.designs.filter(d => offendingDesigns.includes(d.designId))
+    const which = designSummary.length > 1 ? ` (${designSummary.map(d => d.name).join(', ')})` : ''
+    issues.push({
+      id: 'outline-not-rectangular',
+      severity: 'warning',
+      title: 'Board outline is not a plain rectangle',
+      detail:
+        `Route paths follow each PCB's bounding box${which} because outline mode is set to Bounding box. A shaped ` +
+        'board will be over-cut at its non-rectangular features — switch outline mode to Contour or Auto to ' +
+        'follow the real board profile instead.',
+    })
   }
 
   return issues
@@ -340,322 +390,42 @@ export function planRouting(
   const tabs: RouteTab[] = []
 
   // ---- Per-PCB perimeters --------------------------------------------------
-  const resolvedMode = resolveOutlineMode(cfg.pcbOutlineMode, ctx.outlineLayer)
+  // Resolved PER DESIGN — a multi-design panel's placements are not all the
+  // same board, so whether contour tracing is even relevant can differ
+  // design by design (e.g. a plain-rectangle design next to a shaped one).
+  const placementsByDesign = groupPlacementsByDesign(panel.placements)
+  const resolvedModeByDesign = new Map<string, 'contour' | 'bbox'>()
+  for (const designId of placementsByDesign.keys()) {
+    resolvedModeByDesign.set(designId, resolveOutlineMode(cfg.pcbOutlineMode, contextForDesign(ctx, designId).outlineLayer))
+  }
+  // Reported summary mode — 'contour' if ANY design actually routes as
+  // contour, so the emitters/README never silently hide that at least one
+  // board follows a traced profile rather than a bounding box.
+  const resolvedMode: 'contour' | 'bbox' =
+    [...resolvedModeByDesign.values()].some(m => m === 'contour') ? 'contour' : 'bbox'
 
-  if (cfg.routeIndividualPcbs && bit > 0 && resolvedMode === 'bbox') {
-    // Collect as segments first so coincident passes along shared gaps can be
-    // deduped across PCB instances before being turned into paths.
-    const pending: { pcbIndex: number; edge: RouteEdge; seg: RouteSegment }[] = []
-
-    for (const [pcbIndex, pos] of panel.pcbPositions.entries()) {
-      const corners = offsetRectOutward(pos.x, pos.y, panel.pcbWidth, panel.pcbHeight, r)
-
-      for (const { edge, a, b } of rectEdges(corners)) {
-        const edgeLen = segmentLength(a, b)
-        const interrupts: Span[] = []
-
-        // `rectEdges`' a->b direction is a CCW perimeter walk (bottom: LL->LR;
-        // right: LR->UR; top: UR->UL; left: UL->LL) so that consecutive edges'
-        // segments chain end-to-end for the wrap-around stitching below — but
-        // that means 'top' and 'left' measure distance-along-edge in the
-        // OPPOSITE direction from 'bottom' and 'right'. Tab positions must NOT
-        // use that same reversed direction: two facing PCBs across a panel gap
-        // (say, one row's top edge and the row above's bottom edge) would then
-        // measure a custom tabPositionsMm value from opposite ends, landing
-        // tabs at DIFFERENT absolute positions on the two boards. Symmetric
-        // auto-spacing (evenTabCenters) survives this by luck — an evenly-
-        // spaced-with-equal-margins set is always symmetric under reflection —
-        // but a real customer file using a custom override hit exactly this:
-        // with mergeCoincidentPasses sharing one pass down the gap centreline,
-        // each board's own pass then cut straight through its NEIGHBOUR's
-        // now-misaligned tab, silently destroying tabs on both sides with no
-        // error. Canonicalise: always measure tab distance left-to-right for
-        // horizontal edges and bottom-to-top for vertical edges, regardless of
-        // which edge label it is.
-        const isReversedEdge = edge === 'top' || edge === 'left'
-
-        const wantTabs = cfg.tabStyle !== 'none' && edgeEnabled(edge, cfg)
-        if (wantTabs && edgeLen > 0) {
-          const override = parseTabPositions(cfg.tabPositionsMm, edgeLen)
-          const autoCenters = override.length > 0 ? override : evenTabCenters(edgeLen, cfg.tabsPerEdge)
-          const pathGap = cfg.tabWidthMm + bit
-
-          // ⚠ Protective tabs: a tooling/reference hole close enough to this
-          // edge's routed path that a continuous cut would run through it
-          // gets a forced tab instead — a tab means the cutter genuinely
-          // never removes material across that span, which protects the
-          // hole regardless of how tight the panel-compute-time clearance
-          // margin turned out to be (a narrow rib can't always afford one).
-          // Confirmed live: a real panel's bottom-left pinning hole sat
-          // right against the routed edge with only the bare theoretical
-          // minimum of clearance. `centersAlong` stays in the same
-          // "dGlobal" convention `override`/`evenTabCenters` already use —
-          // `projectPointOntoLine` is computed in the raw a→b walk
-          // direction, so it needs the same `isReversedEdge` correction
-          // applied everywhere else in this loop before being merged in.
-          const centersAlong = [...autoCenters]
-          for (const hole of panel.toolingHoles) {
-            const holeR = hole.diameter / 2
-            const { d, perpDist } = projectPointOntoLine(hole, a, b, edgeLen)
-            if (d < 0 || d > edgeLen) continue
-            if (perpDist >= r + holeR + HOLE_TAB_PROTECTION_MARGIN_MM) continue
-            const dGlobalForHole = isReversedEdge ? edgeLen - d : d
-            const alreadyCovered = centersAlong.some(c => Math.abs(c - dGlobalForHole) < pathGap)
-            if (!alreadyCovered) centersAlong.push(dGlobalForHole)
-          }
-
-          for (const dGlobal of centersAlong) {
-            const d = isReversedEdge ? edgeLen - dGlobal : dGlobal
-            interrupts.push({ start: d - pathGap / 2, end: d + pathGap / 2 })
-
-            // The tab itself lives on the BOARD edge, not this offset tool path.
-            // Shift the point back inward by r along the edge's inward normal.
-            const tabCenter = boardEdgePoint(pos, panel, edge, d, r)
-            const dir = { x: (b.x - a.x) / (edgeLen || 1), y: (b.y - a.y) / (edgeLen || 1) }
-            const holes =
-              cfg.tabStyle === 'mousebite'
-                ? mouseBiteHoleCenters(
-                    pullOutward(tabCenter, outwardNormalForEdge(edge), cfg.mouseBiteHoleDiameterMm, cfg.mouseBiteEdgeClearanceMm),
-                    dir,
-                    cfg.tabWidthMm,
-                    cfg.mouseBiteHoleDiameterMm,
-                    cfg.mouseBiteHolePitchMm
-                  )
-                : []
-
-            tabs.push({
-              id: `tab-${pcbIndex}-${edge}-${dGlobal.toFixed(3)}`,
-              style: cfg.tabStyle === 'mousebite' ? 'mousebite' : 'solid',
-              center: tabCenter,
-              dir,
-              widthMm: cfg.tabWidthMm,
-              edge,
-              pcbIndex,
-              holes,
-              holeDiameterMm: cfg.mouseBiteHoleDiameterMm,
-            })
-          }
-        }
-
-        for (const span of splitEdgeByTabs(edgeLen, interrupts)) {
-          pending.push({
-            pcbIndex,
-            edge,
-            seg: { a: pointAlong(a, b, span.start), b: pointAlong(a, b, span.end) },
-          })
-        }
-      }
+  if (cfg.routeIndividualPcbs && bit > 0) {
+    // Contour-mode designs run FIRST so their tabs already exist in the
+    // shared `tabs` array by the time the bbox pass below folds in "foreign
+    // tab" protection (its own Phase 2, which scans the whole `tabs` array).
+    // That gives one-directional cross-mode tab protection in a panel mixing
+    // bbox and contour designs (a bbox pass won't cut through a contour
+    // design's tab); the reverse is a known, documented gap — see CLAUDE.md's
+    // routing section. Same-mode panels (every design bbox, or every design
+    // contour — the common case) are fully protected either way, since each
+    // branch's own internal cross-instance protection doesn't depend on
+    // processing order.
+    const contourDesignIds = [...resolvedModeByDesign.entries()].filter(([, m]) => m === 'contour').map(([id]) => id)
+    if (contourDesignIds.length > 0) {
+      runContourModeRouting(contourDesignIds, placementsByDesign, ctx, panel, panelConfig, cfg, bit, r, paths, tabs, issues)
     }
 
-    const segs = pending.map(p => p.seg)
-    const kept = cfg.mergeCoincidentPasses ? dedupeCoincidentSegments(segs) : segs
-    const keptSet = new Set(kept)
-
-    // Stitch consecutive kept segments into one continuous path instead of
-    // lifting the cutter at every corner. `pending` is walked in its natural
-    // order — bottom → right → top → left, ascending distance within each
-    // edge — which is exactly perimeter-walk order, so two segments merge
-    // whenever the previous one's end meets this one's start on the SAME PCB.
-    // That only fails to hold at an actual tab (by construction, tab spans on
-    // one edge never touch — there's always an interrupt between them) or where
-    // a dedup drop leaves a real gap for a neighbouring PCB's own pass to cover.
-    //
-    // A real CAM350-produced routing file confirmed this matters: the machine
-    // only retracts at tabs, cutting straight through untabbed corners as one
-    // continuous move (see the diagonal corner cuts in a production
-    // Cutting*.NC — three chained points with no intervening lift). Lifting at
-    // every corner regardless produced 2x the retract/plunge cycles a real
-    // router would use for the same board.
-    let current: RoutePath | null = null
-    for (const p of pending) {
-      if (!keptSet.has(p.seg)) {
-        current = null
-        continue
-      }
-      if (current && current.pcbIndex === p.pcbIndex && ptsClose(current.points[current.points.length - 1], p.seg.a)) {
-        current.points.push(p.seg.b)
-      } else {
-        current = {
-          id: `pcb-${p.pcbIndex}-${p.seg.a.x.toFixed(3)}-${p.seg.a.y.toFixed(3)}`,
-          role: 'pcb-outline',
-          pcbIndex: p.pcbIndex,
-          points: [p.seg.a, p.seg.b],
-          closed: false,
-          toolDiameterMm: bit,
-        }
-        paths.push(current)
-      }
+    const bboxEntries: { pos: PanelPlacement; pcbIndex: number }[] = []
+    for (const [designId, entries] of placementsByDesign) {
+      if (resolvedModeByDesign.get(designId) === 'bbox') bboxEntries.push(...entries)
     }
-
-    // Wrap-around merge. The walk above is a linear scan (bottom → right →
-    // top → left) of what is actually a CYCLE — the perimeter has no true
-    // start. So it merges every non-tab corner except one: the seam between
-    // the last edge processed (left) and the first (bottom), i.e. the
-    // bottom-left corner. If a tab happens to sit elsewhere, that corner gets
-    // treated as a false path boundary purely because of where this function's
-    // own loop started, not because the real cutter would lift there. Fix it
-    // by merging each PCB's first-built and last-built path when they meet.
-    const pathsByPcb = new Map<number, RoutePath[]>()
-    for (const p of paths) {
-      if (p.role !== 'pcb-outline' || p.pcbIndex === undefined) continue
-      if (!pathsByPcb.has(p.pcbIndex)) pathsByPcb.set(p.pcbIndex, [])
-      pathsByPcb.get(p.pcbIndex)!.push(p)
-    }
-    for (const group of pathsByPcb.values()) {
-      if (group.length < 2) continue
-      const first = group[0]
-      const last = group[group.length - 1]
-      if (ptsClose(last.points[last.points.length - 1], first.points[0])) {
-        // last's final point duplicates first's start point — drop it once.
-        last.points = [...last.points.slice(0, -1), ...first.points]
-        const firstIdx = paths.indexOf(first)
-        if (firstIdx >= 0) paths.splice(firstIdx, 1)
-      }
-    }
-
-    // A path that walked all the way back to its own start (every edge on
-    // this PCB uncut, i.e. no tabs anywhere) is a closed loop, not an open one.
-    for (const path of paths) {
-      if (path.role === 'pcb-outline' && path.points.length > 2 && ptsClose(path.points[0], path.points[path.points.length - 1])) {
-        path.closed = true
-      }
-    }
-  } else if (cfg.routeIndividualPcbs && bit > 0 && resolvedMode === 'contour') {
-    // ---- Per-PCB contours ----------------------------------------------
-    // No cross-PCB pass merging here yet (unlike the bbox branch's
-    // `dedupeCoincidentSegments`/wrap-around stitch above) — contour paths
-    // carry far more, far shorter segments, and the existing O(n^2) dedup is
-    // documented as too slow at that scale; a spatial-hash version is a
-    // later stage. Each PCB's contour is routed fully independently for now.
-    const contour = ctx.boardContour
-    if (!contour) {
-      issues.push({
-        id: 'contour-unavailable',
-        severity: 'error',
-        title: 'No traced board outline available',
-        detail: 'Outline mode is set to Contour (or resolved to it), but no traced board profile was supplied. No per-PCB contour paths were generated.',
-      })
-    } else if (contour.failureReason) {
-      issues.push(contourFailureIssue(contour.failureReason, contour.sourceFileName))
-    } else {
-      if (contour.openPathCount > 0) {
-        issues.push({
-          id: 'contour-open-paths',
-          severity: 'warning',
-          title: 'Part of the outline did not close',
-          detail: `${contour.openPathCount} loop(s) in the outline layer could not be closed into a region and were ignored — the traced profile may be missing part of the board edge.`,
-        })
-      }
-      if (contour.rings.some(rg => rg.syntheticCloseCount > 0)) {
-        issues.push({
-          id: 'contour-gap-filled',
-          severity: 'info',
-          title: 'Outline tracer bridged a small gap',
-          detail: 'The outline tracer inserted at least one short synthetic segment to close a loop — this is usually harmless (floating-point rounding in the source file) but can indicate a genuine small gap in the board outline.',
-        })
-      }
-
-      const ambiguous = contour.rings.some(rg => rg.ambiguous)
-      const outerRings = contour.rings.filter(rg => rg.depth === 0 && !rg.isHole)
-      if (ambiguous) {
-        issues.push({
-          id: 'contour-ambiguous-nesting',
-          severity: 'error',
-          title: 'Could not determine the outline nesting',
-          detail: 'Whether some part of the outline is the board edge or an interior cutout could not be determined robustly. No per-PCB contour paths were generated.',
-        })
-      } else if (outerRings.length !== 1) {
-        issues.push({
-          id: 'contour-multiple-outer-boundaries',
-          severity: 'error',
-          title: `Outline layer describes ${outerRings.length} separate boards`,
-          detail: 'The outline file traces more than one outer boundary — it likely contains an entire pre-panelized layout rather than a single PCB. No per-PCB contour paths were generated.',
-        })
-      } else {
-        const outer = outerRings[0]
-        const sizeOk = checkContourSize(outer, panel, panelConfig, r, issues)
-        if (sizeOk) {
-          const holes = cfg.routeInteriorCutouts ? contour.rings.filter(rg => rg.isHole) : []
-          const geo = computeContourGeometry(outer, holes, cfg, r, issues)
-          if (geo && ctx.outlineBoundsMm) {
-            const datum = ctx.outlineBoundsMm
-            const instanceOffsets = panel.pcbPositions.map(pos => ({ dx: pos.x - datum.minX, dy: pos.y - datum.minY }))
-            // Every instance's OWN tab centres, sampled once in file space and
-            // translated once per instance — cheap, and reused below to check
-            // every OTHER instance's tabs against THIS instance's own
-            // boundary (see planContourPcb's "coincident-pass tab safety").
-            const tabSamplesFileSpace = geo.tabPositions.map(d => sampleAt(geo.outerPts, geo.outerTable, d))
-            const instanceTabAbs = instanceOffsets.map(({ dx, dy }) =>
-              tabSamplesFileSpace.map(p => ({ x: p.x + dx, y: p.y + dy }))
-            )
-            const coincidenceToleranceMm = r + Math.max(cfg.contourToleranceMm, 0.05)
-
-            // ⚠ Protective tabs from tooling/reference holes — the contour
-            // generalisation of the bbox loop's own hole-protection above
-            // (see its comment for full rationale). Computed per-instance,
-            // same as `extraSilentDs` right below: a hole is only ever near
-            // ONE or TWO instances (the ones at that panel corner), so this
-            // can't be precomputed once in file space the way `tabPositions`
-            // itself is. Routed through `findSafeTabCenter` — same as the
-            // ring's own tab placement — so a hole sitting right at a sharp
-            // corner still nudges to a safe nearby spot rather than being
-            // silently dropped or placed across too much curvature.
-            const pathGap = cfg.tabWidthMm + bit
-            let holeTabsSkipped = 0
-
-            for (const [pcbIndex] of panel.pcbPositions.entries()) {
-              const { dx, dy } = instanceOffsets[pcbIndex]
-              const extraSilentDs: number[] = []
-              for (let other = 0; other < instanceTabAbs.length; other++) {
-                if (other === pcbIndex) continue
-                for (const abs of instanceTabAbs[other]) {
-                  const local = { x: abs.x - dx, y: abs.y - dy }
-                  const { distance, d } = nearestArcLengthOnRing(geo.outerPts, geo.outerTable, local)
-                  if (distance < coincidenceToleranceMm) extraSilentDs.push(d)
-                }
-              }
-
-              const holeProtectiveDs: number[] = []
-              for (const hole of panel.toolingHoles) {
-                const holeR = hole.diameter / 2
-                const local = { x: hole.x - dx, y: hole.y - dy }
-                const { distance, d } = nearestArcLengthOnRing(geo.outerPts, geo.outerTable, local)
-                if (distance >= r + holeR + HOLE_TAB_PROTECTION_MARGIN_MM) continue
-                const covered = [...geo.tabPositions, ...extraSilentDs, ...holeProtectiveDs].some(existing => {
-                  const raw = Math.abs(existing - d)
-                  return Math.min(raw, geo.outerTable.perimeterMm - raw) < pathGap
-                })
-                if (covered) continue
-                const safe = findSafeTabCenter(geo.outerPts, geo.outerTable, d, pathGap)
-                if (safe === null) holeTabsSkipped++
-                else holeProtectiveDs.push(safe)
-              }
-
-              const inst = planContourPcb(geo, dx, dy, pcbIndex, bit, cfg, extraSilentDs, holeProtectiveDs)
-              paths.push(...inst.paths)
-              tabs.push(...inst.tabs)
-            }
-            if (holeTabsSkipped > 0) {
-              issues.push({
-                id: 'contour-tabs-skipped',
-                severity: 'warning',
-                title: `${holeTabsSkipped} protective tab${holeTabsSkipped > 1 ? 's' : ''} near a pinning/reference hole skipped`,
-                detail:
-                  `${holeTabsSkipped} tab(s) meant to protect a tooling/reference hole sat across a corner or ` +
-                  `tight curve (more than 20 degrees of turning) and were skipped rather than cut across it. That ` +
-                  `hole may still be close to the routed path — check the panel's Pinning Inset or move the hole.`,
-              })
-            }
-          } else if (geo && !ctx.outlineBoundsMm) {
-            issues.push({
-              id: 'contour-unavailable',
-              severity: 'error',
-              title: 'No outline layer bounds available for instancing',
-              detail: 'The traced contour could not be positioned onto the panel because the outline layer\'s own bounds were not supplied. No per-PCB contour paths were generated.',
-            })
-          }
-        }
-      }
+    if (bboxEntries.length > 0) {
+      runBboxModeRouting(bboxEntries, panel.toolingHoles, cfg, bit, r, paths, tabs)
     }
   }
 
@@ -684,14 +454,6 @@ export function planRouting(
     const outlineTable = buildArcLength(outlinePts)
     const pathGap = cfg.tabWidthMm + bit
 
-    const maxCol = Math.max(0, ...panel.pcbPositions.map(p => p.col))
-    const maxRow = Math.max(0, ...panel.pcbPositions.map(p => p.row))
-    const coincidentEdges: { edge: RouteEdge; atBoundary: (col: number, row: number) => boolean }[] = [
-      { edge: 'left', atBoundary: (col) => col === 0 },
-      { edge: 'right', atBoundary: (col) => col === maxCol },
-      { edge: 'bottom', atBoundary: (_col, row) => row === 0 },
-      { edge: 'top', atBoundary: (_col, row) => row === maxRow },
-    ]
     const sideRibByEdge: Record<RouteEdge, number> = {
       left: panelConfig.sideRibLeft,
       right: panelConfig.sideRibRight,
@@ -699,14 +461,38 @@ export function planRouting(
       top: panelConfig.sideRibTop,
     }
 
+    // Which tabs coincide with the panel's own outer boundary — GEOMETRIC,
+    // not lattice-derived. The old test asked "is this tab's owning PCB in
+    // the outermost grid row/column" (`col === 0`, `col === maxCol`, …),
+    // which only means anything for a uniform `rows × cols` lattice; a
+    // packed, non-uniform layout has no such column to compare against.
+    // The physical fact this needs to detect — the PCB's own offset edge and
+    // the panel's own offset edge are literally the same cut line — is
+    // exactly what `nearestArcLengthOnRing` already measures, so ask it
+    // directly instead of inferring the answer from grid position.
+    //
+    // ⚠ The match is `distance ≈ r`, NOT `distance ≈ 0`. `t.center` sits on
+    // the true, un-offset PCB edge (RouteTab.center is deliberately the real
+    // edge point — see the mouse-bite-hole convention elsewhere in this
+    // file), while `outlinePts` is the panel's cut line, offset OUTWARD by
+    // the bit radius `r`. A genuinely coincident tab is therefore always
+    // `r` away from the ring, not 0 — confirmed live: an initial version of
+    // this check used a near-zero tolerance and found ZERO matches on a real
+    // no-side-rib panel where the col/row version found 8, since every real
+    // edge tab sits exactly one bit-radius off the ring by construction.
+    // Only reachable when `sideRibByEdge[edge] === 0` (below), so a genuine
+    // coincidence lands within float noise of `r`; anything farther away is
+    // a different PCB's tab on an interior edge that merely shares the same
+    // `edge` label (e.g. an interior column's own 'left' edge, which is not
+    // remotely close to the panel's actual left boundary).
+    const boundaryToleranceMm = 0.01
     const interruptDs: number[] = []
-    for (const { edge, atBoundary } of coincidentEdges) {
+    for (const edge of ['left', 'right', 'bottom', 'top'] as const) {
       if (sideRibByEdge[edge] > 0) continue // rib present — physically separate cut, no interruption needed
       for (const t of tabs) {
-        if (t.edge !== edge || t.pcbIndex === undefined) continue
-        const pos = panel.pcbPositions[t.pcbIndex]
-        if (!pos || !atBoundary(pos.col, pos.row)) continue
-        const { d } = nearestArcLengthOnRing(outlinePts, outlineTable, t.center)
+        if (t.edge !== edge) continue
+        const { d, distance } = nearestArcLengthOnRing(outlinePts, outlineTable, t.center)
+        if (Math.abs(distance - r) > boundaryToleranceMm) continue
         interruptDs.push(d)
       }
     }
@@ -788,6 +574,252 @@ export function planRouting(
   }
 }
 
+/**
+ * Bbox-mode routing for a set of placements (which may span several
+ * designs — bbox geometry reads `pos.w`/`pos.h`/`pos.x`/`pos.y` straight off
+ * each placement already, so it never needed a "the" board size or outline in
+ * the first place). Mutates `paths`/`tabs` in place.
+ *
+ * Extracted verbatim from `planRouting`'s own bbox branch (Phase A) — no
+ * behavior change, only parameterized over `entries` instead of reading
+ * `panel.placements.entries()` directly, so `planRouting` can restrict it to
+ * just the bbox-resolved subset of a multi-design panel while preserving
+ * every placement's original global `pcbIndex`.
+ */
+function runBboxModeRouting(
+  entries: { pos: PanelPlacement; pcbIndex: number }[],
+  toolingHoles: PanelResult['toolingHoles'],
+  cfg: RoutingConfig,
+  bit: number,
+  r: number,
+  paths: RoutePath[],
+  tabs: RouteTab[]
+): void {
+  // Collect as segments first so coincident passes along shared gaps can be
+  // deduped across PCB instances before being turned into paths.
+  const pending: { pcbIndex: number; edge: RouteEdge; seg: RouteSegment }[] = []
+
+  // Two passes, not one — Phase 1 below computes each PCB's OWN tabs (needs
+  // nothing but that PCB's own geometry); Phase 2 (after the loop) folds in
+  // silent interrupts for any FOREIGN PCB's tab that physically coincides
+  // with this edge, which by definition can't be known until every PCB's
+  // tabs exist. See that phase's own comment for why this matters.
+  const perEdgeInfos: { pcbIndex: number; edge: RouteEdge; a: Pt; b: Pt; edgeLen: number; centersAlong: number[]; isReversedEdge: boolean }[] = []
+
+  for (const { pos, pcbIndex } of entries) {
+    const corners = offsetRectOutward(pos.x, pos.y, pos.w, pos.h, r)
+
+    for (const { edge, a, b } of rectEdges(corners)) {
+      const edgeLen = segmentLength(a, b)
+
+      // `rectEdges`' a->b direction is a CCW perimeter walk (bottom: LL->LR;
+      // right: LR->UR; top: UR->UL; left: UL->LL) so that consecutive edges'
+      // segments chain end-to-end for the wrap-around stitching below — but
+      // that means 'top' and 'left' measure distance-along-edge in the
+      // OPPOSITE direction from 'bottom' and 'right'. Tab positions must NOT
+      // use that same reversed direction: two facing PCBs across a panel gap
+      // (say, one row's top edge and the row above's bottom edge) would then
+      // measure a custom tabPositionsMm value from opposite ends, landing
+      // tabs at DIFFERENT absolute positions on the two boards. Symmetric
+      // auto-spacing (evenTabCenters) survives this by luck — an evenly-
+      // spaced-with-equal-margins set is always symmetric under reflection —
+      // but a real customer file using a custom override hit exactly this:
+      // with mergeCoincidentPasses sharing one pass down the gap centreline,
+      // each board's own pass then cut straight through its NEIGHBOUR's
+      // now-misaligned tab, silently destroying tabs on both sides with no
+      // error. Canonicalise: always measure tab distance left-to-right for
+      // horizontal edges and bottom-to-top for vertical edges, regardless of
+      // which edge label it is.
+      const isReversedEdge = edge === 'top' || edge === 'left'
+
+      const wantTabs = cfg.tabStyle !== 'none' && edgeEnabled(edge, cfg)
+      const centersAlong: number[] = []
+      if (wantTabs && edgeLen > 0) {
+        const override = parseTabPositions(cfg.tabPositionsMm, edgeLen)
+        const autoCenters = override.length > 0 ? override : evenTabCenters(edgeLen, cfg.tabsPerEdge)
+        const pathGap = cfg.tabWidthMm + bit
+        centersAlong.push(...autoCenters)
+
+        // ⚠ Protective tabs: a tooling/reference hole close enough to this
+        // edge's routed path that a continuous cut would run through it
+        // gets a forced tab instead — a tab means the cutter genuinely
+        // never removes material across that span, which protects the
+        // hole regardless of how tight the panel-compute-time clearance
+        // margin turned out to be (a narrow rib can't always afford one).
+        // Confirmed live: a real panel's bottom-left pinning hole sat
+        // right against the routed edge with only the bare theoretical
+        // minimum of clearance. `centersAlong` stays in the same
+        // "dGlobal" convention `override`/`evenTabCenters` already use —
+        // `projectPointOntoLine` is computed in the raw a→b walk
+        // direction, so it needs the same `isReversedEdge` correction
+        // applied everywhere else in this loop before being merged in.
+        for (const hole of toolingHoles) {
+          const holeR = hole.diameter / 2
+          const { d, perpDist } = projectPointOntoLine(hole, a, b, edgeLen)
+          if (d < 0 || d > edgeLen) continue
+          if (perpDist >= r + holeR + HOLE_TAB_PROTECTION_MARGIN_MM) continue
+          const dGlobalForHole = isReversedEdge ? edgeLen - d : d
+          const alreadyCovered = centersAlong.some(c => Math.abs(c - dGlobalForHole) < pathGap)
+          if (!alreadyCovered) centersAlong.push(dGlobalForHole)
+        }
+
+        for (const dGlobal of centersAlong) {
+          const d = isReversedEdge ? edgeLen - dGlobal : dGlobal
+
+          // The tab itself lives on the BOARD edge, not this offset tool path.
+          // Shift the point back inward by r along the edge's inward normal.
+          const tabCenter = boardEdgePoint(pos, edge, d, r)
+          const dir = { x: (b.x - a.x) / (edgeLen || 1), y: (b.y - a.y) / (edgeLen || 1) }
+          const holes =
+            cfg.tabStyle === 'mousebite'
+              ? mouseBiteHoleCenters(
+                  pullOutward(tabCenter, outwardNormalForEdge(edge), cfg.mouseBiteHoleDiameterMm, cfg.mouseBiteEdgeClearanceMm),
+                  dir,
+                  cfg.tabWidthMm,
+                  cfg.mouseBiteHoleDiameterMm,
+                  cfg.mouseBiteHolePitchMm
+                )
+              : []
+
+          tabs.push({
+            id: `tab-${pcbIndex}-${edge}-${dGlobal.toFixed(3)}`,
+            style: cfg.tabStyle === 'mousebite' ? 'mousebite' : 'solid',
+            center: tabCenter,
+            dir,
+            widthMm: cfg.tabWidthMm,
+            edge,
+            pcbIndex,
+            holes,
+            holeDiameterMm: cfg.mouseBiteHoleDiameterMm,
+          })
+        }
+      }
+
+      perEdgeInfos.push({ pcbIndex, edge, a, b, edgeLen, centersAlong, isReversedEdge })
+    }
+  }
+
+  // ⚠ Phase 2 — fold in silent interrupts for FOREIGN tabs, mirroring the
+  // contour branch's own `extraSilentDs` (see its comment for the full
+  // rationale). Why this is needed even though `isReversedEdge` above
+  // already canonicalises tab position measurement: that canonicalisation
+  // only guarantees two FACING edges compute the SAME interrupt positions
+  // when those edges also share the same length and tab layout — true for a
+  // uniform grid of ONE design, but not something a panel with different-
+  // sized boards facing each other (a real possibility now) could rely on.
+  // Checking each tab's REAL position against THIS edge's own line — the
+  // same `nearestArcLengthOnRing`-style geometric test the contour branch
+  // already uses — has no such assumption baked in.
+  //
+  // For a uniform single-design grid this finds ZERO new interrupts: every
+  // foreign tab that geometrically coincides with an edge already has an
+  // OWNED interrupt covering that exact position (by the same
+  // canonicalisation), so `alreadyCovered` is always true. Verified live
+  // against a dedicated no-side-rib, mismatched-tab-count fixture that
+  // reproduces the documented tab-destruction failure mode, and against the
+  // full golden export corpus (byte-identical).
+  const coincidenceToleranceMm = r + 0.05
+  for (const { pcbIndex, edge, a, b, edgeLen, centersAlong, isReversedEdge } of perEdgeInfos) {
+    const pathGap = cfg.tabWidthMm + bit
+    const interrupts: Span[] = centersAlong.map(dGlobal => {
+      const d = isReversedEdge ? edgeLen - dGlobal : dGlobal
+      return { start: d - pathGap / 2, end: d + pathGap / 2 }
+    })
+
+    for (const t of tabs) {
+      if (t.pcbIndex === pcbIndex) continue // this PCB's own tabs are already covered above
+      const { d, perpDist } = projectPointOntoLine(t.center, a, b, edgeLen)
+      if (d < 0 || d > edgeLen) continue
+      if (perpDist >= coincidenceToleranceMm) continue
+      const alreadyCovered = interrupts.some(iv => d >= iv.start && d <= iv.end)
+      if (alreadyCovered) continue
+      interrupts.push({ start: d - pathGap / 2, end: d + pathGap / 2 })
+    }
+
+    for (const span of splitEdgeByTabs(edgeLen, interrupts)) {
+      pending.push({
+        pcbIndex,
+        edge,
+        seg: { a: pointAlong(a, b, span.start), b: pointAlong(a, b, span.end) },
+      })
+    }
+  }
+
+  const segs = pending.map(p => p.seg)
+  const kept = cfg.mergeCoincidentPasses ? dedupeCoincidentSegments(segs) : segs
+  const keptSet = new Set(kept)
+
+  // Stitch consecutive kept segments into one continuous path instead of
+  // lifting the cutter at every corner. `pending` is walked in its natural
+  // order — bottom → right → top → left, ascending distance within each
+  // edge — which is exactly perimeter-walk order, so two segments merge
+  // whenever the previous one's end meets this one's start on the SAME PCB.
+  // That only fails to hold at an actual tab (by construction, tab spans on
+  // one edge never touch — there's always an interrupt between them) or where
+  // a dedup drop leaves a real gap for a neighbouring PCB's own pass to cover.
+  //
+  // A real CAM350-produced routing file confirmed this matters: the machine
+  // only retracts at tabs, cutting straight through untabbed corners as one
+  // continuous move (see the diagonal corner cuts in a production
+  // Cutting*.NC — three chained points with no intervening lift). Lifting at
+  // every corner regardless produced 2x the retract/plunge cycles a real
+  // router would use for the same board.
+  let current: RoutePath | null = null
+  for (const p of pending) {
+    if (!keptSet.has(p.seg)) {
+      current = null
+      continue
+    }
+    if (current && current.pcbIndex === p.pcbIndex && ptsClose(current.points[current.points.length - 1], p.seg.a)) {
+      current.points.push(p.seg.b)
+    } else {
+      current = {
+        id: `pcb-${p.pcbIndex}-${p.seg.a.x.toFixed(3)}-${p.seg.a.y.toFixed(3)}`,
+        role: 'pcb-outline',
+        pcbIndex: p.pcbIndex,
+        points: [p.seg.a, p.seg.b],
+        closed: false,
+        toolDiameterMm: bit,
+      }
+      paths.push(current)
+    }
+  }
+
+  // Wrap-around merge. The walk above is a linear scan (bottom → right →
+  // top → left) of what is actually a CYCLE — the perimeter has no true
+  // start. So it merges every non-tab corner except one: the seam between
+  // the last edge processed (left) and the first (bottom), i.e. the
+  // bottom-left corner. If a tab happens to sit elsewhere, that corner gets
+  // treated as a false path boundary purely because of where this function's
+  // own loop started, not because the real cutter would lift there. Fix it
+  // by merging each PCB's first-built and last-built path when they meet.
+  const pathsByPcb = new Map<number, RoutePath[]>()
+  for (const p of paths) {
+    if (p.role !== 'pcb-outline' || p.pcbIndex === undefined) continue
+    if (!pathsByPcb.has(p.pcbIndex)) pathsByPcb.set(p.pcbIndex, [])
+    pathsByPcb.get(p.pcbIndex)!.push(p)
+  }
+  for (const group of pathsByPcb.values()) {
+    if (group.length < 2) continue
+    const first = group[0]
+    const last = group[group.length - 1]
+    if (ptsClose(last.points[last.points.length - 1], first.points[0])) {
+      // last's final point duplicates first's start point — drop it once.
+      last.points = [...last.points.slice(0, -1), ...first.points]
+      const firstIdx = paths.indexOf(first)
+      if (firstIdx >= 0) paths.splice(firstIdx, 1)
+    }
+  }
+
+  // A path that walked all the way back to its own start (every edge on
+  // this PCB uncut, i.e. no tabs anywhere) is a closed loop, not an open one.
+  for (const path of paths) {
+    if (path.role === 'pcb-outline' && path.points.length > 2 && ptsClose(path.points[0], path.points[path.points.length - 1])) {
+      path.closed = true
+    }
+  }
+}
+
 function outwardNormalForEdge(edge: RouteEdge): Pt {
   switch (edge) {
     case 'bottom': return { x: 0, y: -1 }
@@ -821,16 +853,15 @@ function pullOutward(p: Pt, outward: Pt, holeDiameterMm: number, clearanceMm: nu
  * distance and pulls the point inward by `r`.
  */
 function boardEdgePoint(
-  pos: { x: number; y: number },
-  panel: PanelResult,
+  pos: { x: number; y: number; w: number; h: number },
   edge: RouteEdge,
   dAlongToolPath: number,
   r: number
 ): Pt {
   const x0 = pos.x
   const y0 = pos.y
-  const w = panel.pcbWidth
-  const h = panel.pcbHeight
+  const w = pos.w
+  const h = pos.h
   // Distance along the BOARD edge, clamped into it.
   const d = Math.max(0, Math.min(dAlongToolPath - r, edge === 'top' || edge === 'bottom' ? w : h))
 
@@ -864,12 +895,208 @@ function contourFailureIssue(reason: NonNullable<BoardContour['failureReason']>,
   }
 }
 
-/** Compare the traced outline's arc-accurate bbox against the panel's own
- *  (arc-blind) PCB size. Returns false (and pushes a blocking issue) when
- *  the mismatch is severe enough that contour routing shouldn't proceed. */
+/**
+ * Contour-mode routing for every design that resolved to it, in one call —
+ * NOT one call per design — because cross-design tab protection (a design
+ * A board's tab must not be cut through by design B's neighbouring pass)
+ * needs to see every contour instance across every such design at once, the
+ * same way the bbox branch's own Phase 2 scans the whole `tabs` array rather
+ * than just one design's tabs. Mutates `paths`/`tabs`/`issues` in place.
+ *
+ * Single-design byte-identity: with exactly one contour-resolved design,
+ * `geoByDesign` has one entry and `instances` is that design's own
+ * placements in original order — the same geometry, same instancing order,
+ * same accumulation as the pre-multi-design single global computation this
+ * replaces.
+ */
+function runContourModeRouting(
+  contourDesignIds: string[],
+  placementsByDesign: Map<string, { pos: PanelPlacement; pcbIndex: number }[]>,
+  ctx: RoutingPlanContext,
+  panel: PanelResult,
+  panelConfig: PanelConfig,
+  cfg: RoutingConfig,
+  bit: number,
+  r: number,
+  paths: RoutePath[],
+  tabs: RouteTab[],
+  issues: RoutingIssue[]
+): void {
+  const multiDesign = panel.designs.length > 1
+  const designName = (id: string) => panel.designs.find(d => d.designId === id)?.name ?? id
+
+  const geoByDesign = new Map<string, { geo: ContourGeometry; datum: { minX: number; minY: number } }>()
+
+  for (const designId of contourDesignIds) {
+    const dctx = contextForDesign(ctx, designId)
+    const label = multiDesign ? ` (${designName(designId)})` : ''
+    const contour = dctx.boardContour
+
+    if (!contour) {
+      issues.push({
+        id: 'contour-unavailable',
+        severity: 'error',
+        title: 'No traced board outline available',
+        detail: `Outline mode is set to Contour (or resolved to it)${label}, but no traced board profile was supplied. No per-PCB contour paths were generated${label}.`,
+      })
+      continue
+    }
+    if (contour.failureReason) {
+      issues.push(contourFailureIssue(contour.failureReason, contour.sourceFileName))
+      continue
+    }
+    if (contour.openPathCount > 0) {
+      issues.push({
+        id: 'contour-open-paths',
+        severity: 'warning',
+        title: 'Part of the outline did not close',
+        detail: `${contour.openPathCount} loop(s) in the outline layer${label} could not be closed into a region and were ignored — the traced profile may be missing part of the board edge.`,
+      })
+    }
+    if (contour.rings.some(rg => rg.syntheticCloseCount > 0)) {
+      issues.push({
+        id: 'contour-gap-filled',
+        severity: 'info',
+        title: 'Outline tracer bridged a small gap',
+        detail: `The outline tracer${label} inserted at least one short synthetic segment to close a loop — this is usually harmless (floating-point rounding in the source file) but can indicate a genuine small gap in the board outline.`,
+      })
+    }
+
+    const ambiguous = contour.rings.some(rg => rg.ambiguous)
+    const outerRings = contour.rings.filter(rg => rg.depth === 0 && !rg.isHole)
+    if (ambiguous) {
+      issues.push({
+        id: 'contour-ambiguous-nesting',
+        severity: 'error',
+        title: 'Could not determine the outline nesting',
+        detail: `Whether some part of the outline${label} is the board edge or an interior cutout could not be determined robustly. No per-PCB contour paths were generated${label}.`,
+      })
+      continue
+    }
+    if (outerRings.length !== 1) {
+      issues.push({
+        id: 'contour-multiple-outer-boundaries',
+        severity: 'error',
+        title: `Outline layer${label} describes ${outerRings.length} separate boards`,
+        detail: `The outline file${label} traces more than one outer boundary — it likely contains an entire pre-panelized layout rather than a single PCB. No per-PCB contour paths were generated${label}.`,
+      })
+      continue
+    }
+
+    const outer = outerRings[0]
+    const designEntries = placementsByDesign.get(designId) ?? []
+    const pcbWidth = designEntries[0]?.pos.w ?? 0
+    const pcbHeight = designEntries[0]?.pos.h ?? 0
+    const sizeOk = checkContourSize(outer, pcbWidth, pcbHeight, panelConfig, r, issues)
+    if (!sizeOk) continue
+
+    const holes = cfg.routeInteriorCutouts ? contour.rings.filter(rg => rg.isHole) : []
+    const geo = computeContourGeometry(outer, holes, cfg, r, issues)
+    if (!geo) continue
+
+    if (!dctx.outlineBoundsMm) {
+      issues.push({
+        id: 'contour-unavailable',
+        severity: 'error',
+        title: 'No outline layer bounds available for instancing',
+        detail: `The traced contour${label} could not be positioned onto the panel because the outline layer's own bounds were not supplied. No per-PCB contour paths were generated${label}.`,
+      })
+      continue
+    }
+
+    geoByDesign.set(designId, { geo, datum: dctx.outlineBoundsMm })
+  }
+
+  if (geoByDesign.size === 0) return
+
+  // Every instance across every valid contour design, so cross-design tab
+  // protection below can see every candidate neighbour — not just
+  // same-design ones. Order follows `placementsByDesign`'s own iteration
+  // order (design order, then each design's original placement order),
+  // which for the common single-contour-design case is exactly
+  // `panel.placements`'s own order.
+  interface ContourInstance { pcbIndex: number; designId: string; dx: number; dy: number; tabsAbs: Pt[] }
+  const instances: ContourInstance[] = []
+  for (const [designId, { geo, datum }] of geoByDesign) {
+    const entries = placementsByDesign.get(designId) ?? []
+    const tabSamplesFileSpace = geo.tabPositions.map(d => sampleAt(geo.outerPts, geo.outerTable, d))
+    for (const { pos, pcbIndex } of entries) {
+      const dx = pos.x - datum.minX
+      const dy = pos.y - datum.minY
+      const tabsAbs = tabSamplesFileSpace.map(p => ({ x: p.x + dx, y: p.y + dy }))
+      instances.push({ pcbIndex, designId, dx, dy, tabsAbs })
+    }
+  }
+
+  const coincidenceToleranceMm = r + Math.max(cfg.contourToleranceMm, 0.05)
+  const pathGap = cfg.tabWidthMm + bit
+  let holeTabsSkipped = 0
+
+  for (const inst of instances) {
+    const { geo } = geoByDesign.get(inst.designId)!
+
+    // ⚠ Protective tabs from tooling/reference holes and cross-instance
+    // (same- or different-design) tab coincidence — the contour
+    // generalisation of the bbox loop's own hole/foreign-tab protection.
+    // Computed per-instance: a hole or a neighbour's tab is only ever near
+    // ONE or TWO instances (the ones at that panel corner/gap), so this
+    // can't be precomputed once in file space. Routed through
+    // `findSafeTabCenter` — same as the ring's own tab placement — so a hole
+    // sitting right at a sharp corner still nudges to a safe nearby spot
+    // rather than being silently dropped or placed across too much curvature.
+    const extraSilentDs: number[] = []
+    for (const other of instances) {
+      if (other.pcbIndex === inst.pcbIndex) continue
+      for (const abs of other.tabsAbs) {
+        const local = { x: abs.x - inst.dx, y: abs.y - inst.dy }
+        const { distance, d } = nearestArcLengthOnRing(geo.outerPts, geo.outerTable, local)
+        if (distance < coincidenceToleranceMm) extraSilentDs.push(d)
+      }
+    }
+
+    const holeProtectiveDs: number[] = []
+    for (const hole of panel.toolingHoles) {
+      const holeR = hole.diameter / 2
+      const local = { x: hole.x - inst.dx, y: hole.y - inst.dy }
+      const { distance, d } = nearestArcLengthOnRing(geo.outerPts, geo.outerTable, local)
+      if (distance >= r + holeR + HOLE_TAB_PROTECTION_MARGIN_MM) continue
+      const covered = [...geo.tabPositions, ...extraSilentDs, ...holeProtectiveDs].some(existing => {
+        const raw = Math.abs(existing - d)
+        return Math.min(raw, geo.outerTable.perimeterMm - raw) < pathGap
+      })
+      if (covered) continue
+      const safe = findSafeTabCenter(geo.outerPts, geo.outerTable, d, pathGap)
+      if (safe === null) holeTabsSkipped++
+      else holeProtectiveDs.push(safe)
+    }
+
+    const result = planContourPcb(geo, inst.dx, inst.dy, inst.pcbIndex, bit, cfg, extraSilentDs, holeProtectiveDs)
+    paths.push(...result.paths)
+    tabs.push(...result.tabs)
+  }
+
+  if (holeTabsSkipped > 0) {
+    issues.push({
+      id: 'contour-tabs-skipped',
+      severity: 'warning',
+      title: `${holeTabsSkipped} protective tab${holeTabsSkipped > 1 ? 's' : ''} near a pinning/reference hole skipped`,
+      detail:
+        `${holeTabsSkipped} tab(s) meant to protect a tooling/reference hole sat across a corner or ` +
+        `tight curve (more than 20 degrees of turning) and were skipped rather than cut across it. That ` +
+        `hole may still be close to the routed path — check the panel's Pinning Inset or move the hole.`,
+    })
+  }
+}
+
+/** Compare the traced outline's arc-accurate bbox against that DESIGN's own
+ *  (arc-blind) PCB size — `pcbWidth`/`pcbHeight` are the design's own first
+ *  placement, not a panel-wide scalar (a multi-design panel has no single
+ *  "the" PCB size). Returns false (and pushes a blocking issue) when the
+ *  mismatch is severe enough that contour routing shouldn't proceed. */
 function checkContourSize(
   outer: ContourRing,
-  panel: PanelResult,
+  pcbWidth: number,
+  pcbHeight: number,
   panelConfig: PanelConfig,
   r: number,
   issues: RoutingIssue[]
@@ -886,8 +1113,11 @@ function checkContourSize(
     return false
   }
 
+  const panelPcbWidth = pcbWidth
+  const panelPcbHeight = pcbHeight
+
   const closeToRatio = (a: number, b: number, tolPct: number) => Math.abs(a / b - 1) <= tolPct
-  const ratios = [panel.pcbWidth / w, panel.pcbHeight / h]
+  const ratios = [panelPcbWidth / w, panelPcbHeight / h]
   const unitMismatch = ratios.some(rt => closeToRatio(rt, 25.4, 0.02) || closeToRatio(rt, 1 / 25.4, 0.02))
   if (unitMismatch) {
     issues.push({
@@ -896,14 +1126,14 @@ function checkContourSize(
       title: 'Traced outline is ~25.4x off from the panel PCB size',
       detail:
         `The traced outline is ${w.toFixed(3)} x ${h.toFixed(3)} mm but the panel expects ` +
-        `${panel.pcbWidth.toFixed(3)} x ${panel.pcbHeight.toFixed(3)} mm — a ratio near 25.4 usually means an ` +
+        `${panelPcbWidth.toFixed(3)} x ${panelPcbHeight.toFixed(3)} mm — a ratio near 25.4 usually means an ` +
         `inch/mm unit mismatch. No per-PCB contour paths were generated.`,
     })
     return false
   }
 
-  const halfOverhangX = Math.abs(w - panel.pcbWidth) / 2
-  const halfOverhangY = Math.abs(h - panel.pcbHeight) / 2
+  const halfOverhangX = Math.abs(w - panelPcbWidth) / 2
+  const halfOverhangY = Math.abs(h - panelPcbHeight) / 2
   if (halfOverhangX < 0.01 && halfOverhangY < 0.01) return true
 
   const severe = halfOverhangX + r > panelConfig.gapX / 2 || halfOverhangY + r > panelConfig.gapY / 2
@@ -913,7 +1143,7 @@ function checkContourSize(
     title: 'Traced outline size does not match the panel PCB size',
     detail:
       `The traced outline is ${w.toFixed(3)} x ${h.toFixed(3)} mm; the panel was built using ` +
-      `${panel.pcbWidth.toFixed(3)} x ${panel.pcbHeight.toFixed(3)} mm (from the arc-blind bounding-box ` +
+      `${panelPcbWidth.toFixed(3)} x ${panelPcbHeight.toFixed(3)} mm (from the arc-blind bounding-box ` +
       `calculation). ` +
       (severe
         ? 'The difference is large enough that the offset contour path may overhang into the panel gap or a neighbouring PCB. No per-PCB contour paths were generated.'

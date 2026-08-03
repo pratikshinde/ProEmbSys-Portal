@@ -14,7 +14,7 @@ import {
   DEFAULT_OUTPUT_FORMAT,
   autoDetectIntegerDigits,
   generatePanelOutlineGerber,
-  generatePanelizedGerber,
+  generateMergedPanelizedGerber,
   generateFSCommand,
   generateMOCommand,
   generateGUnitCode,
@@ -26,7 +26,9 @@ import {
   BaseOffset,
   isRectangularOutline,
   formatPanelDate,
+  resolveDesignGeometry,
   type DrillFormatConfig,
+  type GerberExportContributor,
 } from './panelization-engine'
 import { collectMouseBiteHoles, type RoutingResult } from './routing/types'
 import { generateRouteGerber } from './routing/emit-gerber'
@@ -41,6 +43,11 @@ export interface LayerFile {
   parsedLayer: GerberLayer | null
   type: 'copper' | 'mask' | 'silk' | 'outline' | 'paste' | 'drill' | 'fab' | 'other'
   side?: 'top' | 'bottom' | 'none'
+  /** Which design this layer belongs to. Defaults to a single shared value
+   *  for every existing caller that doesn't pass one (see the fallback in
+   *  `exportPanelizedGerbers`), so a caller that has never heard of designs
+   *  still exports exactly as before. */
+  designId?: string
 }
 
 /**
@@ -51,6 +58,18 @@ export interface LayerFile {
 function sanitizeForFilename(value: string | undefined, fallback: string): string {
   const cleaned = (value || '').trim().replace(/[<>:"/\\|?*\s]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '')
   return cleaned || fallback
+}
+
+/**
+ * Same as `sanitizeForFilename`, plus replaces dots with "V" (e.g. "1.0" ->
+ * "1V0"). A revision string is the one field that routinely contains a raw
+ * version number — a dot mid-filename reads to Windows Explorer as another
+ * extension boundary, which can misdetect/hide the real `.zip`/`.gerber`
+ * extension on some configurations. Only applied to `revision`, not the
+ * other sanitized fields (customer/PCB name), which don't carry this risk.
+ */
+function sanitizeVersionForFilename(value: string | undefined, fallback: string): string {
+  return sanitizeForFilename(value, fallback).replace(/\./g, 'V')
 }
 
 /**
@@ -120,32 +139,49 @@ export async function exportPanelizedGerbers(
     console.warn(`[Export] Auto-upgraded Gerber format to ${neededDigits}.${fmt.decimalDigits} to prevent coordinate truncation`)
   }
 
-  // CRITICAL: Compute a UNIFORM base offset from the OUTLINE layer's bounds.
-  // All layers must use this SAME offset so they align perfectly in the panel.
-  // computePanel() uses the outline bounds for pcbWidth/pcbHeight, so the offset
-  // must be derived from the same reference point.
-  const outlineLayer = layers.find(l => l.type === 'outline' && l.parsedLayer?.bounds)
-  let globalBaseOffset: BaseOffset | undefined
-  if (outlineLayer?.parsedLayer?.bounds) {
-    const ob = outlineLayer.parsedLayer.bounds
-    globalBaseOffset = { x: -ob.minX, y: -ob.minY }
-    console.log(`[Export] Global base offset from outline: (${globalBaseOffset.x.toFixed(3)}, ${globalBaseOffset.y.toFixed(3)})`)
-  } else {
-    console.warn(`[Export] No outline layer found — each layer will use its own bounds for offset (may cause misalignment)`)
-  }
+  // Every layer belongs to a design — callers that have never heard of
+  // designs (or a single-design panel) get one synthetic id, so every
+  // computation below (which is now always PER-DESIGN) reduces to exactly
+  // today's single global computation in that case.
+  const layersWithDesignId = layers.map(l => ({ ...l, designId: l.designId ?? '__default__' }))
+  const designIds = [...new Set(layersWithDesignId.map(l => l.designId))]
 
-  // Check if PCB outline is rectangular for L-shape mark eligibility
-  let outlineIsRectangular = false
-  if (config.enableLShapeMarks && outlineLayer?.parsedLayer) {
-    outlineIsRectangular = isRectangularOutline(outlineLayer.parsedLayer)
-    if (!outlineIsRectangular) {
-      console.warn('[Export] PCB outline is not rectangular — skipping L-shape marks')
+  // CRITICAL: Compute a UNIFORM base offset PER DESIGN from the layer that
+  // sizes that design — explicit 'outline' first, else the largest visible
+  // layer. All of one design's layers must use that SAME offset so they
+  // align perfectly in the panel; a different design has its own unrelated
+  // native-coordinate origin and must never share another design's offset.
+  // Shared with `computePanelResult`/`generateGcodeFilesAction`/
+  // `generatePanelArrayFilesAction` via `resolveDesignGeometry` so all four
+  // agree — see that function's own docs.
+  const baseOffsetByDesign = new Map<string, BaseOffset>()
+  // Per-design L-shape-mark eligibility — a rectangular design sharing a
+  // merged file with a non-rectangular one must not lose its own marks, so
+  // this is never a single panel-wide flag (see the D-code/macro remap
+  // section in CLAUDE.md).
+  const effectiveConfigByDesign = new Map<string, PanelConfig>()
+  for (const designId of designIds) {
+    const designLayers = layersWithDesignId.filter(l => l.designId === designId)
+    const geometry = resolveDesignGeometry(designLayers)
+    if (geometry) {
+      baseOffsetByDesign.set(designId, geometry.datum)
+      console.log(`[Export] Design "${designId}" base offset from ${geometry.fromFallback ? 'largest-area fallback layer' : 'outline'}: (${geometry.datum.x.toFixed(3)}, ${geometry.datum.y.toFixed(3)})`)
+    } else {
+      console.warn(`[Export] Design "${designId}" has no layer with usable bounds — its layers will use their own bounds for offset (may cause misalignment)`)
     }
+
+    const outlineLayer = designLayers.find(l => l.type === 'outline' && l.parsedLayer?.bounds)
+    let outlineIsRectangular = false
+    if (config.enableLShapeMarks && outlineLayer?.parsedLayer) {
+      outlineIsRectangular = isRectangularOutline(outlineLayer.parsedLayer)
+      if (!outlineIsRectangular) {
+        console.warn(`[Export] Design "${designId}" outline is not rectangular — skipping its L-shape marks`)
+      }
+    }
+    effectiveConfigByDesign.set(designId, outlineIsRectangular ? config : { ...config, enableLShapeMarks: false })
   }
-  // Override config L-shape setting if outline is not rectangular
-  const effectiveConfig: PanelConfig = outlineIsRectangular
-    ? config
-    : { ...config, enableLShapeMarks: false }
+  // Kept for the drill export below and as the single-design fallback.
+  const globalBaseOffset: BaseOffset | undefined = baseOffsetByDesign.get(designIds[0])
 
   const zip = new JSZip()
   const folder = zip.folder('panelized_gerbers')
@@ -155,7 +191,7 @@ export async function exportPanelizedGerbers(
   // archive, PartNumber_LayerName.gerber for each file inside it.
   const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
   const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
-  const version = sanitizeForFilename(info?.revision, 'v1')
+  const version = sanitizeVersionForFilename(info?.revision, 'v1')
   const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
 
   // Generate panel outline with 0.1mm width
@@ -179,14 +215,26 @@ export async function exportPanelizedGerbers(
 
   // Generate panelized drill file with user-selected drill format
   // Always generate drill file when there are drill layers OR tooling/reference holes are enabled
-  const drillLayers = layers.filter(l => l.type === 'drill')
+  //
+  // ⚠ Only designs that actually have PLACEMENTS on this panel contribute
+  // drill layers. A design with zero placements (a packed candidate that
+  // dropped it, or a design hidden by single mode) otherwise still folds its
+  // tool diameters into the Excellon tool table AND emits one dangling bare
+  // `Tnn` line per flash — `generatePanelizedDrill` pushes the T-code before
+  // looping the (empty) position list. The Gerber merge path already skips
+  // zero-placement designs (see the merge-group loop below); this brings the
+  // drill path in line. Byte-identical for every single-design export, whose
+  // one design always has placements.
+  const drillLayers = layersWithDesignId
+    .filter(l => l.type === 'drill')
+    .filter(l => panel.designs.length === 0 || panel.placements.some(p => p.designId === l.designId))
   if (drillLayers.length > 0 || config.enableToolingHoles) {
     // Pass the Gerber output unit so drill format auto-syncs to prevent CAM350 scale mismatch
     // Mouse bites are folded in only when the user asked for it; by default they
     // go to their own file so this output stays byte-identical to before.
     const extraHoles =
       routing && routing.config.mouseBiteInMainDrill ? collectMouseBiteHoles(routing) : undefined
-    const drillContent = generatePanelizedDrill(drillLayers, panel, config, globalBaseOffset, fmt.unit, extraHoles)
+    const drillContent = generatePanelizedDrill(drillLayers, panel, config, globalBaseOffset, fmt.unit, extraHoles, baseOffsetByDesign)
     folder.file(`${partNumber}_Drill.drl`, drillContent)
   }
 
@@ -196,30 +244,72 @@ export async function exportPanelizedGerbers(
     folder.file(`${partNumber}_PINN.drl`, pinnContent)
   }
 
-  // Panelize each layer using PARSED layer data
-  for (const layerFile of layers) {
+  // ---- Merge + export each Gerber layer type/side across every design ----
+  // Two designs each contributing e.g. a "Top_Copper" layer merge into ONE
+  // output file — that IS the point of panelizing them together, one panel
+  // has one Top_Copper. The merge key is the exact output filename fragment
+  // (generateDescriptiveLayerName), which mirrors — byte for byte — the
+  // collision behavior this loop already had for a SINGLE design with two
+  // layers of the same type/side (e.g. two inner-copper layers both
+  // classifying side:'none'): whichever LayerFile comes last in array order
+  // wins that design's contribution to the group, exactly like the old
+  // `folder.file()` call overwriting a previous one of the same name. Real
+  // multi-layer stackups aren't disambiguated (see the "no stackup checking"
+  // decision this feature is built on) — only surfaced via a console.warn.
+  interface MergeGroup {
+    descriptiveName: string
+    layerType: LayerFile['type']
+    layerSide?: LayerFile['side']
+    perDesign: Map<string, LayerFile & { designId: string }>
+  }
+  const mergeGroups = new Map<string, MergeGroup>()
+  for (const layerFile of layersWithDesignId) {
     if (!layerFile.parsedLayer || !layerFile.parsedLayer.bounds) continue
     if (layerFile.type === 'drill') continue
 
+    const descriptiveName = generateDescriptiveLayerName(layerFile)
+    let group = mergeGroups.get(descriptiveName)
+    if (!group) {
+      group = { descriptiveName, layerType: layerFile.type, layerSide: layerFile.side, perDesign: new Map() }
+      mergeGroups.set(descriptiveName, group)
+    }
+    if (group.perDesign.has(layerFile.designId)) {
+      console.warn(`[Export] Design "${layerFile.designId}" contributes multiple layers to merge group "${descriptiveName}" — using the last one (${layerFile.name}); multi-layer stackups (e.g. inner copper) aren't disambiguated.`)
+    }
+    group.perDesign.set(layerFile.designId, layerFile)
+  }
+
+  // designIds order = layer-array order (first appearance), used only as a
+  // fallback when `panel.designs` doesn't know about a design (shouldn't
+  // happen in practice — panel.designs is built from the same store designs
+  // list these layers were tagged from — but a merge must never silently
+  // drop a contributor over an ordering mismatch).
+  const designOrder = panel.designs.length > 0 ? panel.designs.map(d => d.designId) : designIds
+  for (const id of designIds) if (!designOrder.includes(id)) designOrder.push(id)
+
+  for (const group of mergeGroups.values()) {
+    const contributors: GerberExportContributor[] = []
+    for (const designId of designOrder) {
+      const layerFile = group.perDesign.get(designId)
+      if (!layerFile?.parsedLayer) continue
+      const placements = panel.placements.filter(p => p.designId === designId)
+      if (placements.length === 0) continue
+      const baseOffset = baseOffsetByDesign.get(designId)
+      if (!baseOffset) continue
+      const effectiveConfig = effectiveConfigByDesign.get(designId) ?? config
+      contributors.push({ parsedLayer: layerFile.parsedLayer, rawContent: layerFile.content, baseOffset, placements, effectiveConfig })
+    }
+    if (contributors.length === 0) continue
+    if (contributors.length > 1) {
+      console.log(`[Export] Merge group "${group.descriptiveName}": ${contributors.length} contributing designs`)
+    }
+
     try {
-      // Use the new API: pass parsedLayer + rawContent + globalBaseOffset
-      const panelized = generatePanelizedGerber(
-        layerFile.parsedLayer,
-        layerFile.content,
-        panel,
-        effectiveConfig,
-        fmt,
-        globalBaseOffset,
-        layerFile.type,
-        layerFile.side
-      )
-      // PartNumber_LayerName.gerber
-      const descriptiveName = generateDescriptiveLayerName(layerFile)
-      const outName = `${partNumber}_${descriptiveName}.gerber`
+      const panelized = generateMergedPanelizedGerber(contributors, panel, config, fmt, group.layerType, group.layerSide)
+      const outName = `${partNumber}_${group.descriptiveName}.gerber`
       folder.file(outName, panelized)
     } catch (e) {
-      console.warn(`Failed to panelize ${layerFile.name}:`, e)
-      folder.file(layerFile.fileName, layerFile.content)
+      console.warn(`Failed to panelize merge group ${group.descriptiveName}:`, e)
     }
   }
 
@@ -276,7 +366,7 @@ export async function exportRoutingFiles(
 
   const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
   const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
-  const version = sanitizeForFilename(info?.revision, 'v1')
+  const version = sanitizeVersionForFilename(info?.revision, 'v1')
   const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
 
   const zip = new JSZip()
@@ -313,7 +403,7 @@ export async function exportMetaPanelFiles(
 ): Promise<void> {
   const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
   const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
-  const version = sanitizeForFilename(info?.revision, 'v1')
+  const version = sanitizeVersionForFilename(info?.revision, 'v1')
   const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
 
   const zip = new JSZip()
@@ -363,7 +453,7 @@ export async function exportGcodeFiles(
 ): Promise<void> {
   const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
   const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
-  const version = sanitizeForFilename(info?.revision, 'v1')
+  const version = sanitizeVersionForFilename(info?.revision, 'v1')
   const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
 
   const zip = new JSZip()
@@ -513,7 +603,14 @@ function generateReadme(
   lines.push(`G-Code: ${generateGUnitCode(format)}`)
   lines.push('')
   lines.push('--- Panel Configuration ---')
-  lines.push(`PCB Size: ${panel.pcbWidth.toFixed(2)} x ${panel.pcbHeight.toFixed(2)} mm`)
+  if (panel.designs.length > 1) {
+    lines.push(`Designs: ${panel.designs.length} (${panel.source === 'pack' ? 'multi-design pack' : 'multi-design grid'})`)
+    for (const d of panel.designs) {
+      lines.push(`  - ${d.name}: ${d.widthMm.toFixed(2)} x ${d.heightMm.toFixed(2)} mm, qty ${d.count}`)
+    }
+  } else {
+    lines.push(`PCB Size: ${(panel.designs[0]?.widthMm ?? 0).toFixed(2)} x ${(panel.designs[0]?.heightMm ?? 0).toFixed(2)} mm`)
+  }
   lines.push(`Panel Size: ${panel.panelWidth.toFixed(2)} x ${panel.panelHeight.toFixed(2)} mm`)
   lines.push(`Layout: ${config.rows} rows x ${config.cols} columns`)
   lines.push(`Total PCBs: ${panel.totalPCBs}`)
@@ -561,8 +658,16 @@ function generateReadme(
         lines.push(`${partNumber}_MouseBites.drl - Break-away perforation holes (NPTH)`)
       }
     }
+    // One line per MERGED output file, not per LayerFile — with 2+ designs,
+    // several designs' LayerFiles collapse into the same output file (see
+    // exportPanelizedGerbers' merge-group loop), so this must dedupe by the
+    // same key that loop merges on or a 2-design panel would list
+    // "Top_Copper.gerber" twice for one actual file.
+    const seenNames = new Set<string>()
     for (const layer of layers) {
       const descriptiveName = generateDescriptiveLayerName(layer)
+      if (seenNames.has(descriptiveName)) continue
+      seenNames.add(descriptiveName)
       lines.push(`${partNumber}_${descriptiveName}.gerber - Panelized ${descriptiveName}`)
     }
     lines.push('')
@@ -598,7 +703,7 @@ function generateReadme(
  * - No G90/G05 in body
  * - M30 to end
  */
-function generatePINNDrill(
+export function generatePINNDrill(
   panel: PanelResult,
   config: PanelConfig,
   gerberUnit?: 'mm' | 'inches'
@@ -667,7 +772,7 @@ function generatePINNDrill(
   return lines.join('\n')
 }
 
-function generatePanelizedDrill(
+export function generatePanelizedDrill(
   drillLayers: LayerFile[],
   panel: PanelResult,
   config: PanelConfig,
@@ -676,7 +781,15 @@ function generatePanelizedDrill(
   /** Mouse-bite perforations, only when the user opted to fold them in here
    *  rather than into their own file. Omitted by default, so this function's
    *  output stays byte-identical to before routing existed. */
-  mouseBiteHoles?: { x: number; y: number; diameter: number }[]
+  mouseBiteHoles?: { x: number; y: number; diameter: number }[],
+  /** Per-design datum + placement scoping, keyed by `LayerFile.designId`.
+   *  When provided, each drill layer is only stamped at ITS OWN design's
+   *  placements using ITS OWN datum — never every design's, and never
+   *  another design's offset. Omitted (or a layer's designId missing from
+   *  the map) falls back to `globalBaseOffset` + every `panel.placements`,
+   *  exactly today's single-design behavior — this parameter is purely
+   *  additive. */
+  perDesignBaseOffset?: Map<string, BaseOffset>
 ): string {
   const drillFmt = resolveExportDrillFormat(config.drillFormat, panel, gerberUnit, 'Export')
 
@@ -752,11 +865,15 @@ function generatePanelizedDrill(
         // Emit T-code for each hit
         lines.push(tCode)
 
-        // Generate coordinates for each panel position
-        const boX = globalBaseOffset ? globalBaseOffset.x : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minX : 0)
-        const boY = globalBaseOffset ? globalBaseOffset.y : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minY : 0)
+        // Generate coordinates for each panel position — this design's own
+        // datum + own placements when perDesignBaseOffset is provided,
+        // else today's single global offset + every placement.
+        const designOffset = perDesignBaseOffset && dl.designId ? perDesignBaseOffset.get(dl.designId) : undefined
+        const boX = designOffset ? designOffset.x : globalBaseOffset ? globalBaseOffset.x : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minX : 0)
+        const boY = designOffset ? designOffset.y : globalBaseOffset ? globalBaseOffset.y : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minY : 0)
+        const positions = perDesignBaseOffset && dl.designId ? panel.placements.filter(p => p.designId === dl.designId) : panel.placements
 
-        for (const pos of panel.pcbPositions) {
+        for (const pos of positions) {
           const x = (cmd.coordinate.x || 0) + pos.x + boX
           const y = (cmd.coordinate.y || 0) + pos.y + boY
           lines.push(`X${fmtCoord(x)}Y${fmtCoord(y)}`)
@@ -775,14 +892,16 @@ function generatePanelizedDrill(
   for (const dl of drillLayers) {
     if (!dl.parsedLayer?.drillSlots?.length) continue
 
-    const boX = globalBaseOffset ? globalBaseOffset.x : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minX : 0)
-    const boY = globalBaseOffset ? globalBaseOffset.y : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minY : 0)
+    const designOffset = perDesignBaseOffset && dl.designId ? perDesignBaseOffset.get(dl.designId) : undefined
+    const boX = designOffset ? designOffset.x : globalBaseOffset ? globalBaseOffset.x : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minX : 0)
+    const boY = designOffset ? designOffset.y : globalBaseOffset ? globalBaseOffset.y : (dl.parsedLayer.bounds ? -dl.parsedLayer.bounds.minY : 0)
+    const positions = perDesignBaseOffset && dl.designId ? panel.placements.filter(p => p.designId === dl.designId) : panel.placements
 
     for (const slot of dl.parsedLayer.drillSlots) {
       if (slot.diameterMm <= 0) continue
       const tCode = getTCode(slot.diameterMm)
       lines.push(tCode)
-      for (const pos of panel.pcbPositions) {
+      for (const pos of positions) {
         const sx = slot.start.x + pos.x + boX
         const sy = slot.start.y + pos.y + boY
         const ex = slot.end.x + pos.x + boX
@@ -919,7 +1038,7 @@ export function collectPanelizedDrillHoles(
 
       if (!byDia.has(dia)) byDia.set(dia, [])
       const holes = byDia.get(dia)!
-      for (const pos of panel.pcbPositions) {
+      for (const pos of panel.placements) {
         holes.push({
           x: (cmd.coordinate.x || 0) + pos.x + boX,
           y: (cmd.coordinate.y || 0) + pos.y + boY,
@@ -956,7 +1075,7 @@ export function collectPanelizedDrillSlots(
       if (slot.diameterMm <= 0) continue
       if (!byDia.has(slot.diameterMm)) byDia.set(slot.diameterMm, [])
       const slots = byDia.get(slot.diameterMm)!
-      for (const pos of panel.pcbPositions) {
+      for (const pos of panel.placements) {
         slots.push({
           start: { x: slot.start.x + pos.x + boX, y: slot.start.y + pos.y + boY },
           end: { x: slot.end.x + pos.x + boX, y: slot.end.y + pos.y + boY },

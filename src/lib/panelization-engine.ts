@@ -4,7 +4,7 @@
  * Generates proper RS-274X Gerber output from parsed layer data.
  */
 
-import { GerberLayer, GerberAperture } from './gerber-parser'
+import { GerberLayer, GerberAperture, GerberDrawCommand } from './gerber-parser'
 import { generateStrokeFontGerberCommands, layerNeedsTextShapes } from './stroke-font'
 import { generateRegionTextGerberCommands, layerNeedsRegionText, measureRegionText } from './region-font'
 
@@ -582,16 +582,47 @@ export function formatPanelDate(d: Date = new Date()): string {
   return `${dd}-${mmm}-${yyyy}`
 }
 
+/**
+ * One board instance placed on the panel. `x`/`y` are the low corner in
+ * panel-absolute Gerber Y-up mm; `w`/`h` are the bbox AS PLACED (already
+ * swapped for a 90/270 rotation — never re-derive from a design's own
+ * unrotated size). `row`/`col` are populated only in grid mode and are
+ * DISPLAY/DEBUG ONLY — never load-bearing for geometry, since a future
+ * free-packed panel has no row/col concept at all.
+ */
+export interface PanelPlacement {
+  x: number
+  y: number
+  w: number
+  h: number
+  rotationDeg: 0 | 90 | 180 | 270
+  designId: string
+  row?: number
+  col?: number
+}
+
+/** Per-design rollup for display/README/rib-meta-text — never geometry. */
+export interface PanelDesignSummary {
+  designId: string
+  name: string
+  widthMm: number
+  heightMm: number
+  count: number
+  rotationsDeg: (0 | 90 | 180 | 270)[]
+}
+
 export interface PanelResult {
-  pcbWidth: number
-  pcbHeight: number
   panelWidth: number
   panelHeight: number
-  pcbPositions: { x: number; y: number; row: number; col: number }[]
+  /** Replaces the old `pcbPositions` — every placed board instance. */
+  placements: PanelPlacement[]
+  designs: PanelDesignSummary[]
   toolingHoles: { id: string; x: number; y: number; diameter: number; type: 'tooling' | 'reference' }[]
   fiducials: { id: string; x: number; y: number; diameter: number; clearance: number }[]
   infoTexts: InfoText[]
   totalPCBs: number
+  grid?: { rows: number; cols: number }
+  source: 'grid' | 'pack'
 }
 
 export interface InfoText {
@@ -659,12 +690,100 @@ export const DEFAULT_PANEL_CONFIG: PanelConfig = {
 // Panel Layout Computation
 // ============================================================================
 
-export function computePanel(
+/**
+ * Minimal shape `resolveDesignGeometry` needs — deliberately generic so both
+ * `store.ts`'s `LayerEntry` (real `visible: boolean`) and `gerber-exporter.ts`'s
+ * `LayerFile` (no `visible` field at all — every entry it's given is already
+ * meant to be exported) can be passed in without either importing the other's type.
+ */
+export interface DesignGeometrySource {
+  type: string
+  visible?: boolean
+  parsedLayer: { bounds: { minX: number; minY: number; maxX: number; maxY: number } | null } | null
+}
+
+export interface ResolvedDesignGeometry {
+  /** `-bounds.min` — the ONE offset every layer/drill-hit/route path for this
+   *  design must share so they land in the same panel-absolute space. */
+  datum: { x: number; y: number }
+  widthMm: number
+  heightMm: number
+  /** true when no `type === 'outline'` layer had usable bounds and the
+   *  largest-visible-area fallback was used instead. */
+  fromFallback: boolean
+}
+
+/**
+ * The single canonical way to decide "which layer sizes/positions this
+ * design" — same explicit-outline-then-largest-visible-area priority
+ * `computePanelResult` has always used (`type === 'outline'` first, since
+ * non-standard exports like Eagle's `profile.gbr` don't declare themselves as
+ * one), now shared by every site that needs the datum: the exporter's
+ * `globalBaseOffset`, `computePanelResult`, `generateGcodeFilesAction`, and
+ * `generatePanelArrayFilesAction`.
+ *
+ * ⚠ Before this was extracted, the exporter's own `globalBaseOffset`
+ * computation (`gerber-exporter.ts`) had NEITHER the largest-area fallback
+ * NOR a visibility check — an outline-less design already sized correctly by
+ * `computePanelResult` (via the fallback) would then export with every layer
+ * falling back to ITS OWN bounds instead of one shared datum, misregistering
+ * the panel. Unifying onto this one function is a real behavior fix for that
+ * case, not just a refactor — the fallback now applies everywhere the datum
+ * is computed, not only where panel size happens to be computed.
+ *
+ * Deliberately NOT used by routing's contour-trace decision
+ * (`findOutlineBoundsLayer`, `store.ts`) — tracing "the largest layer" when
+ * it isn't actually a board outline would trace copper or silk artwork as if
+ * it were a board edge, which is a different and much worse kind of wrong
+ * than a slightly-off panel size. That call site intentionally keeps its
+ * stricter no-fallback behavior.
+ */
+export function resolveDesignGeometry<T extends DesignGeometrySource>(layers: T[]): ResolvedDesignGeometry | null {
+  const outlineLayer = layers.find(l => l.type === 'outline' && l.visible !== false && l.parsedLayer?.bounds)
+  let boundsLayer = outlineLayer
+  let fromFallback = false
+  if (!boundsLayer) {
+    const visibleWithBounds = layers.filter(l => l.visible !== false && l.parsedLayer?.bounds)
+    if (visibleWithBounds.length > 0) {
+      boundsLayer = visibleWithBounds.reduce((best, layer) => {
+        const b = layer.parsedLayer!.bounds!
+        const bestB = best.parsedLayer!.bounds!
+        const area = (b.maxX - b.minX) * (b.maxY - b.minY)
+        const bestArea = (bestB.maxX - bestB.minX) * (bestB.maxY - bestB.minY)
+        return area > bestArea ? layer : best
+      })
+      fromFallback = true
+    }
+  }
+
+  if (!boundsLayer?.parsedLayer?.bounds) return null
+  const b = boundsLayer.parsedLayer.bounds
+  return {
+    datum: { x: -b.minX, y: -b.minY },
+    widthMm: b.maxX - b.minX,
+    heightMm: b.maxY - b.minY,
+    fromFallback,
+  }
+}
+
+/**
+ * The uniform-lattice half of `computePanel` — sizes the panel and lays out
+ * one copy of the board at every grid cell. Split out (alongside `finishPanel`
+ * below) so a future non-uniform layout (multiple different board designs
+ * packed onto one panel, rather than one design repeated) can build its own
+ * `placements` and feed it through the exact same tooling-hole/fiducial/
+ * rib-text pipeline instead of duplicating ~550 lines of hard-won geometry
+ * corrections. `computePanel` itself stays the thin single-design entry point.
+ */
+/** Single-design grid mode has no real design identity yet (that's Stage 2's
+ *  `LayerEntry.designId`) — every placement/summary uses this sentinel. */
+const SINGLE_DESIGN_ID = 'default'
+
+function buildGridPlacements(
   pcbWidth: number,
   pcbHeight: number,
-  config: PanelConfig,
-  info?: PanelInfo
-): PanelResult {
+  config: PanelConfig
+): { placements: PanelPlacement[]; panelWidth: number; panelHeight: number } {
   const { rows, cols, gapX, gapY } = config
 
   const gridWidth = cols * pcbWidth + (cols - 1) * gapX
@@ -688,17 +807,100 @@ export function computePanel(
   // placement (top rib at `panelHeight − sideRibTop/2`, bottom rib at
   // `sideRibBottom/2`), both grid-exclusion computations, the fiducial
   // fallbacks, and both rib-text generators. This line was the sole outlier.
-  const pcbPositions: PanelResult['pcbPositions'] = []
+  const placements: PanelPlacement[] = []
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
-      pcbPositions.push({
+      placements.push({
         x: config.sideRibLeft + c * (pcbWidth + gapX),
         y: config.sideRibBottom + r * (pcbHeight + gapY),
+        w: pcbWidth,
+        h: pcbHeight,
+        rotationDeg: 0,
+        designId: SINGLE_DESIGN_ID,
         row: r,
         col: c,
       })
     }
   }
+
+  return { placements, panelWidth, panelHeight }
+}
+
+export function computePanel(
+  pcbWidth: number,
+  pcbHeight: number,
+  config: PanelConfig,
+  info?: PanelInfo
+): PanelResult {
+  const { placements, panelWidth, panelHeight } = buildGridPlacements(pcbWidth, pcbHeight, config)
+  const designs: PanelDesignSummary[] = placements.length > 0 ? [{
+    designId: SINGLE_DESIGN_ID,
+    name: info?.pcbName || 'PCB',
+    widthMm: pcbWidth,
+    heightMm: pcbHeight,
+    count: placements.length,
+    rotationsDeg: [0],
+  }] : []
+  return finishPanel(placements, designs, panelWidth, panelHeight, config, 'grid', info)
+}
+
+/**
+ * Build a `PanelResult` from an already-packed, non-uniform layout — the
+ * `src/lib/packing/` engine's counterpart to `computePanel`. `placements`
+ * must already be final (panel-absolute mm, one entry per placed board
+ * instance); this only adds tooling holes, fiducials, and rib text on top,
+ * through the exact same `finishPanel` pipeline grid mode uses.
+ */
+export function finishPackedPanel(
+  placements: PanelPlacement[],
+  designs: PanelDesignSummary[],
+  panelWidth: number,
+  panelHeight: number,
+  config: PanelConfig,
+  info?: PanelInfo
+): PanelResult {
+  return finishPanel(placements, designs, panelWidth, panelHeight, config, 'pack', info)
+}
+
+/**
+ * Everything past layout: tooling holes, fiducials, and rib text — all
+ * measured against the placements' own bounding box, never against
+ * `rows`/`cols`/a single `pcbWidth`/`pcbHeight` directly, so this function
+ * has no idea whether `placements` came from a uniform lattice or a packed,
+ * multi-design layout.
+ */
+function finishPanel(
+  placements: PanelPlacement[],
+  designs: PanelDesignSummary[],
+  panelWidth: number,
+  panelHeight: number,
+  config: PanelConfig,
+  source: 'grid' | 'pack',
+  info?: PanelInfo
+): PanelResult {
+  // Derived from the placements' own bbox — mathematically identical to the
+  // old `config.cols * pcbWidth + (cols-1)*gapX` formula for a uniform grid
+  // (min(x) = sideRibLeft, max(x+w) = sideRibLeft + cols*pcbWidth +
+  // (cols-1)*gapX, verified against the golden corpus), and correctly
+  // generalizes to a non-uniform packed layout, where no single
+  // pcbWidth/cols describes the layout at all.
+  let plMinX = Infinity, plMinY = Infinity, plMaxX = -Infinity, plMaxY = -Infinity
+  for (const p of placements) {
+    plMinX = Math.min(plMinX, p.x)
+    plMinY = Math.min(plMinY, p.y)
+    plMaxX = Math.max(plMaxX, p.x + p.w)
+    plMaxY = Math.max(plMaxY, p.y + p.h)
+  }
+  const gridWidth = placements.length > 0 ? plMaxX - plMinX : 0
+  const gridHeight = placements.length > 0 ? plMaxY - plMinY : 0
+
+  // Representative single-board size for the parts of this function that
+  // still assume one board (the rib-text call just below) — always correct
+  // for grid mode (exactly one design, always), and a deliberate, documented
+  // simplification for pack mode until a later stage generalizes rib text
+  // to show every design rather than just the first.
+  const pcbWidth = designs[0]?.widthMm ?? 0
+  const pcbHeight = designs[0]?.heightMm ?? 0
 
   // Tooling holes — placed ONLY on side ribs, not on PCB area
   // Coordinate system: CAM350 first quadrant (X+ right, Y+ up, origin at bottom-left)
@@ -883,15 +1085,12 @@ export function computePanel(
     }
   }
 
-  // Generate panel meta text (Customer/PCB name, revision, date, PCB size,
-  // panel size) BEFORE fiducials — it only needs `toolingHoles` (already
-  // computed above) and `info`, so hoisting it lets fiducial placement below
-  // avoid the real, measured text zone instead of guessing at one.
+  // `infoTexts` is populated further below, AFTER fiducials — see the note
+  // at that population site for why the order flipped from an earlier
+  // version of this function (fiducials used to run after text, so they
+  // could avoid it; text now avoids fiducials instead, which needs the
+  // REAL final fiducial position, not a guess at one).
   const infoTexts: InfoText[] = []
-  if (info) {
-    const topRibTexts = generatePanelMetaText(info, pcbWidth, pcbHeight, panelWidth, panelHeight, config, toolingHoles)
-    infoTexts.push(...topRibTexts)
-  }
 
   // Fiducials — placed ONLY on side ribs, near corners, no overlap with tooling holes or other features
   let fiducials: PanelResult['fiducials'] = []
@@ -905,13 +1104,10 @@ export function computePanel(
 
     const radius = config.fiducialDiameter / 2
     const clearanceOffset = Math.max(0, (config.fiducialClearance - config.fiducialDiameter) / 2)
-    // Small explicit margin beyond the mask-clearance geometry itself, so a
-    // fiducial's clearance ring doesn't just barely graze a hole or a line
-    // of rib text — confirmed live on real panels: text and pinning holes
-    // were landing ~1mm from a fiducial's edge, technically clear but too
-    // tight to trust across real fab registration tolerance.
-    const marginBeyondClearanceMm = 1.5
-    const fidHalfSpan = radius + clearanceOffset + marginBeyondClearanceMm
+    // Shared with `fiducialsAsHoles` (used by the text functions below, which
+    // now run AFTER this block) — kept as one function so the two can't
+    // drift apart.
+    const fidHalfSpan = fiducialHalfSpanMm(config)
 
     // Fiducial-to-fiducial spacing floor — the physical minimum that keeps
     // mask-clearance rings from touching. The actual TARGET spacing is
@@ -921,118 +1117,40 @@ export function computePanel(
     const physicalMinFidSpacingMm = config.fiducialDiameter + clearanceOffset * 2 + 2.0
     let minFidSpacingMm = physicalMinFidSpacingMm
 
-    // ⚠ Reserved zones for rib TEXT, so a fiducial can never land under a
-    // layer-name label or the customer/PCB-name legend. These two features
-    // were designed independently with no coordination between them — a
-    // real customer panel showed the bottom-right fiducial candidate
-    // (`panelWidth - sideRibRight - 40`) landing exactly at the START of
-    // the "Bottom Copper" layer-label text on the bottom rib (both sit at
-    // the same Y = sideRibBottom/2, and the hardcoded -40 offset happened
-    // to fall inside the text's real span). Rather than guess a new magic
-    // offset, reject candidates that collide with the text zone and let
-    // the existing fallback candidate (on the side rib instead, structurally
-    // clear of both rib-text zones) take over — see `addFiducial` below.
+    // ⚠ A fiducial no longer needs to avoid the customer/PCB-name legend or
+    // the revision/date/size overflow text at all — this block now runs
+    // BEFORE `generatePanelMetaText`/`generateLayerLabels` are called (see
+    // the `infoTexts` population site further down), and THOSE functions
+    // avoid the fiducial instead (`fiducialsAsHoles`), using its real final
+    // position. That flip is deliberate: a reservation computed here could
+    // only ever guess at where a fiducial's own fallback/widest-spacing
+    // search will actually land it, and a real customer panel showed that
+    // guess going wrong in both directions — too narrow (text still
+    // overlapping the fiducial) and too wide (text needlessly shoved into a
+    // real hole's clearance zone to dodge a fiducial that never actually
+    // landed near there). Avoiding the REAL position afterward has no such
+    // guessing problem.
     //
-    // Top-rib zone: `generatePanelMetaText`'s own measured output, above —
-    // the real customer/PCB-name string width, not a guess. Tracked as a
-    // list of INDIVIDUAL intervals (one per infoText entry), not merged into
-    // one [min,max] envelope — see the bottom-rib comment below for why that
-    // merge is a real bug, not just imprecision.
+    // The ONE reservation still needed here is the bottom rib's RIGHT side:
+    // real per-layer labels aren't generated until `generateLayerLabels`,
+    // called much later in store.ts once the customer's Gerber imports are
+    // known — by then this fiducial's position is already fixed and can't
+    // be revisited, so this still has to guess at a WORST-CASE label zone
+    // the way it always did (see `worstCaseBottomRibLabelZone`'s own docs).
     interface XInterval { min: number; max: number }
-    const topRibIntervals: XInterval[] = []
-    for (const t of infoTexts) {
-      if (t.location !== 'top-rib') continue
-      const { lo, hi } = infoTextSpanX(t)
-      topRibIntervals.push({ min: lo, max: hi })
-    }
-    const topRibBandY = { min: panelHeight - config.sideRibTop, max: panelHeight }
-
-    // Bottom-rib zone: layer names aren't known this early (they depend on
-    // which Gerber files the customer imported, resolved later in
-    // `generateLayerLabels`), so the RIGHT side reserves the WORST-CASE
-    // realistic label — see `worstCaseBottomRibLabelZone`'s own docs, shared
-    // with the panel-meta-text overflow placement below so the two
-    // reservations can't drift apart. The LEFT side, though, can already
-    // carry REAL text by this point — `generatePanelMetaText`'s bottom-rib
-    // overflow tier (revision/date/PCB size/panel size, once the top rib
-    // runs out of height) — so that gets added in from the real measured
-    // `infoTexts`.
-    //
-    // ⚠ Kept as SEPARATE intervals, never merged into one [min,max] span —
-    // the left overflow text and the right worst-case reservation are
-    // usually far apart with genuinely empty rib in between, and a merged
-    // envelope falsely marks that whole empty middle as reserved. Confirmed
-    // live on a real 176.5mm panel: left text at [9.5,47] and the worst-case
-    // right zone at [131,175] merged into one [9.5,175] span, leaving
-    // fid_bl/fid_br nowhere to go anywhere on the bottom rib — both got
-    // pushed all the way up to the top rib instead, which is exactly the
-    // "avoid clustering" fix above defeating itself: with nothing available
-    // on bottom, all three fiducials landed on the one rib that still had
-    // room, clustered together rather than spread across corners.
     const worstCase = worstCaseBottomRibLabelZone(config, panelWidth, toolingHoles)
     const bottomRibIntervals: XInterval[] = [{ min: worstCase.minX, max: worstCase.maxX }]
-    for (const t of infoTexts) {
-      if (t.location !== 'bottom-rib') continue
-      const { lo, hi } = infoTextSpanX(t)
-      bottomRibIntervals.push({ min: lo, max: hi })
-    }
     const bottomRibBandY = { min: 0, max: config.sideRibBottom }
 
-    // Left/right-rib zone: the vertical "PCB WxHmm" / "Panel WxHmm" (etc.)
-    // meta text `generatePanelMetaText`'s tier 3 places on the SIDE ribs when
-    // both are present — rotation 90°, so its real extent runs along Y, not
-    // X (see `infoTextSpanY`). This was missing entirely until a real panel
-    // showed both `fid_bl`'s and `fid_br`'s side-rib FALLBACK candidate (the
-    // one that centers the fiducial inside the left/right rib once the
-    // primary bottom-rib candidate is rejected) landing directly on top of
-    // this text — `collidesWithRibText` only ever checked X-intervals within
-    // a Y-band for the horizontal top/bottom rib text, with no equivalent
-    // check for the side ribs at all. Mirrors that same X-interval-in-Y-band
-    // shape, transposed: a Y-interval-in-X-band, since the side ribs are
-    // narrow vertical strips rather than horizontal ones.
-    const leftRibBandX = { min: 0, max: config.sideRibLeft }
-    const leftRibIntervals: XInterval[] = []
-    for (const t of infoTexts) {
-      if (t.location !== 'left-rib') continue
-      const { lo, hi } = infoTextSpanY(t)
-      leftRibIntervals.push({ min: lo, max: hi })
-    }
-    const rightRibBandX = { min: panelWidth - config.sideRibRight, max: panelWidth }
-    const rightRibIntervals: XInterval[] = []
-    for (const t of infoTexts) {
-      if (t.location !== 'right-rib') continue
-      const { lo, hi } = infoTextSpanY(t)
-      rightRibIntervals.push({ min: lo, max: hi })
-    }
-
-    // ⚠ Band membership (which rib, if any, a candidate is even near) must be
-    // inflated by `fidHalfSpan` too, not just the interval check within the
-    // band — a fiducial's CENTER can sit just outside a rib's Y (or X) band
-    // while its clearance-inflated disc still physically reaches into the
-    // band and touches the text there. Confirmed live on a random panel
-    // sweep: `fid_tr` landed a few mm below `topRibBandY.min` (so it read as
-    // "on the PCB grid, not the rib" by a center-only check) while its own
-    // clearance radius still overlapped the bottom-most of several stacked
-    // top-rib text lines.
+    // ⚠ Band membership must be inflated by `fidHalfSpan` too, not just the
+    // interval check within the band — a fiducial's CENTER can sit just
+    // outside the bottom rib's Y band while its clearance-inflated disc
+    // still physically reaches into the band and touches the reserved zone
+    // there.
     function collidesWithRibText(x: number, y: number): boolean {
-      if (y + fidHalfSpan >= topRibBandY.min && y - fidHalfSpan <= topRibBandY.max) {
-        for (const iv of topRibIntervals) {
-          if (x + fidHalfSpan >= iv.min && x - fidHalfSpan <= iv.max) return true
-        }
-      }
       if (y + fidHalfSpan >= bottomRibBandY.min && y - fidHalfSpan <= bottomRibBandY.max) {
         for (const iv of bottomRibIntervals) {
           if (x + fidHalfSpan >= iv.min && x - fidHalfSpan <= iv.max) return true
-        }
-      }
-      if (x + fidHalfSpan >= leftRibBandX.min && x - fidHalfSpan <= leftRibBandX.max) {
-        for (const iv of leftRibIntervals) {
-          if (y + fidHalfSpan >= iv.min && y - fidHalfSpan <= iv.max) return true
-        }
-      }
-      if (x + fidHalfSpan >= rightRibBandX.min && x - fidHalfSpan <= rightRibBandX.max) {
-        for (const iv of rightRibIntervals) {
-          if (y + fidHalfSpan >= iv.min && y - fidHalfSpan <= iv.max) return true
         }
       }
       return false
@@ -1317,7 +1435,27 @@ export function computePanel(
     }
   }
 
-  return { pcbWidth, pcbHeight, panelWidth, panelHeight, pcbPositions, toolingHoles, fiducials, infoTexts, totalPCBs: rows * cols }
+  // Generate panel meta text (Customer/PCB name, revision, date, PCB size,
+  // panel size) AFTER fiducials, passing the now-final `fiducials` array
+  // through — see the reordering note at `infoTexts`'s declaration above for
+  // why this flipped from an earlier version that ran text first.
+  if (info) {
+    const metaTexts = generatePanelMetaText(info, pcbWidth, pcbHeight, panelWidth, panelHeight, config, toolingHoles, fiducials)
+    infoTexts.push(...metaTexts)
+  }
+
+  return {
+    panelWidth,
+    panelHeight,
+    placements,
+    designs,
+    toolingHoles,
+    fiducials,
+    infoTexts,
+    totalPCBs: placements.length,
+    grid: source === 'grid' ? { rows: config.rows, cols: config.cols } : undefined,
+    source,
+  }
 }
 
 // ============================================================================
@@ -1347,37 +1485,46 @@ export function computePanel(
  * @returns Array of InfoText items to be added to the panel result
  */
 /**
- * The real world-space X span `[lo, hi]` an `InfoText` entry (rotation 0)
- * covers, honoring `mirrored`. A non-mirrored entry grows RIGHT from its
- * anchor (`[x, x+w]`, `align: 'left'`) — a mirrored one grows LEFT from its
- * anchor instead (`transformPoint` flips `nx`), so its real span is
- * `[x-w, x]`, not `[x, x+w]`. Reusing the non-mirrored formula for a
- * mirrored entry silently reserves a second, phantom text-width of space on
- * the WRONG side of the anchor — confirmed live: with both side ribs
- * removed, the top-rib name line's mirrored copy inflated the fiducial
- * text-reservation zone from its real ~50mm span out to ~100mm, consuming
- * the entire rib and leaving `fid_tr` with nowhere valid to land at all.
+ * A fiducial's clearance-inflated "radius" — copper dot radius plus the
+ * gap out to the mask keep-out ring, plus a small explicit margin beyond
+ * that geometry so the ring doesn't just barely graze a neighboring
+ * feature (confirmed live on real panels: 1mm alone left text/holes
+ * landing only ~1mm from a fiducial's edge — technically clear but too
+ * tight to trust against real fab registration tolerance). Shared by
+ * `computePanel`'s own fiducial placement AND `fiducialsAsHoles` below, so
+ * the two can't drift apart.
  */
-function infoTextSpanX(t: InfoText): { lo: number; hi: number } {
-  const w = measureRegionText(t.text) * t.fontSize
-  return t.mirrored ? { lo: t.x - w, hi: t.x } : { lo: t.x, hi: t.x + w }
+function fiducialHalfSpanMm(config: PanelConfig): number {
+  const radius = config.fiducialDiameter / 2
+  const clearanceOffset = Math.max(0, (config.fiducialClearance - config.fiducialDiameter) / 2)
+  const marginBeyondClearanceMm = 1.5
+  return radius + clearanceOffset + marginBeyondClearanceMm
 }
 
 /**
- * The real world-space Y span `[lo, hi]` a `rotation: 90` `InfoText` entry
- * (the `left-rib`/`right-rib` vertical meta text — see `generatePanelMetaText`'s
- * tier 3) covers. `transformPoint` (region-font.ts) rotates the local reading
- * axis onto world Y for a 90° entry (cosR=0, sinR=1: `ry = mx`), so the same
- * mirrored/non-mirrored growth-direction rule `infoTextSpanX` uses for a
- * horizontal entry's X span applies here to the Y span instead: a
- * non-mirrored entry grows from its anchor toward +Y (`[y, y+len]`), a
- * mirrored one grows toward -Y (`[y-len, y]`) — matching how
- * `placeSideGroup` anchors its two copies of each line at `startY` and
- * `endY = startY + textLen` respectively.
+ * Adapts already-placed fiducials into the `{x, diameter}` shape
+ * `clearHolesAlongAxis` expects, so rib TEXT (the customer/PCB-name line,
+ * the revision/date/size overflow lines, and per-layer labels) can treat a
+ * fiducial as just one more obstacle to clear — restoring the "reference
+ * hole, tooling hole, fiducial, THEN text" reading order a real customer
+ * asked for at a corner. `fid.clearance` is already the mask keep-out
+ * ring's OUTER diameter (see `clearanceOffset`'s derivation above), so no
+ * extra half-span math is needed here the way the fiducial's OWN placement
+ * needs `fiducialHalfSpanMm` — `clearHolesAlongAxis` adds its own
+ * `clearanceMm` buffer on top, same as it does for real holes.
+ *
+ * Filtered to `ribY`'s band first — a fiducial that (via its own fallback
+ * chain) ended up on a DIFFERENT rib than the text being laid out must not
+ * phantom-block that text; only same-rib fiducials are real obstacles here.
  */
-function infoTextSpanY(t: InfoText): { lo: number; hi: number } {
-  const len = measureRegionText(t.text) * t.fontSize
-  return t.mirrored ? { lo: t.y - len, hi: t.y } : { lo: t.y, hi: t.y + len }
+function fiducialsAsHoles(
+  fiducials: PanelResult['fiducials'],
+  ribYMin: number,
+  ribYMax: number
+): { x: number; diameter: number }[] {
+  return fiducials
+    .filter(f => f.y >= ribYMin - 0.01 && f.y <= ribYMax + 0.01)
+    .map(f => ({ x: f.x, diameter: f.clearance }))
 }
 
 /**
@@ -1518,8 +1665,9 @@ export function generateLayerLabels(
   config: PanelConfig,
   pcbWidth: number,
   pcbHeight: number,
-  pcbPositions: PanelResult['pcbPositions'],
-  toolingHoles?: PanelResult['toolingHoles']
+  pcbPositions: PanelPlacement[],
+  toolingHoles?: PanelResult['toolingHoles'],
+  fiducials?: PanelResult['fiducials']
 ): InfoText[] {
   const texts: InfoText[] = []
 
@@ -1583,8 +1731,20 @@ export function generateLayerLabels(
   const maxTopWidth = topLabels.reduce((max, l) => Math.max(max, measureRegionText(l.name) * fontSize), 0)
   const maxBottomWidth = bottomLabels.reduce((max, l) => Math.max(max, measureRegionText(l.name) * fontSize), 0)
 
-  const topAnchorX = topLabels.length > 0 ? clearHolesAlongAxis(topFirstCharX, maxTopWidth, bottomRibHoles, 'right', holeClearanceMm) : topFirstCharX
-  const bottomAnchorX = bottomLabels.length > 0 ? clearHolesAlongAxis(bottomFirstCharX, maxBottomWidth, bottomRibHoles, 'left', holeClearanceMm) : bottomFirstCharX
+  // BOTTOM labels are mirrored and grow LEFT from `bottomFirstCharX` — i.e.
+  // toward `fid_br`'s own corner — so without this they can (and on a real
+  // no-side-rib panel, did) grow straight past the fiducial there. Folded in
+  // as one more synthetic "hole" for the existing `clearHolesAlongAxis` pass
+  // rather than a separate check, so it gets the same iterate-to-a-fixed-
+  // point treatment as the real holes. `computePanel` now places fiducials
+  // BEFORE calling this function specifically so `fiducials` here is the
+  // REAL final position (not a guess at where it might land) — see the
+  // reordering note on `computePanel`'s own fiducial block.
+  const bottomRibFiducialHoles = fiducialsAsHoles(fiducials ?? [], 0, ribHeight)
+  const bottomRibHolesWithFid = [...bottomRibHoles, ...bottomRibFiducialHoles]
+
+  const topAnchorX = topLabels.length > 0 ? clearHolesAlongAxis(topFirstCharX, maxTopWidth, bottomRibHolesWithFid, 'right', holeClearanceMm) : topFirstCharX
+  const bottomAnchorX = bottomLabels.length > 0 ? clearHolesAlongAxis(bottomFirstCharX, maxBottomWidth, bottomRibHolesWithFid, 'left', holeClearanceMm) : bottomFirstCharX
 
   if (topAnchorX !== topFirstCharX) {
     console.log(`[Label Position] TOP layers anchor shifted from ${topFirstCharX.toFixed(2)}mm to ${topAnchorX.toFixed(2)}mm to clear tooling/reference holes (widest label ${maxTopWidth.toFixed(2)}mm)`)
@@ -1676,6 +1836,10 @@ export function generateLayerLabels(
  * @param panelHeight - Full panel height in mm
  * @param config - Panel configuration with side rib dimensions
  * @param toolingHoles - Tooling/reference hole positions, for anchor + hole-avoidance
+ * @param fiducials - Already-placed fiducial positions, for hole-avoidance-style
+ *   clearance so text starts clear of a fiducial at the same corner instead of
+ *   claiming that space first — `computePanel` places fiducials before calling
+ *   this function specifically so this is the real final position, not a guess.
  * @returns Array of InfoText items across whichever ribs had room
  */
 export function generatePanelMetaText(
@@ -1685,7 +1849,8 @@ export function generatePanelMetaText(
   panelWidth: number,
   panelHeight: number,
   config: PanelConfig,
-  toolingHoles?: PanelResult['toolingHoles']
+  toolingHoles?: PanelResult['toolingHoles'],
+  fiducials?: PanelResult['fiducials']
 ): InfoText[] {
   const texts: InfoText[] = []
   if (!info) return texts
@@ -1752,8 +1917,10 @@ export function generatePanelMetaText(
   // enough line can still reach them) using the widest line that will actually
   // land here, same `clearHolesAlongAxis` machinery `generateLayerLabels` uses.
   const topRibHoles = (toolingHoles ?? []).filter(h => h.y >= panelHeight - config.sideRibTop - 0.01)
+  const topRibFiducialHoles = fiducialsAsHoles(fiducials ?? [], panelHeight - config.sideRibTop, panelHeight)
+  const topRibHolesWithFid = [...topRibHoles, ...topRibFiducialHoles]
   const maxTopMetaWidth = placedOnTop.reduce((max, l) => Math.max(max, measureTextWidth(l, topFontSize)), 0)
-  const clearedFirstCharX = clearHolesAlongAxis(firstCharX, maxTopMetaWidth, topRibHoles, 'right', holeClearanceMm)
+  const clearedFirstCharX = clearHolesAlongAxis(firstCharX, maxTopMetaWidth, topRibHolesWithFid, 'right', holeClearanceMm)
   // The name line is never dropped, so it must never be pushed off the panel
   // (a wide enough name + a cramped top-left hole cluster can otherwise walk
   // the anchor negative — clearing holes is only useful while it stays on
@@ -1787,11 +1954,21 @@ export function generatePanelMetaText(
     const bottomStartX = config.sideRibLeft + 2.0
     const bottomCenterY = ribHeight / 2
 
+    // `fid_bl` sits between this text's own start anchor and where it would
+    // otherwise grow toward. Folded in as one more synthetic "hole" for the
+    // existing `clearHolesAlongAxis` pass (same treatment `generateLayerLabels`
+    // gives `fid_br` on the opposite corner) so the text starts AFTER the
+    // reference hole, tooling hole, AND the fiducial — not on top of it.
+    // `computePanel` places fiducials before calling this function
+    // specifically so this is the fiducial's real final position.
+    const bottomRibFiducialHoles = fiducialsAsHoles(fiducials ?? [], 0, ribHeight)
+    const bottomRibHolesWithFid = [...bottomRibHoles, ...bottomRibFiducialHoles]
+
     const placedOnBottom: string[] = []
     for (const lineText of remaining) {
       if (placedOnBottom.length >= bottomLinesFitByHeight) break
       const textWidth = measureTextWidth(lineText, bottomFontSize)
-      const anchorX = clearHolesAlongAxis(bottomStartX, textWidth, bottomRibHoles, 'right', holeClearanceMm)
+      const anchorX = clearHolesAlongAxis(bottomStartX, textWidth, bottomRibHolesWithFid, 'right', holeClearanceMm)
       if (anchorX + textWidth + marginMm > zone.minX) break // would run into the per-layer-label zone
       placedOnBottom.push(lineText)
     }
@@ -1801,7 +1978,7 @@ export function generatePanelMetaText(
       const groupOffset = ((placedOnBottom.length - 1) / 2) * bottomLineHeight
       const lineY = bottomCenterY + groupOffset - i * bottomLineHeight
       const textWidth = measureTextWidth(lineText, bottomFontSize)
-      const anchorX = clearHolesAlongAxis(bottomStartX, textWidth, bottomRibHoles, 'right', holeClearanceMm)
+      const anchorX = clearHolesAlongAxis(bottomStartX, textWidth, bottomRibHolesWithFid, 'right', holeClearanceMm)
       console.log(`[Bottom Rib] Adding meta line: "${lineText}" at ${anchorX.toFixed(2)}mm`)
       pushHorizontalPair(lineText, anchorX, lineY, bottomFontSize, 'bottom-rib')
     })
@@ -2085,7 +2262,7 @@ export function layerNeedsDonutShapes(layerType: string): boolean {
  * @returns The final interpolation mode after processing all commands
  */
 function generateBodyFromCommands(
-  layer: GerberLayer,
+  commands: GerberDrawCommand[],
   offsetX: number,
   offsetY: number,
   fmt: OutputFormat,
@@ -2117,8 +2294,8 @@ function generateBodyFromCommands(
     currentInterp = 'linear'
   }
 
-  for (let i = 0; i < layer.commands.length; i++) {
-    const cmd = layer.commands[i]
+  for (let i = 0; i < commands.length; i++) {
+    const cmd = commands[i]
 
     if (cmd.coordinate.x !== undefined) posX = cmd.coordinate.x
     if (cmd.coordinate.y !== undefined) posY = cmd.coordinate.y
@@ -2293,10 +2470,18 @@ export function generatePanelizedGerber(
   outputFormat?: OutputFormat,
   globalBaseOffset?: BaseOffset,
   layerType?: string,
-  layerSide?: 'top' | 'bottom' | 'none'
+  layerSide?: 'top' | 'bottom' | 'none',
+  /** Restrict body + PCB-corner-L-shape emission to a subset of the panel's
+   *  placements — used by `generateMergedPanelizedGerber`'s single-contributor
+   *  delegate so a design's own layer is only stamped at ITS OWN placements,
+   *  not every design's. Defaults to `panel.placements` (all of them), which
+   *  is every existing call site's behavior — this parameter is purely
+   *  additive. */
+  placementsOverride?: PanelPlacement[]
 ): string {
   const fmt: OutputFormat = outputFormat || DEFAULT_OUTPUT_FORMAT
   const lines: string[] = []
+  const placements = placementsOverride ?? panel.placements
 
   // ---- 0. Allocate collision-free D-codes for panel overlay features ----
   // Scan both the raw content and the parsed aperture table (parsing may have
@@ -2354,12 +2539,12 @@ export function generatePanelizedGerber(
 
   let lastInterp: 'linear' | 'cw' | 'ccw' = 'linear'
 
-  for (const pos of panel.pcbPositions) {
+  for (const pos of placements) {
     const dx = pos.x + baseOffsetX
     const dy = pos.y + baseOffsetY
 
     // Pass previous interpolation mode so state is continuous across copies
-    lastInterp = generateBodyFromCommands(parsedLayer, dx, dy, fmt, lines, lastInterp)
+    lastInterp = generateBodyFromCommands(parsedLayer.commands, dx, dy, fmt, lines, lastInterp)
   }
 
   // FORCE LINEAR MODE FOR APPENDED ELEMENTS
@@ -2377,8 +2562,9 @@ export function generatePanelizedGerber(
   // Generate L-shapes for each panel position, offset to match panel layout.
   // L-shapes are added to copper and mask layers only.
   if (config.enableLShapeMarks && layerType && layerNeedsLShapeMarks(layerType)) {
-    // Generate L-shape commands relative to PCB origin (0,0)
-    const lShapeBase = generateLShapeGerberCommands(panel.pcbWidth, panel.pcbHeight, config, fmt, lShapeCornerCode)
+    // Generate L-shape commands relative to PCB origin (0,0). All placements
+    // share one size in single-design grid mode, so the first is representative.
+    const lShapeBase = generateLShapeGerberCommands(placements[0]?.w ?? 0, placements[0]?.h ?? 0, config, fmt, lShapeCornerCode)
 
     // For each panel position, offset the L-shape coordinates
     if (lShapeBase.length > 0) {
@@ -2386,7 +2572,7 @@ export function generatePanelizedGerber(
       // trip warnings in CAM tools.
       lines.push(`%ADD${lShapeCornerCode}C,${config.lShapeLineWidth.toFixed(6)}*%`)
 
-      for (const pos of panel.pcbPositions) {
+      for (const pos of placements) {
         // pos.x/pos.y are already panel-absolute (from computePanel), same as
         // panel.toolingHoles/fiducials/infoTexts below — do NOT add
         // baseOffsetX/baseOffsetY here, that's only for converting the body
@@ -2399,8 +2585,8 @@ export function generatePanelizedGerber(
 
         // Re-generate L-shapes with position offset
         const arm = config.lShapeArmLength
-        const w = panel.pcbWidth
-        const h = panel.pcbHeight
+        const w = pos.w
+        const h = pos.h
 
         const f = (v: number) => formatCoordinate(v + offX, fmt)
         const fy = (v: number) => formatCoordinate(v + offY, fmt)
@@ -2535,6 +2721,300 @@ export function generatePanelizedGerber(
   if (lastInterp !== 'linear') {
     lines.push('G74*')
     lines.push('G01*')
+  }
+
+  lines.push('M02*')
+  return lines.join('\n')
+}
+
+/**
+ * One design's contribution to a single merged output file (one per
+ * `(layerType, layerSide)` key — see `generateMergedPanelizedGerber`).
+ */
+export interface GerberExportContributor {
+  parsedLayer: GerberLayer
+  rawContent: string
+  /** This design's own datum (from `resolveDesignGeometry`), NOT the whole
+   *  panel's — every design has its own native-coordinate origin. */
+  baseOffset: BaseOffset
+  /** Only this design's own placements — never the full `panel.placements`. */
+  placements: PanelPlacement[]
+  /** This design's own L-shape-mark eligibility (its own outline-rectangular
+   *  check) folded into an otherwise-shared `PanelConfig`. */
+  effectiveConfig: PanelConfig
+}
+
+/**
+ * Merge N designs' contributions to ONE output file (one Gerber layer, e.g.
+ * "Top_Copper", shared by every design in the panel that has a matching
+ * layer) with a D-code / `%AM` macro-name remap so the merged file has no
+ * collisions.
+ *
+ * ⚠ Byte-identity for the single-design case is STRUCTURAL, not incidental:
+ * with exactly one contributor this delegates straight to the unmodified
+ * `generatePanelizedGerber` (contributor 0 is never remapped in the merge
+ * path either, so the two paths would agree even if this delegate didn't
+ * exist — but delegating means the single-contributor case can never drift
+ * from that function's own behavior as it evolves).
+ *
+ * Contributors are expected in the caller's chosen order (this codebase uses
+ * `panel.designs` order, i.e. store design order) — contributor 0's D-codes
+ * and macro names are NEVER touched; contributors 1..N are remapped in
+ * ascending old-code order, continuing the same code cursor across
+ * contributors so no two contributors' codes can collide.
+ */
+export function generateMergedPanelizedGerber(
+  contributors: GerberExportContributor[],
+  panel: PanelResult,
+  panelConfig: PanelConfig,
+  outputFormat?: OutputFormat,
+  layerType?: string,
+  layerSide?: 'top' | 'bottom' | 'none'
+): string {
+  if (contributors.length === 0) return ''
+
+  if (contributors.length === 1) {
+    const c = contributors[0]
+    return generatePanelizedGerber(
+      c.parsedLayer, c.rawContent, panel, c.effectiveConfig, outputFormat,
+      c.baseOffset, layerType, layerSide, c.placements
+    )
+  }
+
+  const fmt: OutputFormat = outputFormat || DEFAULT_OUTPUT_FORMAT
+  const lines: string[] = []
+
+  // ---- 0. Merge macros + apertures, remapping D-codes/macro names for every
+  // contributor after the first ----
+  const macroLines: string[] = []
+  const usedMacroNames = new Set<string>()
+  const addLines: string[] = []
+
+  interface RemappedContributor {
+    commands: GerberDrawCommand[]
+    baseOffset: BaseOffset
+    placements: PanelPlacement[]
+    effectiveConfig: PanelConfig
+    hasBounds: boolean
+  }
+  const remapped: RemappedContributor[] = []
+
+  // Contributor 0's own max D-code seeds the shared cursor — identical to
+  // generatePanelizedGerber's own single-file allocation.
+  let nextCode = 10
+  {
+    const c0 = contributors[0]
+    let maxD0 = findMaxDCode(c0.rawContent)
+    for (const code of c0.parsedLayer.apertures.keys()) {
+      if (code > maxD0) maxD0 = code
+    }
+    nextCode = maxD0 + 1
+  }
+
+  contributors.forEach((c, k) => {
+    if (k === 0) {
+      // Identity — verbatim macros, apertures, commands.
+      for (const macro of extractMacroDefinitions(c.rawContent)) {
+        const nameMatch = macro.match(/^%AM([A-Za-z0-9_-]+)\*/)
+        if (nameMatch) usedMacroNames.add(nameMatch[1])
+        macroLines.push(macro)
+      }
+      addLines.push(...generateApertureDefinitions(c.parsedLayer.apertures))
+      remapped.push({
+        commands: c.parsedLayer.commands,
+        baseOffset: c.baseOffset,
+        placements: c.placements,
+        effectiveConfig: c.effectiveConfig,
+        hasBounds: !!c.parsedLayer.bounds,
+      })
+      return
+    }
+
+    // ---- Macro name remap: rename ONLY on collision, never try to prove two
+    // identically-named bodies are equivalent (see this function's own docs
+    // + CLAUDE.md's D-code/macro remap section). ----
+    const macroNameMap = new Map<string, string>()
+    for (const macro of extractMacroDefinitions(c.rawContent)) {
+      const nameMatch = macro.match(/^%AM([A-Za-z0-9_-]+)\*/)
+      if (!nameMatch) continue
+      const origName = nameMatch[1]
+      const finalName = usedMacroNames.has(origName) ? `${origName}_${k}` : origName
+      macroNameMap.set(origName, finalName)
+      usedMacroNames.add(finalName)
+      macroLines.push(finalName === origName ? macro : macro.replace(/^%AM[A-Za-z0-9_-]+\*/, `%AM${finalName}*`))
+    }
+
+    // ---- D-code remap: ascending old-code order, continuing the shared
+    // cursor from every previously-processed contributor. ----
+    const oldCodes = Array.from(c.parsedLayer.apertures.keys()).sort((a, b) => a - b)
+    const codeMap = new Map<number, number>()
+    for (const oldCode of oldCodes) {
+      codeMap.set(oldCode, nextCode)
+      nextCode++
+    }
+
+    const remappedApertures = new Map<number, GerberAperture>()
+    for (const [oldCode, ap] of c.parsedLayer.apertures.entries()) {
+      const newCode = codeMap.get(oldCode)!
+      const ap2: GerberAperture = { ...ap, code: newCode }
+      if (ap2.shape === 'macro' && ap2.macroName) {
+        ap2.macroName = macroNameMap.get(ap2.macroName) ?? ap2.macroName
+      }
+      remappedApertures.set(newCode, ap2)
+    }
+    addLines.push(...generateApertureDefinitions(remappedApertures))
+
+    const remappedCommands: GerberDrawCommand[] = c.parsedLayer.commands.map(cmd => {
+      if (cmd.apertureCode === null) return cmd
+      const newCode = codeMap.get(cmd.apertureCode)
+      return newCode === undefined ? cmd : { ...cmd, apertureCode: newCode }
+    })
+
+    remapped.push({
+      commands: remappedCommands,
+      baseOffset: c.baseOffset,
+      placements: c.placements,
+      effectiveConfig: c.effectiveConfig,
+      hasBounds: !!c.parsedLayer.bounds,
+    })
+  })
+
+  // Overlay codes go above every contributor's codes, same "next century"
+  // convention as the single-design function.
+  const baseCode = Math.max(301, Math.ceil(nextCode / 100) * 100 + 1)
+  const lShapeCornerCode = baseCode
+  const lShapeBorderCode = baseCode + 1
+  const strokeFontApertureCode = baseCode + 2
+  const donutApertureCode = baseCode + 3
+  const fiducialApertureCode = baseCode + 4
+
+  // ---- 1. Format header ----
+  lines.push(generateFSCommand(fmt))
+  lines.push(generateMOCommand(fmt))
+  lines.push('%LPD*%')
+
+  // ---- 2. Merged macro definitions ----
+  lines.push(...macroLines)
+
+  // ---- 3. Merged aperture definitions ----
+  lines.push(...addLines)
+
+  // ---- 4. G-code initialization ----
+  lines.push(generateGUnitCode(fmt))
+  lines.push('G01*')
+
+  // ---- 5. Body — each contributor's own placements only, one continuous
+  // interpolation-mode stream across all contributors (same convention as
+  // the single-design function's continuity across placements). A
+  // contributor with no bounds contributes no geometry but doesn't abort the
+  // whole file — other designs may still have usable geometry. ----
+  let lastInterp: 'linear' | 'cw' | 'ccw' = 'linear'
+  for (const rc of remapped) {
+    if (!rc.hasBounds) continue
+    for (const pos of rc.placements) {
+      const dx = pos.x + rc.baseOffset.x
+      const dy = pos.y + rc.baseOffset.y
+      lastInterp = generateBodyFromCommands(rc.commands, dx, dy, fmt, lines, lastInterp)
+    }
+  }
+  if (lastInterp !== 'linear') {
+    lines.push('G74*')
+    lines.push('G01*')
+    lastInterp = 'linear'
+  }
+
+  // ---- 6. L-shape marks at PCB corners — per contributor, using THAT
+  // design's own w/h and its own outline-rectangular eligibility
+  // (`effectiveConfig.enableLShapeMarks`), so a rectangular design sharing a
+  // file with a shaped one doesn't lose its marks. One shared aperture code
+  // (the line width is panel-wide, not per-design). ----
+  if (layerType && layerNeedsLShapeMarks(layerType)) {
+    const eligible = remapped.filter(rc => rc.hasBounds && rc.effectiveConfig.enableLShapeMarks && rc.placements.length > 0)
+    if (eligible.length > 0) {
+      lines.push(`%ADD${lShapeCornerCode}C,${panelConfig.lShapeLineWidth.toFixed(6)}*%`)
+      lines.push(`G54D${lShapeCornerCode}*`)
+      const arm = panelConfig.lShapeArmLength
+      for (const rc of eligible) {
+        for (const pos of rc.placements) {
+          const maxArm = Math.min(pos.w / 2, pos.h / 2)
+          if (arm <= 0 || arm > maxArm) continue
+          const f = (v: number) => formatCoordinate(v + pos.x, fmt)
+          const fy = (v: number) => formatCoordinate(v + pos.y, fmt)
+          const w = pos.w
+          const h = pos.h
+          lines.push(`X${f(arm)}Y${fy(0)}D02*`)
+          lines.push(`X${f(0)}Y${fy(0)}D01*`)
+          lines.push(`X${f(0)}Y${fy(arm)}D01*`)
+          lines.push(`X${f(w - arm)}Y${fy(0)}D02*`)
+          lines.push(`X${f(w)}Y${fy(0)}D01*`)
+          lines.push(`X${f(w)}Y${fy(arm)}D01*`)
+          lines.push(`X${f(w)}Y${fy(h - arm)}D02*`)
+          lines.push(`X${f(w)}Y${fy(h)}D01*`)
+          lines.push(`X${f(w - arm)}Y${fy(h)}D01*`)
+          lines.push(`X${f(arm)}Y${fy(h)}D02*`)
+          lines.push(`X${f(0)}Y${fy(h)}D01*`)
+          lines.push(`X${f(0)}Y${fy(h - arm)}D01*`)
+        }
+      }
+    }
+  }
+
+  // ---- 6.5. L-shape marks on panel border — panel-wide, not per-design. ----
+  if (panelConfig.enablePanelBorderLShape && layerType && layerNeedsLShapeMarks(layerType)) {
+    lines.push(...generatePanelBorderLShapeGerberCommands(panel.panelWidth, panel.panelHeight, panelConfig, fmt, lShapeBorderCode))
+  }
+
+  // ---- 7. Donut rings around reference holes — panel-wide. ----
+  if (panelConfig.enableToolingHoles && layerType && layerNeedsDonutShapes(layerType)) {
+    const refHoles = panel.toolingHoles.filter(h => h.type === 'reference')
+    if (refHoles.length > 0) {
+      const od = panelConfig.donutOuterDiameter || 2.25
+      const id = panelConfig.donutInnerDiameter || 1.25
+      lines.push(`%ADD${donutApertureCode}C,${od.toFixed(5)}X${id.toFixed(5)}*%`)
+      const f = (v: number) => formatCoordinate(v, fmt)
+      lines.push(`G54D${donutApertureCode}*`)
+      for (const hole of refHoles) {
+        lines.push(`X${f(hole.x)}Y${f(hole.y)}D03*`)
+      }
+    }
+  }
+
+  // ---- 7.5. Fiducials — panel-wide. ----
+  if (panelConfig.enableFiducials && layerType && (layerType === 'copper' || layerType === 'mask') && panel.fiducials.length > 0) {
+    const isTop = layerSide === 'top'
+    const isBottom = layerSide === 'bottom'
+    const enabledForSide = (isTop && panelConfig.fiducialsTop !== false) || (isBottom && panelConfig.fiducialsBottom !== false)
+    if (enabledForSide) {
+      const diameter = layerType === 'copper' ? panelConfig.fiducialDiameter : panelConfig.fiducialClearance
+      lines.push(`%ADD${fiducialApertureCode}C,${diameter.toFixed(6)}*%`)
+      const f = (v: number) => formatCoordinate(v, fmt)
+      lines.push(`G54D${fiducialApertureCode}*`)
+      for (const fid of panel.fiducials) {
+        lines.push(`X${f(fid.x)}Y${f(fid.y)}D03*`)
+      }
+    }
+  }
+
+  // ---- 8. Text on panel ribs — panel-wide. ----
+  const isRegionFont = panelConfig.textFont === 'region'
+  const layerNeedsFont = isRegionFont ? layerNeedsRegionText(layerType || 'none') : layerNeedsTextShapes(layerType || 'none')
+  if (layerType && layerNeedsFont && panel.infoTexts.length > 0) {
+    const currentLayerSide = layerSide || 'none'
+    const filteredText = panel.infoTexts.filter(t => {
+      if (layerType === 'paste') return false
+      if (!t.targetLayerType) {
+        if (currentLayerSide === 'top' && t.mirrored) return false
+        if (currentLayerSide === 'bottom' && !t.mirrored) return false
+        return true
+      }
+      return t.targetLayerType === layerType && t.targetLayerSide === currentLayerSide
+    })
+    if (filteredText.length > 0) {
+      const textCmds = isRegionFont
+        ? generateRegionTextGerberCommands(filteredText, fmt)
+        : generateStrokeFontGerberCommands(filteredText, fmt, strokeFontApertureCode)
+      lines.push(...textCmds)
+    }
   }
 
   lines.push('M02*')

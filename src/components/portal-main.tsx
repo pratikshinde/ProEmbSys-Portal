@@ -3,13 +3,14 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import GerberViewer from './gerber-viewer';
 import LayerPanel from './layer-panel';
+import DesignsPanel from './designs-panel';
 import PanelConfigPanel from './panel-config';
 import ExportPanel from './export-panel';
 import DfmPanel from './dfm-panel';
 import RoutingPanel from './routing-panel';
 import GcodePanel from './gcode-panel';
 import { Button } from './ui/button';
-import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck, Scissors, Terminal } from 'lucide-react';
+import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck, Scissors, Terminal, Boxes, Square } from 'lucide-react';
 import { useAppStore } from '../lib/store';
 import JSZip from 'jszip';
 import { analyzeGerberSet, GerberQuoteAnalysis } from '../lib/gerber-analysis';
@@ -1795,6 +1796,8 @@ function PanelizationPage() {
   const startW = useRef(0);
   const activeTab = useAppStore(s => s.activeTab);
   const setActiveTab = useAppStore(s => s.setActiveTab);
+  const camMode = useAppStore(s => s.camMode);
+  const setCamMode = useAppStore(s => s.setCamMode);
 
   const onResizeStart = useCallback((e) => {
     e.preventDefault();
@@ -1862,12 +1865,13 @@ function PanelizationPage() {
         <div style={{ display:"flex", gap:4, marginLeft:24 }}>
           {[
             { key: 'layers' as const, icon: Layers, label: 'Layers' },
+            { key: 'designs' as const, icon: Boxes, label: 'Designs' },
             { key: 'dfm' as const, icon: ShieldCheck, label: 'DFM Check' },
             { key: 'panel' as const, icon: LayoutGrid, label: 'Panel Config' },
             { key: 'routing' as const, icon: Scissors, label: 'Routing' },
             { key: 'gcode' as const, icon: Terminal, label: 'G-Code' },
             { key: 'export' as const, icon: Download, label: 'Info & Export' },
-          ].map(({ key, icon: Icon, label }) => (
+          ].filter(t => camMode === 'multi' || t.key !== 'designs').map(({ key, icon: Icon, label }) => (
             <button
               key={key}
               onClick={() => {
@@ -1888,10 +1892,36 @@ function PanelizationPage() {
           ))}
         </div>
 
+        {/* Tool-wide mode switch — single-board (classic) vs multi-design pack.
+            Lives here rather than inside a tab because it gates which TABS
+            exist at all, and stays visible with the sidebar collapsed. */}
+        <div style={{ marginLeft:"auto", display:"flex", gap:2, background:C.bg3, padding:3, borderRadius:8, border:`1px solid ${C.border}` }}>
+          {[
+            { key: 'single' as const, icon: Square, label: 'Single Design', title: 'One board, panelized across a rows × columns grid. Imports add to the same board.' },
+            { key: 'multi' as const, icon: Boxes, label: 'Multi-Design', title: 'Several different boards packed onto one panel. Each imported archive becomes its own design.' },
+          ].map(({ key, icon: Icon, label, title }) => (
+            <button
+              key={key}
+              onClick={() => setCamMode(key)}
+              title={`${title}\n\nSwitching clears the computed panel, routing and G-code — your imported layers are kept.`}
+              style={{
+                display:"flex", alignItems:"center", gap:6, padding:"5px 11px", borderRadius:6, fontSize:12, cursor:"pointer", transition:"all 0.15s", fontFamily:"'DM Sans',sans-serif",
+                background: camMode === key ? C.accent : "transparent",
+                color: camMode === key ? "#fff" : C.text2,
+                border: "none",
+                fontWeight: camMode === key ? 700 : 400,
+              }}
+            >
+              <Icon style={{ width:13, height:13 }} />
+              <span>{label}</span>
+            </button>
+          ))}
+        </div>
+
         {/* Sidebar toggle */}
         <button
           onClick={() => setSidebarOpen(!sidebarOpen)}
-          style={{ marginLeft:"auto", background:"transparent", border:`1px solid ${C.border}`, borderRadius:6, padding:"4px 8px", cursor:"pointer", color:C.text2, display:"flex", alignItems:"center" }}
+          style={{ background:"transparent", border:`1px solid ${C.border}`, borderRadius:6, padding:"4px 8px", cursor:"pointer", color:C.text2, display:"flex", alignItems:"center" }}
         >
           {sidebarOpen ? (
             <ChevronRight style={{ width:16, height:16 }} />
@@ -1911,6 +1941,7 @@ function PanelizationPage() {
             <div style={{ flex:1, minHeight:0, overflowY:"auto" }}>
               <div style={{ padding:12, height:"100%" }}>
                 {activeTab === 'layers' && <LayerPanel />}
+                {activeTab === 'designs' && <DesignsPanel />}
                 {activeTab === 'dfm' && <DfmPanel />}
                 {activeTab === 'panel' && <PanelConfigPanel />}
                 {activeTab === 'routing' && <RoutingPanel />}
