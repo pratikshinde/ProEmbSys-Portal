@@ -63,6 +63,16 @@ export default function DfmPanel() {
   const [saving, setSaving] = React.useState(false)
   const [showEditor, setShowEditor] = React.useState(false)
 
+  // Only PERSISTING a template needs an account — /api/dfm-templates is
+  // publicly readable so the CAM tool works fully logged-out (see
+  // CLAUDE.md's DFM section). The rule VALUE inputs below must never be
+  // gated on `signedIn`: a logged-out user editing a threshold and clicking
+  // "Run check" is exactly the documented no-login flow, and the caption
+  // shown when signed out ("You can still run checks against the shared
+  // ones") already promises this. Only the Save/"Save as new" buttons
+  // further down are conditioned on `signedIn` — that's the real
+  // auth boundary; disabling the inputs themselves was a second, redundant
+  // gate that silently broke the documented logged-out flow entirely.
   const signedIn = sessionStatus === 'authenticated'
   const selected = templates.find(t => t.id === dfmTemplateId) ?? null
 
@@ -338,7 +348,6 @@ export default function DfmPanel() {
                     step="0.01"
                     className="h-8 w-16 text-xs"
                     value={limit.standard}
-                    disabled={!signedIn}
                     onChange={e => setLimit(key, 'standard', e.target.value)}
                   />
                   <Input
@@ -347,7 +356,6 @@ export default function DfmPanel() {
                     className="h-8 w-16 text-xs"
                     placeholder="—"
                     value={limit.advanced ?? ''}
-                    disabled={!signedIn}
                     onChange={e => setLimit(key, 'advanced', e.target.value)}
                   />
                 </div>
@@ -363,7 +371,6 @@ export default function DfmPanel() {
                   type="number"
                   className="mt-1 h-8 text-xs"
                   value={activeRules.maxBoardMm}
-                  disabled={!signedIn}
                   onChange={e => {
                     const n = Number(e.target.value)
                     if (!Number.isFinite(n) || n <= 0) return
@@ -378,7 +385,6 @@ export default function DfmPanel() {
                   type="number"
                   className="mt-1 h-8 text-xs"
                   value={activeRules.maxAspectRatio}
-                  disabled={!signedIn}
                   onChange={e => {
                     const n = Number(e.target.value)
                     if (!Number.isFinite(n) || n <= 0) return

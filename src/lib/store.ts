@@ -770,6 +770,31 @@ function buildPackItemSpecs(designs: DesignEntry[], layers: LayerEntry[]): PackI
 }
 
 /**
+ * The packer's bin size, in mm — the configured material sheet minus the
+ * side-rib margins `finishPanel` reserves for tooling holes/fiducials/rib
+ * text. Grid mode's `buildGridPlacements` starts its grid at
+ * `sideRibLeft`/`sideRibBottom` so PCBs never land under a rib; the packer
+ * has no concept of ribs at all (`PackConfig` doc: "knows nothing about
+ * ribs, tooling holes, fiducials, or rib text") and was being called with
+ * the FULL, un-reduced material size, so a packed item routinely landed at
+ * x=0/y=0 — exactly where the rib text goes. Subtracting the margins here,
+ * before packing, keeps the packer from ever proposing a placement that
+ * `buildPackedPanelResult` will then have to shift on top of a rib.
+ * Floored at 0 so a rib configuration wider than the sheet reports as "no
+ * layout fits" (the existing `packInfeasible` path) instead of handing the
+ * packer a negative bin size.
+ */
+function packableMaterialSize(
+  materialSizeMm: { widthMm: number; heightMm: number },
+  config: PanelConfig
+): { widthMm: number; heightMm: number } {
+  return {
+    widthMm: Math.max(0, materialSizeMm.widthMm - config.sideRibLeft - config.sideRibRight),
+    heightMm: Math.max(0, materialSizeMm.heightMm - config.sideRibTop - config.sideRibBottom),
+  }
+}
+
+/**
  * A chosen `PackCandidate` → a finished `PanelResult` (placements, design
  * summaries, tooling holes/fiducials/rib text via `finishPackedPanel`) —
  * shared by `applyPackCandidateAction` ("Use This Layout") and
@@ -782,8 +807,17 @@ function buildPackedPanelResult(
   panelConfig: PanelConfig,
   panelInfo: PanelInfo
 ): PanelResult {
+  // `candidate.items` are packed into the rib-reduced bin from
+  // `packableMaterialSize`, at a 0,0-origin bbox of the items themselves
+  // (see PackCandidate's own doc — "tight bbox of the placed items").
+  // Shifting by sideRibLeft/sideRibBottom here is the exact analogue of
+  // `buildGridPlacements`'s `x: config.sideRibLeft + …` — without it, the
+  // packer's raw 0-origin coordinates were used as panel-absolute directly,
+  // so the first packed item sat right where the rib text/fiducials go.
   const placements: PanelPlacement[] = candidate.items.map(it => ({
-    x: it.x, y: it.y, w: it.w, h: it.h, rotationDeg: it.rotationDeg, designId: it.designId,
+    x: it.x + panelConfig.sideRibLeft,
+    y: it.y + panelConfig.sideRibBottom,
+    w: it.w, h: it.h, rotationDeg: it.rotationDeg, designId: it.designId,
   }))
 
   const designSummaries: PanelDesignSummary[] = designs
@@ -800,7 +834,14 @@ function buildPackedPanelResult(
       }
     })
 
-  return finishPackedPanel(placements, designSummaries, candidate.panelWidthMm, candidate.panelHeightMm, panelConfig, panelInfo)
+  // Mirrors buildGridPlacements' `panelWidth = sideRibLeft + gridWidth +
+  // sideRibRight` exactly — candidate.panelWidthMm/HeightMm is the packed
+  // items' own tight bbox (pre-rib), same role gridWidth/gridHeight play
+  // in grid mode.
+  const panelWidth = panelConfig.sideRibLeft + candidate.panelWidthMm + panelConfig.sideRibRight
+  const panelHeight = panelConfig.sideRibBottom + candidate.panelHeightMm + panelConfig.sideRibTop
+
+  return finishPackedPanel(placements, designSummaries, panelWidth, panelHeight, panelConfig, panelInfo)
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -874,9 +915,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   findPackCandidatesAction: () => {
     const { designs, layers, materialSizeMm, panelConfig } = get()
+    const packable = packableMaterialSize(materialSizeMm, panelConfig)
     const result = findPackCandidates(buildPackItemSpecs(designs, layers), {
-      materialWidthMm: materialSizeMm.widthMm,
-      materialHeightMm: materialSizeMm.heightMm,
+      materialWidthMm: packable.widthMm,
+      materialHeightMm: packable.heightMm,
       gapXMm: panelConfig.gapX,
       gapYMm: panelConfig.gapY,
     })
@@ -1947,9 +1989,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         return
       }
 
+      const packable = packableMaterialSize(materialSizeMm, panelConfig)
       const packed = findPackCandidates(specs, {
-        materialWidthMm: materialSizeMm.widthMm,
-        materialHeightMm: materialSizeMm.heightMm,
+        materialWidthMm: packable.widthMm,
+        materialHeightMm: packable.heightMm,
         gapXMm: panelConfig.gapX,
         gapYMm: panelConfig.gapY,
       })

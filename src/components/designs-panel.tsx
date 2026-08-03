@@ -13,20 +13,31 @@ import type { PackCandidate } from '@/lib/packing/pack'
 /** Small rectangles-only preview of a candidate layout — no Gerber content,
  *  just each placement's own design color, enough to compare candidates at
  *  a glance. Real per-design geometry rendering is a later update (once the
- *  viewer itself supports more than one design's content — see the plan). */
-function CandidateMiniPreview({ candidate, colorByDesign }: { candidate: PackCandidate; colorByDesign: Map<string, string> }) {
+ *  viewer itself supports more than one design's content — see the plan).
+ *
+ *  `candidate.panelWidthMm/HeightMm` is the packed items' own tight bbox —
+ *  the packer knows nothing about ribs (see `packableMaterialSize` in
+ *  store.ts). The FINAL panel `buildPackedPanelResult` builds is bigger by
+ *  the rib margins on every side, with every item shifted by
+ *  sideRibLeft/sideRibBottom — so this preview adds the same margins,
+ *  otherwise it shows PCBs flush against the panel edge (where the rib
+ *  text/fiducials actually land) instead of where "Use This Layout" will
+ *  really place them. */
+function CandidateMiniPreview({ candidate, colorByDesign, ribs }: { candidate: PackCandidate; colorByDesign: Map<string, string>; ribs: { left: number; right: number; top: number; bottom: number } }) {
   const pad = 4
-  const scale = Math.min(120 / (candidate.panelWidthMm || 1), 80 / (candidate.panelHeightMm || 1))
-  const w = candidate.panelWidthMm * scale
-  const h = candidate.panelHeightMm * scale
+  const panelWidthMm = ribs.left + candidate.panelWidthMm + ribs.right
+  const panelHeightMm = ribs.bottom + candidate.panelHeightMm + ribs.top
+  const scale = Math.min(120 / (panelWidthMm || 1), 80 / (panelHeightMm || 1))
+  const w = panelWidthMm * scale
+  const h = panelHeightMm * scale
   return (
     <svg width={w + pad * 2} height={h + pad * 2} className="flex-shrink-0">
       <rect x={0} y={0} width={w + pad * 2} height={h + pad * 2} fill="#061628" rx={3} />
       {candidate.items.map((it, i) => (
         <rect
           key={i}
-          x={pad + it.x * scale}
-          y={pad + (candidate.panelHeightMm - it.y - it.h) * scale}
+          x={pad + (it.x + ribs.left) * scale}
+          y={pad + (panelHeightMm - (it.y + ribs.bottom) - it.h) * scale}
           width={Math.max(1, it.w * scale)}
           height={Math.max(1, it.h * scale)}
           fill={colorByDesign.get(it.designId) ?? '#0ea5e9'}
@@ -49,6 +60,8 @@ export default function DesignsPanel() {
 
   const materialSizeMm = useAppStore(s => s.materialSizeMm)
   const updateMaterialSize = useAppStore(s => s.updateMaterialSize)
+  const panelConfig = useAppStore(s => s.panelConfig)
+  const ribs = { left: panelConfig.sideRibLeft, right: panelConfig.sideRibRight, top: panelConfig.sideRibTop, bottom: panelConfig.sideRibBottom }
   const packCandidates = useAppStore(s => s.packCandidates)
   const packInfeasible = useAppStore(s => s.packInfeasible)
   const selectedCandidateId = useAppStore(s => s.selectedCandidateId)
@@ -246,7 +259,7 @@ export default function DesignsPanel() {
                         c.id === selectedCandidateId ? 'border-[#0ea5e9] bg-[#0ea5e9]/10' : 'border-[#1a3a5c] bg-[#0f2848]/40 hover:border-[#0ea5e9]/40'
                       }`}
                     >
-                      <CandidateMiniPreview candidate={c} colorByDesign={colorByDesign} />
+                      <CandidateMiniPreview candidate={c} colorByDesign={colorByDesign} ribs={ribs} />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-1.5 flex-wrap">
                           <Badge variant="secondary" className="text-[8px] px-1 py-0 h-4 bg-[#0f2848] text-[#94b8d4]">{c.strategy}</Badge>
@@ -254,7 +267,10 @@ export default function DesignsPanel() {
                           {c.id === selectedCandidateId && <CheckCircle2 className="w-3 h-3 text-[#0ea5e9]" />}
                         </div>
                         <div className="text-[#f0f8ff] mt-1">
-                          {c.panelWidthMm.toFixed(1)}×{c.panelHeightMm.toFixed(1)}mm · {c.totalBoards} boards · {(c.efficiency * 100).toFixed(0)}% used
+                          {/* Panel size shown here includes the rib margins — the packed
+                              items' own tight bbox (c.panelWidthMm/HeightMm) is smaller;
+                              see CandidateMiniPreview's doc for why. */}
+                          {(ribs.left + c.panelWidthMm + ribs.right).toFixed(1)}×{(ribs.bottom + c.panelHeightMm + ribs.top).toFixed(1)}mm · {c.totalBoards} boards · {(c.efficiency * 100).toFixed(0)}% used
                         </div>
                         <div className="text-[#4a6f94] mt-0.5 truncate">
                           {Object.entries(c.countsByDesign).map(([id, n]) => `${designs.find(d => d.id === id)?.name ?? id}: ${n}`).join(', ')}
