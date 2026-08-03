@@ -42,10 +42,9 @@ import { collectMouseBiteHoles, type RoutingResult } from './types'
 export function generateRoutFile(
   result: RoutingResult,
   drillFormat: DrillFormatConfig,
-  panel: PanelResult,
-  gerberUnit?: 'mm' | 'inches'
+  panel: PanelResult
 ): string {
-  const drillFmt = resolveExportDrillFormat(drillFormat, panel, gerberUnit, 'Route Export')
+  const drillFmt = resolveExportDrillFormat(drillFormat, panel, 'Route Export')
   const bit = result.config.bitDiameterMm
 
   const lines: string[] = []
@@ -87,13 +86,12 @@ export function generateRoutFile(
 export function generateMouseBiteDrill(
   result: RoutingResult,
   drillFormat: DrillFormatConfig,
-  panel: PanelResult,
-  gerberUnit?: 'mm' | 'inches'
+  panel: PanelResult
 ): string {
   const holes = collectMouseBiteHoles(result)
   if (holes.length === 0) return ''
 
-  const drillFmt = resolveExportDrillFormat(drillFormat, panel, gerberUnit, 'MouseBite Export')
+  const drillFmt = resolveExportDrillFormat(drillFormat, panel, 'MouseBite Export')
 
   // One tool per distinct hole diameter, sorted so T-codes are stable.
   const diameters = [...new Set(holes.map(h => h.diameter))].sort((a, b) => a - b)

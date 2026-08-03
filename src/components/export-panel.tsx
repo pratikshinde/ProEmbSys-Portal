@@ -8,9 +8,10 @@ import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { FileText, Download, Package, Settings2, RotateCcw, AlertTriangle } from 'lucide-react'
+import { FileText, Download, Package, Settings2, RotateCcw, AlertTriangle, Wrench } from 'lucide-react'
 import { exportPanelizedGerbers } from '@/lib/gerber-exporter'
 import { LayerFile } from '@/lib/gerber-exporter'
+import { DrillFormatPreset, DRILL_FORMAT_PRESETS, DrillCamCompatibility } from '@/lib/panelization-engine'
 
 export default function ExportPanel() {
   const panelInfo = useAppStore(s => s.panelInfo)
@@ -86,6 +87,20 @@ export default function ExportPanel() {
     ? Math.max(3, Math.floor(Math.log10(Math.max(panelResult.panelWidth, panelResult.panelHeight, 1))) + 2)
     : 4
   const formatInsufficient = outputFormat.integerDigits < minIntegerDigits
+
+  // Preview of what `resolveExportDrillFormat` will actually do at export
+  // time (same math, mirrored here rather than calling that function
+  // directly so this doesn't also fire its console.warn on every render).
+  // Deliberately independent of `outputFormat.unit` — the drill unit is no
+  // longer force-synced to the Gerber output unit (mixed mm-Gerber +
+  // inch-drill is standard practice; see resolveExportDrillFormat's docs).
+  const drillFmt = panelConfig.drillFormat
+  const drillMaxCoord = panelResult ? Math.max(panelResult.panelWidth, panelResult.panelHeight) : 0
+  const drillMaxCoordInUnit = drillFmt.unit === 'mm' ? drillMaxCoord : drillMaxCoord / 25.4
+  const drillNeededIntDigits = drillMaxCoordInUnit <= 0 ? 3 : Math.min(Math.floor(Math.log10(drillMaxCoordInUnit)) + 2, 6)
+  // Gated on panelResult too — with no panel computed yet there's nothing to
+  // size against, so this must read as "no widening", not a stale 3-digit floor.
+  const drillDigitsWillWiden = !!panelResult && drillFmt.integerDigits < drillNeededIntDigits
 
   return (
     <Card className="border-[#1a3a5c] bg-[#0a1e38]/70">
@@ -237,6 +252,201 @@ export default function ExportPanel() {
                 : `${Math.pow(10, -outputFormat.decimalDigits).toFixed(outputFormat.decimalDigits)} in`
               })
             </div>
+          </div>
+        </div>
+
+        <Separator className="bg-[#1a3a5c]" />
+
+        {/* Drill Output Format — kept in the same card as the Gerber output
+            format so both can be set together (they used to live on
+            separate tabs, which made it easy to change one and forget the
+            other, e.g. picking Inches here while Gerber stayed mm). */}
+        <div>
+          <Label className="text-xs text-[#94b8d4] font-medium flex items-center gap-1.5 mb-2">
+            <Wrench className="w-3 h-3 text-amber-400" />
+            Drill Output Format
+          </Label>
+
+          {/* Format preset selector */}
+          <div className="mb-2">
+            <Label className="text-[10px] text-[#4a6f94]">Format Preset</Label>
+            <Select
+              value={drillFmt.preset || 'excellon-2-4'}
+              onValueChange={(v) => {
+                const preset = v as DrillFormatPreset
+                const p = DRILL_FORMAT_PRESETS[preset]
+                if (p) {
+                  updatePanelConfig({
+                    drillFormat: {
+                      preset,
+                      integerDigits: p.integerDigits,
+                      decimalDigits: p.decimalDigits,
+                      unit: p.unit,
+                      zeroSuppression: p.zeroSuppression,
+                      camCompatibility: p.camCompatibility,
+                    }
+                  })
+                }
+              }}
+            >
+              <SelectTrigger className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="bg-[#0a1e38] border-[#1a3a5c]">
+                <SelectItem value="excellon-2-4">Excellon 2:4 (inch)</SelectItem>
+                <SelectItem value="excellon-3-3">Excellon 3:3 (mm)</SelectItem>
+                <SelectItem value="excellon-2-5">Excellon 2:5 (inch)</SelectItem>
+                <SelectItem value="excellon-3-4">Excellon 3:4 (mm)</SelectItem>
+                <SelectItem value="custom">Custom</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Customizable format details */}
+          <div className="grid grid-cols-2 gap-2">
+            {/* Integer digits */}
+            <div>
+              <Label className="text-[10px] text-[#4a6f94]">Integer Digits</Label>
+              <Select
+                value={drillFmt.integerDigits?.toString() || '2'}
+                onValueChange={(v) => {
+                  updatePanelConfig({
+                    drillFormat: { ...drillFmt, integerDigits: parseInt(v), preset: 'custom' }
+                  })
+                }}
+              >
+                <SelectTrigger className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-[#0a1e38] border-[#1a3a5c]">
+                  <SelectItem value="2">2</SelectItem>
+                  <SelectItem value="3">3</SelectItem>
+                  <SelectItem value="4">4</SelectItem>
+                  <SelectItem value="5">5</SelectItem>
+                  <SelectItem value="6">6</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Decimal digits */}
+            <div>
+              <Label className="text-[10px] text-[#4a6f94]">Decimal Digits</Label>
+              <Select
+                value={drillFmt.decimalDigits?.toString() || '4'}
+                onValueChange={(v) => {
+                  updatePanelConfig({
+                    drillFormat: { ...drillFmt, decimalDigits: parseInt(v), preset: 'custom' }
+                  })
+                }}
+              >
+                <SelectTrigger className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-[#0a1e38] border-[#1a3a5c]">
+                  <SelectItem value="3">3 (0.001)</SelectItem>
+                  <SelectItem value="4">4 (0.0001)</SelectItem>
+                  <SelectItem value="5">5 (0.00001)</SelectItem>
+                  <SelectItem value="6">6 (0.000001)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Unit */}
+            <div>
+              <Label className="text-[10px] text-[#4a6f94]">Drill Units</Label>
+              <Select
+                value={drillFmt.unit || 'inches'}
+                onValueChange={(v) => {
+                  updatePanelConfig({
+                    drillFormat: { ...drillFmt, unit: v as 'mm' | 'inches', preset: 'custom' }
+                  })
+                }}
+              >
+                <SelectTrigger className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-[#0a1e38] border-[#1a3a5c]">
+                  <SelectItem value="mm">Metric (mm)</SelectItem>
+                  <SelectItem value="inches">English (inch)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Zero suppression */}
+            <div>
+              <Label className="text-[10px] text-[#4a6f94]">Zero Suppression</Label>
+              <Select
+                value={drillFmt.zeroSuppression || 'none'}
+                onValueChange={(v) => {
+                  updatePanelConfig({
+                    drillFormat: { ...drillFmt, zeroSuppression: v as 'none' | 'leading' | 'trailing', preset: 'custom' }
+                  })
+                }}
+              >
+                <SelectTrigger className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-[#0a1e38] border-[#1a3a5c]">
+                  <SelectItem value="none">None (NO)</SelectItem>
+                  <SelectItem value="leading">Leading (LZ)</SelectItem>
+                  <SelectItem value="trailing">Trailing (TZ)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          {/* CAM compatibility — only matters for leading/trailing suppression;
+              'none' is unambiguous fixed-width in both conventions. */}
+          {drillFmt.zeroSuppression !== 'none' && (
+            <div className="mt-2">
+              <Label className="text-[10px] text-[#4a6f94]">Zero-Suppression Reader</Label>
+              <div className="grid grid-cols-2 gap-1 mt-1">
+                <Button
+                  size="sm"
+                  variant={drillFmt.camCompatibility === 'cam350' ? 'default' : 'outline'}
+                  onClick={() => updatePanelConfig({ drillFormat: { ...drillFmt, camCompatibility: 'cam350' as DrillCamCompatibility } })}
+                  className={`h-7 px-2 text-xs leading-tight ${drillFmt.camCompatibility !== 'cam350' ? 'border-[#1a3a5c] text-[#94b8d4] hover:text-white hover:bg-[#0f2848]' : 'bg-[#0ea5e9] text-white'}`}
+                  title="CAM350 reads LZ/TZ backwards from the Excellon spec — this matches that quirk"
+                >
+                  CAM350
+                </Button>
+                <Button
+                  size="sm"
+                  variant={drillFmt.camCompatibility === 'standard' ? 'default' : 'outline'}
+                  onClick={() => updatePanelConfig({ drillFormat: { ...drillFmt, camCompatibility: 'standard' as DrillCamCompatibility } })}
+                  className={`h-7 px-2 text-xs leading-tight ${drillFmt.camCompatibility !== 'standard' ? 'border-[#1a3a5c] text-[#94b8d4] hover:text-white hover:bg-[#0f2848]' : 'bg-[#0ea5e9] text-white'}`}
+                  title="Standard Excellon LZ/TZ meaning — for tracespace.io, KiCad, and most other CAM tools"
+                >
+                  Standard
+                </Button>
+              </div>
+              <p className="text-[10px] text-[#4a6f94] mt-1">
+                {drillFmt.camCompatibility === 'standard'
+                  ? 'Matches tracespace.io, KiCad, and most non-CAM350 Excellon readers.'
+                  : 'Matches CAM350’s own (spec-inverted) LZ/TZ interpretation. Wrong choice here shifts every drill coordinate’s decimal point — holes land off-pad, too small or too big.'}
+              </p>
+            </div>
+          )}
+
+          {/* Drill digit auto-widen warning */}
+          {drillDigitsWillWiden && panelResult && (
+            <div className="mt-2 flex items-start gap-1.5 px-2 py-1.5 rounded-md bg-yellow-950/40 border border-yellow-800/40">
+              <AlertTriangle className="w-3 h-3 text-yellow-500 mt-0.5 flex-shrink-0" />
+              <div className="text-[10px] text-yellow-300">
+                Panel needs ≥{drillNeededIntDigits} integer digits at this unit/size — export will widen from {drillFmt.integerDigits} to {drillNeededIntDigits} automatically.
+              </div>
+            </div>
+          )}
+
+          {/* Format summary */}
+          <div className="mt-2 bg-[#061628]/80 rounded-md p-2 text-[10px] font-mono text-[#4a6f94] space-y-0.5">
+            <div className="text-[#94b8d4] font-medium">Drill Format Preview</div>
+            <div>FORMAT: {drillDigitsWillWiden ? drillNeededIntDigits : drillFmt.integerDigits}:{drillFmt.decimalDigits ?? 4}</div>
+            <div>UNIT: {drillFmt.unit === 'mm' ? 'METRIC' : 'ENGLISH'}</div>
+            <div>ZERO: {drillFmt.zeroSuppression === 'none' ? 'NONE' : drillFmt.zeroSuppression === 'leading' ? 'LZ' : 'TZ'}</div>
+            {drillFmt.zeroSuppression !== 'none' && (
+              <div>READER: {drillFmt.camCompatibility === 'standard' ? 'STANDARD' : 'CAM350'}</div>
+            )}
           </div>
         </div>
 

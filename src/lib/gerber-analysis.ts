@@ -43,6 +43,21 @@ export function detectLayerType(fileName: string): LayerType {
   if (baseName === 'PASTETOP' || baseName === 'PASTEBOT') return 'paste'
   if (baseName === 'DRILLDRAWING') return 'fab'
 
+  // Paste MUST be checked before the mask heuristic below — EasyEDA/JLCPCB
+  // exports name the paste layer "TopPasteMaskLayer"/"BottomPasteMaskLayer"
+  // (confirmed on a real customer export), and that name contains "MASK" as
+  // a substring. If mask were checked first, its generic (TOP/BOT + MASK)
+  // test would catch the paste file too, misclassifying it as 'mask'. In
+  // single-design export this is merely a cosmetic filename mixup, but in
+  // multi-design panel export the merge groups by (type, side): both the
+  // real soldermask layer AND the misclassified paste layer for the same
+  // design then collide into the SAME "Top_Mask"/"Bottom_Mask" merge group,
+  // and whichever is processed second silently overwrites the other in
+  // `group.perDesign` — one of the two is dropped from the export entirely,
+  // with only a console.warn as a trace. This is the confirmed root cause of
+  // a real "masking dcodes missing" report on a GSM_GER-style export.
+  if (upper.includes('GTP') || upper.includes('GBP') || upper.includes('PASTE')) return 'paste'
+
   // Standard KiCad/Altium naming. MASK/SILK also match their common CAM
   // abbreviations MSK/SLK (e.g. PentaLogix ViewMaster's "_MSK-TOP.art" /
   // "_SLK-BOT.art") — without this, a TOP/BOT-plus-abbreviation filename with
@@ -57,7 +72,6 @@ export function detectLayerType(fileName: string): LayerType {
   if (upper.includes('GTO') || (upper.includes('TOP') && (upper.includes('SILK') || upper.includes('SLK'))) || upper.endsWith('.GTO') || upper.includes('SST') || upper.includes('SSB')) return 'silk'
   if (upper.includes('GBO') || (upper.includes('BOT') && (upper.includes('SILK') || upper.includes('SLK'))) || upper.endsWith('.GBO')) return 'silk'
   if (upper.includes('GKO') || upper.includes('OUTLINE') || upper.includes('BOARD') || upper.endsWith('.GKO') || upper.includes('EDGE') || upper.includes('PROFILE') || upper.includes('CONTOUR') || upper.includes('DIMENSION') || upper === 'MILL' || upper === 'MILLING' || upper === 'ROUTE' || upper.endsWith('.GM1') || upper.endsWith('.GML') || baseName === 'GM1' || baseName === 'GML') return 'outline'
-  if (upper.includes('GTP') || upper.includes('GBP') || upper.includes('PASTE')) return 'paste'
 
   // Catch-all checks for bare BOT/BOTTOM/TOP copper layers (after mask/silk/etc have been checked)
   if (upper.includes('BOT') || upper.includes('BOTTOM') || baseName === 'BOT' || baseName === 'BOTTOM' || nameNoExt === 'BOT') return 'copper'

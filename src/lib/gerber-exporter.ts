@@ -229,18 +229,17 @@ export async function exportPanelizedGerbers(
     .filter(l => l.type === 'drill')
     .filter(l => panel.designs.length === 0 || panel.placements.some(p => p.designId === l.designId))
   if (drillLayers.length > 0 || config.enableToolingHoles) {
-    // Pass the Gerber output unit so drill format auto-syncs to prevent CAM350 scale mismatch
     // Mouse bites are folded in only when the user asked for it; by default they
     // go to their own file so this output stays byte-identical to before.
     const extraHoles =
       routing && routing.config.mouseBiteInMainDrill ? collectMouseBiteHoles(routing) : undefined
-    const drillContent = generatePanelizedDrill(drillLayers, panel, config, globalBaseOffset, fmt.unit, extraHoles, baseOffsetByDesign)
+    const drillContent = generatePanelizedDrill(drillLayers, panel, config, globalBaseOffset, extraHoles, baseOffsetByDesign)
     folder.file(`${partNumber}_Drill.drl`, drillContent)
   }
 
   // Generate PINN.drl file with only tooling and reference holes
   if (config.enableToolingHoles) {
-    const pinnContent = generatePINNDrill(panel, config, fmt.unit)
+    const pinnContent = generatePINNDrill(panel, config)
     folder.file(`${partNumber}_PINN.drl`, pinnContent)
   }
 
@@ -339,11 +338,11 @@ function writeRouteFiles(
   if (!routing || routing.paths.length === 0) return
 
   folder.file(`${partNumber}_Route.gerber`, generateRouteGerber(routing, fmt))
-  folder.file(`${partNumber}_Route.rou`, generateRoutFile(routing, config.drillFormat, panel, fmt.unit))
+  folder.file(`${partNumber}_Route.rou`, generateRoutFile(routing, config.drillFormat, panel))
 
   // Own file unless the user folded the bites into the main drill program.
   if (!routing.config.mouseBiteInMainDrill) {
-    const bites = generateMouseBiteDrill(routing, config.drillFormat, panel, fmt.unit)
+    const bites = generateMouseBiteDrill(routing, config.drillFormat, panel)
     if (bites) folder.file(`${partNumber}_MouseBites.drl`, bites)
   }
 }
@@ -705,10 +704,9 @@ function generateReadme(
  */
 export function generatePINNDrill(
   panel: PanelResult,
-  config: PanelConfig,
-  gerberUnit?: 'mm' | 'inches'
+  config: PanelConfig
 ): string {
-  const drillFmt = resolveExportDrillFormat(config.drillFormat, panel, gerberUnit, 'PINN Export')
+  const drillFmt = resolveExportDrillFormat(config.drillFormat, panel, 'PINN Export')
 
   const lines: string[] = []
 
@@ -777,7 +775,6 @@ export function generatePanelizedDrill(
   panel: PanelResult,
   config: PanelConfig,
   globalBaseOffset?: BaseOffset,
-  gerberUnit?: 'mm' | 'inches',
   /** Mouse-bite perforations, only when the user opted to fold them in here
    *  rather than into their own file. Omitted by default, so this function's
    *  output stays byte-identical to before routing existed. */
@@ -791,7 +788,7 @@ export function generatePanelizedDrill(
    *  additive. */
   perDesignBaseOffset?: Map<string, BaseOffset>
 ): string {
-  const drillFmt = resolveExportDrillFormat(config.drillFormat, panel, gerberUnit, 'Export')
+  const drillFmt = resolveExportDrillFormat(config.drillFormat, panel, 'Export')
 
   const lines: string[] = []
 
@@ -966,13 +963,11 @@ export function generateMetaPanelDrill(
   holeGroups: { diameterMm: number; holes: { x: number; y: number }[] }[],
   slotGroups: { diameterMm: number; slots: { start: { x: number; y: number }; end: { x: number; y: number } }[] }[],
   drillFormat: DrillFormatConfig,
-  panelArray: PanelArrayResult,
-  gerberUnit?: 'mm' | 'inches'
+  panelArray: PanelArrayResult
 ): string {
   const drillFmt = resolveExportDrillFormat(
     drillFormat,
     { panelWidth: panelArray.sheetWidthMm, panelHeight: panelArray.sheetHeightMm },
-    gerberUnit,
     'Meta-Panel Export'
   )
 

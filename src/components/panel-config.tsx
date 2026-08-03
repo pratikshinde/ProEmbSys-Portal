@@ -8,10 +8,8 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Separator } from '@/components/ui/separator'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
-import { Grid3x3, Crosshair, LayoutGrid, Settings2, RotateCcw, FileDown, Wrench, Play } from 'lucide-react'
-import { DrillFormatPreset, DRILL_FORMAT_PRESETS } from '@/lib/panelization-engine'
+import { Grid3x3, Crosshair, LayoutGrid, Settings2, RotateCcw, FileDown, Play } from 'lucide-react'
 import PanelTemplatePicker from './panel-template-picker'
 
 export default function PanelConfigPanel() {
@@ -122,7 +120,7 @@ export default function PanelConfigPanel() {
               Holes &amp; Fids
             </TabsTrigger>
             <TabsTrigger value="drill" className="text-[11px] py-1 text-[#94b8d4] data-[state=active]:bg-[#0f2848] data-[state=active]:text-[#0ea5e9]">
-              Drill &amp; Marks
+              Corner Marks
             </TabsTrigger>
           </TabsList>
 
@@ -603,174 +601,9 @@ export default function PanelConfigPanel() {
           </TabsContent>
 
           <TabsContent value="drill" className="space-y-4 pt-2">
-            {/* Drill output format */}
-            <div>
-              <Label className="text-xs text-[#94b8d4] mb-2 flex items-center gap-1.5">
-                <Wrench className="w-3 h-3 text-amber-400" />
-                Drill Output Format
-              </Label>
-
-              {/* Format preset selector */}
-              <div className="mb-2">
-                <Label className="text-[10px] text-[#4a6f94]">Format Preset</Label>
-                <Select
-                  value={panelConfig.drillFormat?.preset || 'excellon-2-4'}
-                  onValueChange={(v) => {
-                    const preset = v as DrillFormatPreset
-                    const p = DRILL_FORMAT_PRESETS[preset]
-                    if (p) {
-                      updatePanelConfig({
-                        drillFormat: {
-                          preset,
-                          integerDigits: p.integerDigits,
-                          decimalDigits: p.decimalDigits,
-                          unit: p.unit,
-                          zeroSuppression: p.zeroSuppression,
-                        }
-                      })
-                    }
-                  }}
-                >
-                  <SelectTrigger className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent className="bg-[#0a1e38] border-[#1a3a5c]">
-                    <SelectItem value="excellon-2-4">Excellon 2:4 (inch)</SelectItem>
-                    <SelectItem value="excellon-3-3">Excellon 3:3 (mm)</SelectItem>
-                    <SelectItem value="excellon-2-5">Excellon 2:5 (inch)</SelectItem>
-                    <SelectItem value="excellon-3-4">Excellon 3:4 (mm)</SelectItem>
-                    <SelectItem value="custom">Custom</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              {/* Customizable format details */}
-              <div className="grid grid-cols-2 gap-2">
-                {/* Integer digits */}
-                <div>
-                  <Label className="text-[10px] text-[#4a6f94]">Integer Digits</Label>
-                  <Select
-                    value={panelConfig.drillFormat?.integerDigits?.toString() || '2'}
-                    onValueChange={(v) => {
-                      const intD = parseInt(v)
-                      if (panelConfig.drillFormat) {
-                        updatePanelConfig({
-                          drillFormat: {
-                            ...panelConfig.drillFormat,
-                            integerDigits: intD,
-                            preset: 'custom',
-                          }
-                        })
-                      }
-                    }}
-                  >
-                    <SelectTrigger className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-[#0a1e38] border-[#1a3a5c]">
-                      <SelectItem value="2">2</SelectItem>
-                      <SelectItem value="3">3</SelectItem>
-                      <SelectItem value="4">4</SelectItem>
-                      <SelectItem value="5">5</SelectItem>
-                      <SelectItem value="6">6</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-
-                {/* Decimal digits */}
-                <div>
-                  <Label className="text-[10px] text-[#4a6f94]">Decimal Digits</Label>
-                  <Select
-                    value={panelConfig.drillFormat?.decimalDigits?.toString() || '4'}
-                    onValueChange={(v) => {
-                      const decD = parseInt(v)
-                      if (panelConfig.drillFormat) {
-                        updatePanelConfig({
-                          drillFormat: {
-                            ...panelConfig.drillFormat,
-                            decimalDigits: decD,
-                            preset: 'custom',
-                          }
-                        })
-                      }
-                    }}
-                  >
-                    <SelectTrigger className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-[#0a1e38] border-[#1a3a5c]">
-                      <SelectItem value="3">3 (0.001)</SelectItem>
-                      <SelectItem value="4">4 (0.0001)</SelectItem>
-                      <SelectItem value="5">5 (0.00001)</SelectItem>
-                      <SelectItem value="6">6 (0.000001)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-
-                {/* Unit */}
-                <div>
-                  <Label className="text-[10px] text-[#4a6f94]">Drill Units</Label>
-                  <Select
-                    value={panelConfig.drillFormat?.unit || 'inches'}
-                    onValueChange={(v) => {
-                      if (panelConfig.drillFormat) {
-                        updatePanelConfig({
-                          drillFormat: {
-                            ...panelConfig.drillFormat,
-                            unit: v as 'mm' | 'inches',
-                            preset: 'custom',
-                          }
-                        })
-                      }
-                    }}
-                  >
-                    <SelectTrigger className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-[#0a1e38] border-[#1a3a5c]">
-                      <SelectItem value="mm">Metric (mm)</SelectItem>
-                      <SelectItem value="inches">English (inch)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-
-                {/* Zero suppression */}
-                <div>
-                  <Label className="text-[10px] text-[#4a6f94]">Zero Suppression</Label>
-                  <Select
-                    value={panelConfig.drillFormat?.zeroSuppression || 'none'}
-                    onValueChange={(v) => {
-                      if (panelConfig.drillFormat) {
-                        updatePanelConfig({
-                          drillFormat: {
-                            ...panelConfig.drillFormat,
-                            zeroSuppression: v as 'none' | 'leading' | 'trailing',
-                            preset: 'custom',
-                          }
-                        })
-                      }
-                    }}
-                  >
-                    <SelectTrigger className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-[#0a1e38] border-[#1a3a5c]">
-                      <SelectItem value="none">None (NO)</SelectItem>
-                      <SelectItem value="leading">Leading (LZ)</SelectItem>
-                      <SelectItem value="trailing">Trailing (TZ)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-
-              {/* Format summary */}
-              <div className="mt-2 bg-[#061628]/80 rounded-md p-2 text-[10px] font-mono text-[#4a6f94] space-y-0.5">
-                <div className="text-[#94b8d4] font-medium">Drill Format Preview</div>
-                <div>FORMAT: {panelConfig.drillFormat?.integerDigits ?? 2}:{panelConfig.drillFormat?.decimalDigits ?? 4}</div>
-                <div>UNIT: {panelConfig.drillFormat?.unit === 'mm' ? 'METRIC' : 'ENGLISH'}</div>
-                <div>ZERO: {panelConfig.drillFormat?.zeroSuppression === 'none' ? 'NONE' : panelConfig.drillFormat?.zeroSuppression === 'leading' ? 'LZ' : 'TZ'}</div>
-              </div>
-            </div>
+            {/* Drill output format moved to the "Panel Information & Export"
+                card (Info & Export tab) — it's exported alongside the Gerber
+                output format now, so both can be set in one place. */}
 
             {/* L-Shape Marks */}
             <div className="bg-[#061628]/50 rounded-lg p-3 border border-[#1a3a5c]">

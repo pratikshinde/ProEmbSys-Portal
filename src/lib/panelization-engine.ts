@@ -172,12 +172,21 @@ export function formatCoordinate(valueMm: number, format: OutputFormat): string 
  */
 /**
  * WARNING — opposite convention to the parser. `DrillZeroSuppressionMode` in
- * gerber-parser.ts names *which zeros were removed* from the file. Here
- * 'leading' (LZ) strips TRAILING zeros and 'trailing' (TZ) strips LEADING
- * zeros, because CAM350 inverts the meaning of the LZ/TZ header keywords.
- * The two do not collide today: exported drills carry an explicit header, and
- * the drill we hand the viewer is normalized to explicit decimals. Do not
- * "unify" the two conventions without re-testing the output in CAM350.
+ * gerber-parser.ts names *which zeros were removed* from the file. Here,
+ * under the default `camCompatibility: 'cam350'`, 'leading' (LZ) strips
+ * TRAILING zeros and 'trailing' (TZ) strips LEADING zeros, because CAM350
+ * inverts the meaning of the LZ/TZ header keywords. The two do not collide
+ * today: exported drills carry an explicit header, and the drill we hand the
+ * viewer is normalized to explicit decimals. Do not "unify" the two
+ * conventions without re-testing the output in CAM350.
+ *
+ * `camCompatibility: 'standard'` writes the SAME header keyword but strips
+ * the zeros the keyword actually names per the Excellon spec (no inversion)
+ * — for readers that don't share CAM350's quirk (confirmed against
+ * tracespace.io). Picking the wrong mode for your destination tool doesn't
+ * drop or corrupt digits, it just reconstructs the decimal point in the
+ * wrong place — every coordinate comes out shifted, which reads as "drills
+ * don't line up with pads, holes are too small or too big."
  */
 export function formatDrillCoordinate(valueMm: number, drillFmt: DrillFormatConfig): string {
   // Convert mm to the target unit
@@ -206,21 +215,22 @@ export function formatDrillCoordinate(valueMm: number, drillFmt: DrillFormatConf
   if (drillFmt.zeroSuppression === 'none') {
     // No suppression: always output full fixed-width digits (safest for CAM350 compatibility)
     return isNegative ? `-${truncated}` : truncated
-  } else if (drillFmt.zeroSuppression === 'leading') {
-    // Leading zero suppression: strip leading zeros, keep at least one digit
-    // NOTE: CAM350 inverts LZ/TZ meaning! When user selects 'leading' (LZ),
-    // we write header as METRIC,LZ but we actually strip TRAILING zeros because
-    // CAM350 interprets LZ as "strip trailing zeros" (opposite of standard).
-    const stripped = truncated.replace(/0+$/, '') || '0'
-    return isNegative ? `-${stripped}` : stripped
-  } else {
-    // Trailing zero suppression: strip trailing zeros
-    // NOTE: CAM350 inverts LZ/TZ! When user selects 'trailing' (TZ),
-    // we write header as METRIC,TZ but we actually strip LEADING zeros because
-    // CAM350 interprets TZ as "strip leading zeros" (opposite of standard).
-    const stripped = truncated.replace(/^0+/, '') || '0'
-    return isNegative ? `-${stripped}` : stripped
   }
+
+  // Anything other than exactly 'standard' keeps today's verified CAM350
+  // inversion — including old/undefined `camCompatibility` values from a
+  // template saved before this field existed.
+  const cam350 = drillFmt.camCompatibility !== 'standard'
+  // True meaning of 'leading' (LZ) per the Excellon spec is "leading zeros
+  // were suppressed" — strip leading. CAM350 reads its own LZ keyword
+  // backwards, so under 'cam350' compatibility we strip trailing instead
+  // while still writing the LZ keyword the user selected.
+  const stripLeadingZeros = drillFmt.zeroSuppression === 'leading' ? !cam350 : cam350
+
+  const stripped = stripLeadingZeros
+    ? truncated.replace(/^0+/, '') || '0'
+    : truncated.replace(/0+$/, '') || '0'
+  return isNegative ? `-${stripped}` : stripped
 }
 
 /**
@@ -284,11 +294,24 @@ export function generateDrillFormatHeader(drillFmt: DrillFormatConfig): string[]
 
 /**
  * Resolve the drill format actually used for an export: a clone of the
- * configured format, with the unit synced to the Gerber output unit and the
- * integer digits widened if the panel is large enough to overflow them.
+ * configured format, with the integer digits widened if the panel is large
+ * enough to overflow them.
  *
  * Returns a **clone** — never mutates `config.drillFormat`, which is live store
  * state.
+ *
+ * ⚠ Deliberately does NOT sync the drill unit to the Gerber output unit.
+ * Mixed units between Gerber (commonly mm) and Excellon drill (commonly
+ * inch) is standard, well-supported practice — each file independently
+ * declares its own unit in its own header (`%MOMM%`/`%MOIN%` vs
+ * `METRIC`/`INCH`), and any correct reader scales off that declaration, not
+ * off an assumption that the two files must match. A prior version of this
+ * function force-synced the two "to keep CAM350 from displaying them at
+ * different scales" — confirmed wrong against a real KiCad reference export
+ * (4.6mm Gerber + 2:4 inch drill, its own default), which the sync silently
+ * overrode into an all-metric drill file the user never asked for. Removed
+ * rather than kept as an opt-in: forcing agreement between two files that
+ * are supposed to be independent isn't a feature worth a checkbox for.
  *
  * @param label Prefix for the console warnings, so each caller's log messages
  *   stay distinguishable (e.g. 'Export' vs 'PINN Export').
@@ -302,22 +325,9 @@ export function generateDrillFormatHeader(drillFmt: DrillFormatConfig): string[]
 export function resolveExportDrillFormat(
   drillFormat: DrillFormatConfig,
   panel: Pick<PanelResult, 'panelWidth' | 'panelHeight'>,
-  gerberUnit: 'mm' | 'inches' | undefined,
   label: string
 ): DrillFormatConfig {
   const drillFmt: DrillFormatConfig = { ...drillFormat }
-
-  // CRITICAL: Sync drill unit with the Gerber output unit.
-  // CAM350 may display Gerber and drill at different scales if units differ.
-  if (gerberUnit && drillFmt.unit !== gerberUnit) {
-    const prevUnit = drillFmt.unit
-    drillFmt.unit = gerberUnit
-    // When switching from inches to mm, increase decimal digits for adequate resolution
-    if (prevUnit === 'inches' && gerberUnit === 'mm') {
-      if (drillFmt.decimalDigits < 3) drillFmt.decimalDigits = 3
-    }
-    console.warn(`[${label}] Auto-synced drill unit from ${prevUnit} to ${gerberUnit} to match Gerber output`)
-  }
 
   // Auto-fix drill format: ensure integer digits are sufficient for panel dimensions.
   const maxCoord = Math.max(panel.panelWidth, panel.panelHeight)
@@ -507,6 +517,23 @@ export type DrillFormatPreset = 'excellon-2-4' | 'excellon-3-3' | 'excellon-2-5'
 /** Drill zero suppression mode */
 export type DrillZeroSuppression = 'none' | 'leading' | 'trailing'
 
+/**
+ * Which reader's LZ/TZ convention `formatDrillCoordinate` targets when
+ * `zeroSuppression` is 'leading' or 'trailing' (irrelevant for 'none', which
+ * is unambiguous fixed-width in both conventions).
+ *
+ * 'cam350' (default, matches every format this app has ever exported) keeps
+ * the CAM350-inverted behavior documented on `formatDrillCoordinate` —
+ * verified against real CAM350 output. 'standard' writes the same LZ/TZ
+ * header keyword but strips the zeros the keyword ACTUALLY names per the
+ * Excellon spec, for readers that don't share CAM350's inversion (confirmed:
+ * tracespace.io, and by extension most non-CAM350 Excellon parsers). Picking
+ * the wrong one for your destination tool doesn't corrupt content or drop
+ * digits — it just reconstructs every coordinate's decimal point in the
+ * wrong place, which reads as drills randomly offset from their pads.
+ */
+export type DrillCamCompatibility = 'cam350' | 'standard'
+
 /** Drill output format configuration — each field is independently configurable */
 export interface DrillFormatConfig {
   /** Format preset name (for quick selection) */
@@ -519,15 +546,17 @@ export interface DrillFormatConfig {
   unit: 'mm' | 'inches'
   /** Zero suppression mode: 'none' = always output full fixed-width digits (safest for CAM350) */
   zeroSuppression: DrillZeroSuppression
+  /** Which reader's LZ/TZ convention to target — see `DrillCamCompatibility`. */
+  camCompatibility: DrillCamCompatibility
 }
 
 /** Preset definitions — maps preset name to its format parameters */
 export const DRILL_FORMAT_PRESETS: Record<DrillFormatPreset, Omit<DrillFormatConfig, 'preset'>> = {
-  'excellon-2-4': { integerDigits: 2, decimalDigits: 4, unit: 'inches', zeroSuppression: 'none' },
-  'excellon-3-3': { integerDigits: 3, decimalDigits: 3, unit: 'mm', zeroSuppression: 'none' },
-  'excellon-2-5': { integerDigits: 2, decimalDigits: 5, unit: 'inches', zeroSuppression: 'none' },
-  'excellon-3-4': { integerDigits: 3, decimalDigits: 4, unit: 'mm', zeroSuppression: 'none' },
-  'custom': { integerDigits: 2, decimalDigits: 4, unit: 'inches', zeroSuppression: 'none' },
+  'excellon-2-4': { integerDigits: 2, decimalDigits: 4, unit: 'inches', zeroSuppression: 'none', camCompatibility: 'cam350' },
+  'excellon-3-3': { integerDigits: 3, decimalDigits: 3, unit: 'mm', zeroSuppression: 'none', camCompatibility: 'cam350' },
+  'excellon-2-5': { integerDigits: 2, decimalDigits: 5, unit: 'inches', zeroSuppression: 'none', camCompatibility: 'cam350' },
+  'excellon-3-4': { integerDigits: 3, decimalDigits: 4, unit: 'mm', zeroSuppression: 'none', camCompatibility: 'cam350' },
+  'custom': { integerDigits: 2, decimalDigits: 4, unit: 'inches', zeroSuppression: 'none', camCompatibility: 'cam350' },
 }
 
 export const DEFAULT_DRILL_FORMAT: DrillFormatConfig = {
@@ -536,6 +565,7 @@ export const DEFAULT_DRILL_FORMAT: DrillFormatConfig = {
   decimalDigits: 4,
   unit: 'inches',
   zeroSuppression: 'none',
+  camCompatibility: 'cam350',
 }
 
 export interface PanelConfig {

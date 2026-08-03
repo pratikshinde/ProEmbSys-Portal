@@ -459,6 +459,7 @@ function generateId(): string {
 function sameDrillFormat(a: Omit<DrillFormatConfig, 'preset'>, b: Omit<DrillFormatConfig, 'preset'>): boolean {
   return a.integerDigits === b.integerDigits && a.decimalDigits === b.decimalDigits
     && a.unit === b.unit && a.zeroSuppression === b.zeroSuppression
+    && a.camCompatibility === b.camCompatibility
 }
 
 /**
@@ -479,6 +480,7 @@ function drillFormatFromMeta(meta: DrillMeta): DrillFormatConfig {
     decimalDigits: meta.decimalDigits,
     unit: meta.unit,
     zeroSuppression,
+    camCompatibility: 'cam350',
   }
   const matchedPreset = (Object.keys(DRILL_FORMAT_PRESETS) as DrillFormatPreset[])
     .find(p => p !== 'custom' && sameDrillFormat(DRILL_FORMAT_PRESETS[p], format))
@@ -2479,7 +2481,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     const borderMarksGerber = generateBorderMarksGerber(array, panelArrayConfig, outputFormat)
     const drillContent = generateMetaPanelDrill(
-      tiledHoleGroups, tiledSlotGroups, panelConfig.drillFormat, array, outputFormat.unit
+      tiledHoleGroups, tiledSlotGroups, panelConfig.drillFormat, array
     )
 
     const markPaths = generateBorderMarkPaths(array)

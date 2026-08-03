@@ -104,6 +104,7 @@ const drillFormatSectionSchema = z.object({
   decimalDigits: z.number().int().nonnegative(),
   unit: z.enum(['mm', 'inches']),
   zeroSuppression: z.enum(['none', 'leading', 'trailing']),
+  camCompatibility: z.enum(['cam350', 'standard']),
 }).partial()
 
 const panelSectionSchema = z.object({
