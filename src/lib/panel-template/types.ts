@@ -198,6 +198,11 @@ const arraySectionSchema = z.object({
   markArmLengthMm: z.number().nonnegative(),
   markLineWidthMm: z.number().positive(),
   markCutDepthMm: z.number(),
+  rotatePanel90: z.boolean(),
+  manualCols: z.number().int().positive().nullable(),
+  manualRows: z.number().int().positive().nullable(),
+  materialCellWidthMm: z.number().positive().nullable(),
+  materialCellHeightMm: z.number().positive().nullable(),
 }).partial()
 
 export const panelTemplateSettingsSchema = z.object({

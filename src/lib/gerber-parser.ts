@@ -2641,6 +2641,38 @@ export function rotateGerberLayer(layer: GerberLayer, direction: 'left' | 'right
       if (ap.rotation !== undefined) {
         ap.rotation = direction === 'right' ? ap.rotation - 90 : ap.rotation + 90
       }
+    } else if (ap.shape === 'macro' && ap.macroName && ap.parameters && /RoundRect/i.test(ap.macroName)) {
+      // KiCad's RoundRect macro (confirmed on a real customer board: SMD IC
+      // pads went "merged and malformed" after rotating a layer in the
+      // Layers tab) parameterizes its 4 corners directly as $2,$3 / $4,$5 /
+      // $6,$7 / $8,$9 (x,y pairs), not a width/height + rotation angle like
+      // the built-in shapes above — every primitive in the %AM body (the
+      // box polygon, the 4 corner circles, the 4 edge vector-lines)
+      // references only these corner coordinates, so rotating just the 4
+      // pairs rigidly rotates the whole rendered pad. $1 (rounding radius)
+      // is rotation-invariant and untouched; a trailing $10 some KiCad
+      // versions emit is unreferenced by the macro body (confirmed against
+      // this file's own %AM block) and left alone too.
+      //
+      // This does NOT generalize to other macro names — this codebase has
+      // no way to know an arbitrary macro's own coordinate-parameter layout
+      // without interpreting its %AM body, so anything else still falls
+      // through unrotated (a real, documented gap — see CLAUDE.md's
+      // `rotationBlockedReason` note). RoundRect is by far the dominant
+      // real-world case: every KiCad SMD pad with rounded corners.
+      const corners: [string, string][] = [['$2', '$3'], ['$4', '$5'], ['$6', '$7'], ['$8', '$9']]
+      for (const [xk, yk] of corners) {
+        const px = ap.parameters[xk]
+        const py = ap.parameters[yk]
+        if (px === undefined || py === undefined) continue
+        if (direction === 'right') {
+          ap.parameters[xk] = py
+          ap.parameters[yk] = -px
+        } else {
+          ap.parameters[xk] = -py
+          ap.parameters[yk] = px
+        }
+      }
     }
   }
 

@@ -26,6 +26,8 @@ import {
   generateBorderMarksGerber,
   tileHolesAcrossArray,
   tileSlotsAcrossArray,
+  rotateHoleGroupsForArray,
+  rotateSlotGroupsForArray,
   type PanelArrayConfig,
   type PanelArrayResult,
 } from './panel-array'
@@ -2474,8 +2476,21 @@ export const useAppStore = create<AppState>((set, get) => ({
       .sort(([a], [b]) => a - b)
       .map(([diameterMm, holes]) => ({ diameterMm, holes }))
 
-    const tiledHoleGroups = tileHolesAcrossArray(mergedHoleGroups, array)
-    const tiledSlotGroups = tileSlotsAcrossArray(componentSlotGroups, array)
+    // When the panel is placed rotated on the sheet, every hole/slot's LOCAL
+    // coordinate must rotate too — computePanelArray only swapped the cell
+    // FOOTPRINT used for fitting/positioning, not the point data itself.
+    // Must happen before tiling: rotation is defined in the panel's own
+    // un-rotated frame (panelResult.panelHeight), tiling then translates the
+    // already-rotated points by each cell's offset.
+    const rotatedHoleGroups = panelArrayConfig.rotatePanel90
+      ? rotateHoleGroupsForArray(mergedHoleGroups, panelResult.panelHeight)
+      : mergedHoleGroups
+    const rotatedSlotGroups = panelArrayConfig.rotatePanel90
+      ? rotateSlotGroupsForArray(componentSlotGroups, panelResult.panelHeight)
+      : componentSlotGroups
+
+    const tiledHoleGroups = tileHolesAcrossArray(rotatedHoleGroups, array)
+    const tiledSlotGroups = tileSlotsAcrossArray(rotatedSlotGroups, array)
 
     const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
 

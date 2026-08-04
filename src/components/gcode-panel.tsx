@@ -47,6 +47,7 @@ export default function GcodePanel() {
 
   const ctx = gcodeContext
   const canGenerate = !!routingResult && routingResult.paths.length > 0
+  const hasMaterialCell = !!panelArrayConfig.materialCellWidthMm && !!panelArrayConfig.materialCellHeightMm
 
   const handleDownload = async () => {
     if (!gcodeFiles || gcodeFiles.length === 0) return
@@ -373,7 +374,7 @@ export default function GcodePanel() {
           <>
             <Separator className="bg-[#1a3a5c]" />
             <div>
-              <Label className={sectionLabelCls}>CNC &amp; Material</Label>
+              <Label className={sectionLabelCls}>CNC{!hasMaterialCell && ' & Material'}</Label>
               <div className="mt-2 grid grid-cols-2 gap-2">
                 <div>
                   <Label className={fieldLabelCls}>CNC Max X (mm)</Label>
@@ -393,64 +394,141 @@ export default function GcodePanel() {
                     className={numInputCls}
                   />
                 </div>
-                <div>
-                  <Label className={fieldLabelCls}>Material X (mm)</Label>
-                  <Input
-                    type="number" step={10}
-                    value={panelArrayConfig.materialXmm}
-                    onChange={e => updatePanelArrayConfig({ materialXmm: parseFloat(e.target.value) || 0 })}
-                    className={numInputCls}
-                  />
-                </div>
-                <div>
-                  <Label className={fieldLabelCls}>Material Y (mm)</Label>
-                  <Input
-                    type="number" step={10}
-                    value={panelArrayConfig.materialYmm}
-                    onChange={e => updatePanelArrayConfig({ materialYmm: parseFloat(e.target.value) || 0 })}
-                    className={numInputCls}
-                  />
-                </div>
+                {!hasMaterialCell && (
+                  <>
+                    <div>
+                      <Label className={fieldLabelCls}>Material X (mm)</Label>
+                      <Input
+                        type="number" step={10}
+                        value={panelArrayConfig.materialXmm}
+                        onChange={e => updatePanelArrayConfig({ materialXmm: parseFloat(e.target.value) || 0 })}
+                        className={numInputCls}
+                      />
+                    </div>
+                    <div>
+                      <Label className={fieldLabelCls}>Material Y (mm)</Label>
+                      <Input
+                        type="number" step={10}
+                        value={panelArrayConfig.materialYmm}
+                        onChange={e => updatePanelArrayConfig({ materialYmm: parseFloat(e.target.value) || 0 })}
+                        className={numInputCls}
+                      />
+                    </div>
+                  </>
+                )}
               </div>
               <p className="text-[10px] text-[#4a6f94] mt-1.5">
-                The array fits within whichever is smaller per axis — the CNC&apos;s own travel limit
-                or the material sheet on hand.
+                {hasMaterialCell
+                  ? 'A material cell IS your material — one physical block per panel — so only the CNC’s own travel limit bounds the array.'
+                  : 'The array fits within whichever is smaller per axis — the CNC’s own travel limit or the material sheet on hand.'}
               </p>
             </div>
 
             <Separator className="bg-[#1a3a5c]" />
 
             <div>
-              <Label className={sectionLabelCls}>Layout</Label>
+              <Label className={sectionLabelCls}>Orientation &amp; Manual Layout</Label>
+              <div className="mt-2 flex items-center justify-between">
+                <div>
+                  <Label className={fieldLabelCls}>Rotate panel 90° on sheet</Label>
+                  <p className="text-[9px] text-[#4a6f94] mt-0.5 max-w-[220px]">
+                    Swaps the panel&apos;s width/height for fitting and rotates every hole,
+                    slot, and mark to match — use when the panel fits the sheet sideways
+                    but not upright.
+                  </p>
+                </div>
+                <Switch
+                  checked={panelArrayConfig.rotatePanel90}
+                  onCheckedChange={v => updatePanelArrayConfig({ rotatePanel90: v })}
+                  className="scale-75"
+                />
+              </div>
               <div className="mt-2 grid grid-cols-2 gap-2">
                 <div>
-                  <Label className={fieldLabelCls}>Gap between panels X (mm)</Label>
+                  <Label className={fieldLabelCls}>Manual columns (blank = auto)</Label>
                   <Input
-                    type="number" step={0.5}
-                    value={panelArrayConfig.arrayGapXmm}
-                    onChange={e => updatePanelArrayConfig({ arrayGapXmm: parseFloat(e.target.value) || 0 })}
+                    type="number" min={0} step={1}
+                    value={panelArrayConfig.manualCols ?? ''}
+                    onChange={e => {
+                      const v = e.target.value.trim()
+                      updatePanelArrayConfig({ manualCols: v === '' ? null : Math.max(0, parseInt(v, 10) || 0) })
+                    }}
+                    placeholder="Auto"
                     className={numInputCls}
                   />
                 </div>
                 <div>
-                  <Label className={fieldLabelCls}>Gap between panels Y (mm)</Label>
+                  <Label className={fieldLabelCls}>Manual rows (blank = auto)</Label>
                   <Input
-                    type="number" step={0.5}
-                    value={panelArrayConfig.arrayGapYmm}
-                    onChange={e => updatePanelArrayConfig({ arrayGapYmm: parseFloat(e.target.value) || 0 })}
-                    className={numInputCls}
-                  />
-                </div>
-                <div>
-                  <Label className={fieldLabelCls}>Sheet margin (mm)</Label>
-                  <Input
-                    type="number" step={0.5}
-                    value={panelArrayConfig.sheetMarginMm}
-                    onChange={e => updatePanelArrayConfig({ sheetMarginMm: parseFloat(e.target.value) || 0 })}
+                    type="number" min={0} step={1}
+                    value={panelArrayConfig.manualRows ?? ''}
+                    onChange={e => {
+                      const v = e.target.value.trim()
+                      updatePanelArrayConfig({ manualRows: v === '' ? null : Math.max(0, parseInt(v, 10) || 0) })
+                    }}
+                    placeholder="Auto"
                     className={numInputCls}
                   />
                 </div>
               </div>
+              <p className="text-[10px] text-[#4a6f94] mt-1.5">
+                Both fields must be set (and &gt; 0) to force an exact layout — leave either
+                blank to auto-fit from CNC/material bounds as usual. A forced layout that
+                exceeds those bounds still generates (it&apos;s your explicit call), but shows
+                a warning below rather than silently producing scrap tool paths.
+              </p>
+            </div>
+
+            <Separator className="bg-[#1a3a5c]" />
+
+            <div>
+              <Label className={sectionLabelCls}>Material Cell Size</Label>
+              <p className="text-[10px] text-[#4a6f94] mt-1 mb-2">
+                The size of the physical block (MDF backing, pre-cut blank, etc.) that holds
+                ONE panel copy — e.g. a 100×191mm panel on a 115×200mm block. The panel is
+                centered inside it automatically; blocks tile edge-to-edge with no extra gap
+                needed, since the spacing between panels is already the two blocks&apos; own
+                margins combined. Leave both blank to tile the panel&apos;s own raw size directly.
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <Label className={fieldLabelCls}>Material cell width (mm)</Label>
+                  <Input
+                    type="number" min={0} step={1}
+                    value={panelArrayConfig.materialCellWidthMm ?? ''}
+                    onChange={e => {
+                      const v = e.target.value.trim()
+                      updatePanelArrayConfig({ materialCellWidthMm: v === '' ? null : parseFloat(v) || null })
+                    }}
+                    placeholder="Panel width"
+                    className={numInputCls}
+                  />
+                </div>
+                <div>
+                  <Label className={fieldLabelCls}>Material cell height (mm)</Label>
+                  <Input
+                    type="number" min={0} step={1}
+                    value={panelArrayConfig.materialCellHeightMm ?? ''}
+                    onChange={e => {
+                      const v = e.target.value.trim()
+                      updatePanelArrayConfig({ materialCellHeightMm: v === '' ? null : parseFloat(v) || null })
+                    }}
+                    placeholder="Panel height"
+                    className={numInputCls}
+                  />
+                </div>
+              </div>
+              {panelResult && panelArrayConfig.materialCellWidthMm && panelArrayConfig.materialCellHeightMm && (() => {
+                const effW = panelArrayConfig.rotatePanel90 ? panelResult.panelHeight : panelResult.panelWidth
+                const effH = panelArrayConfig.rotatePanel90 ? panelResult.panelWidth : panelResult.panelHeight
+                const marginX = Math.max(0, (panelArrayConfig.materialCellWidthMm - effW) / 2)
+                const marginY = Math.max(0, (panelArrayConfig.materialCellHeightMm - effH) / 2)
+                return (
+                  <p className="text-[10px] text-[#4a6f94] mt-1.5">
+                    Panel centered with {marginX.toFixed(2)}mm / {marginY.toFixed(2)}mm margin per side on X/Y.
+                  </p>
+                )
+              })()}
             </div>
 
             <Separator className="bg-[#1a3a5c]" />
@@ -525,9 +603,23 @@ export default function GcodePanel() {
 
             {panelArrayResult && (
               <div className="bg-[#061628]/80 rounded-md p-2 text-[10px] font-mono text-[#94b8d4] space-y-0.5">
-                <div>Layout: {panelArrayResult.cols} × {panelArrayResult.rows} = {panelArrayResult.totalPanels} panels</div>
+                <div>Layout: {panelArrayResult.cols} × {panelArrayResult.rows} = {panelArrayResult.totalPanels} panels{panelArrayConfig.rotatePanel90 ? ' (rotated 90°)' : ''}</div>
+                <div>Cell footprint: {panelArrayResult.cellWidthMm.toFixed(1)} × {panelArrayResult.cellHeightMm.toFixed(1)}mm</div>
                 <div>Sheet size: {panelArrayResult.sheetWidthMm.toFixed(1)} × {panelArrayResult.sheetHeightMm.toFixed(1)}mm</div>
                 <div>Mark arm (effective): {panelArrayResult.effectiveMarkArmLengthMm.toFixed(2)}mm</div>
+              </div>
+            )}
+
+            {panelArrayResult?.exceedsBounds && (
+              <div className="rounded-md p-2 border bg-yellow-950/40 border-yellow-800/40">
+                <div className="flex items-start gap-1.5">
+                  <AlertTriangle className="w-3 h-3 mt-0.5 text-yellow-500 shrink-0" />
+                  <div className="text-[10px] text-yellow-300 leading-snug">
+                    This manual layout&apos;s sheet ({panelArrayResult.sheetWidthMm.toFixed(1)}×{panelArrayResult.sheetHeightMm.toFixed(1)}mm)
+                    exceeds the CNC/material bound. Generated as requested, but confirm this
+                    actually fits your setup before cutting.
+                  </div>
+                </div>
               </div>
             )}
 

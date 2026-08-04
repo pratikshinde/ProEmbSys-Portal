@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import GerberViewer from './gerber-viewer';
+import ArrayLayoutCanvas from './array-layout-canvas';
 import LayerPanel from './layer-panel';
 import DesignsPanel from './designs-panel';
 import PanelConfigPanel from './panel-config';
@@ -1960,9 +1961,12 @@ function PanelizationPage() {
           </aside>
         )}
 
-        {/* Canvas area */}
+        {/* Canvas area — the G-Code tab swaps the usual Gerber/panel viewer
+            for a CNC-bed + array-cell placement preview, since the board
+            artwork isn't the useful thing to look at while configuring the
+            Multi-Panel Array. */}
         <main style={{ flex:1, position:"relative", minHeight:0 }}>
-          <GerberViewer />
+          {activeTab === 'gcode' ? <ArrayLayoutCanvas /> : <GerberViewer />}
         </main>
       </div>
     </div>
