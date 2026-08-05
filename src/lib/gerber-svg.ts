@@ -11,6 +11,7 @@ import * as Comlink from 'comlink'
 import type { GerberWorkerApi } from '@/workers/gerber-worker'
 import { normalizeGerberMacroPrimitives, scalePlotTreeToMm, scaleBoardShapeToMm } from './gerber-preprocess'
 import type { CopperSpacingResult } from './dfm/types'
+import type { StencilApertureOutput } from '@/workers/gerber-worker'
 import { boardShapeCoversContent, boardShapeToContour } from './board-contour'
 import type { BoardContour } from './routing/types'
 
@@ -140,6 +141,34 @@ export async function checkCopperSpacing(input: {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     console.warn('checkCopperSpacing worker call failed:', message)
+    return { ...fallback, error: message }
+  }
+}
+
+/**
+ * Paste-aperture outlines for one layer, computed in the worker, for the
+ * stencil DXF export. Same failure-degrades-to-error contract as
+ * checkCopperSpacing — a missing/broken worker never throws.
+ */
+export async function extractStencilApertures(input: {
+  layerName: string
+  contents: string
+  reductionPct: number
+  maxPrimitives?: number
+}): Promise<StencilApertureOutput> {
+  const fallback: StencilApertureOutput = {
+    layerName: input.layerName,
+    apertures: [],
+    skippedNonFlashCount: 0,
+    truncated: false,
+  }
+  const worker = getWorker()
+  if (!worker) return { ...fallback, error: 'Worker unavailable (server-side render?)' }
+  try {
+    return (await worker.extractStencilApertures(input)) as StencilApertureOutput
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.warn('extractStencilApertures worker call failed:', message)
     return { ...fallback, error: message }
   }
 }

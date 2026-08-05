@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import GerberViewer from './gerber-viewer';
 import ArrayLayoutCanvas from './array-layout-canvas';
+import StencilPreviewCanvas from './stencil-preview-canvas';
 import LayerPanel from './layer-panel';
 import DesignsPanel from './designs-panel';
 import PanelConfigPanel from './panel-config';
@@ -10,8 +11,9 @@ import ExportPanel from './export-panel';
 import DfmPanel from './dfm-panel';
 import RoutingPanel from './routing-panel';
 import GcodePanel from './gcode-panel';
+import StencilPanel from './stencil-panel';
 import { Button } from './ui/button';
-import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck, Scissors, Terminal, Boxes, Square } from 'lucide-react';
+import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck, Scissors, Terminal, Boxes, Square, Stamp } from 'lucide-react';
 import { useAppStore } from '../lib/store';
 import JSZip from 'jszip';
 import { analyzeGerberSet, GerberQuoteAnalysis } from '../lib/gerber-analysis';
@@ -1871,6 +1873,7 @@ function PanelizationPage() {
             { key: 'panel' as const, icon: LayoutGrid, label: 'Panel Config' },
             { key: 'routing' as const, icon: Scissors, label: 'Routing' },
             { key: 'gcode' as const, icon: Terminal, label: 'G-Code' },
+            { key: 'stencil' as const, icon: Stamp, label: 'Stencil' },
             { key: 'export' as const, icon: Download, label: 'Info & Export' },
           ].filter(t => camMode === 'multi' || t.key !== 'designs').map(({ key, icon: Icon, label }) => (
             <button
@@ -1947,6 +1950,7 @@ function PanelizationPage() {
                 {activeTab === 'panel' && <PanelConfigPanel />}
                 {activeTab === 'routing' && <RoutingPanel />}
                 {activeTab === 'gcode' && <GcodePanel />}
+                {activeTab === 'stencil' && <StencilPanel />}
                 {activeTab === 'export' && <ExportPanel />}
               </div>
             </div>
@@ -1966,7 +1970,7 @@ function PanelizationPage() {
             artwork isn't the useful thing to look at while configuring the
             Multi-Panel Array. */}
         <main style={{ flex:1, position:"relative", minHeight:0 }}>
-          {activeTab === 'gcode' ? <ArrayLayoutCanvas /> : <GerberViewer />}
+          {activeTab === 'gcode' ? <ArrayLayoutCanvas /> : activeTab === 'stencil' ? <StencilPreviewCanvas /> : <GerberViewer />}
         </main>
       </div>
     </div>

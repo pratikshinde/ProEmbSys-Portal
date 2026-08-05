@@ -493,6 +493,49 @@ export async function exportGcodeFiles(
 }
 
 /**
+ * Stencil-only ZIP — DXF paste apertures + scribe outline for laser-cutting
+ * a solder-paste stencil, downloadable independently of the main panelized-
+ * Gerber export. Mirrors exportRoutingFiles/exportGcodeFiles/
+ * exportMetaPanelFiles's identical shape.
+ */
+export async function exportStencilFiles(
+  stencilFiles: { filename: string; content: string }[],
+  info?: PanelInfo
+): Promise<void> {
+  const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
+  const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
+  const version = sanitizeVersionForFilename(info?.revision, 'v1')
+  const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
+
+  const zip = new JSZip()
+  const folder = zip.folder('stencil')
+  if (!folder) throw new Error('Failed to create ZIP folder')
+
+  for (const f of stencilFiles) folder.file(f.filename, f.content)
+
+  const lines: string[] = []
+  lines.push('=== SMD Solder-Paste Stencil (DXF) ===')
+  lines.push('')
+  lines.push(`Generated: ${new Date().toISOString()}`)
+  lines.push('')
+  lines.push('DXF R12 ASCII, millimetres, POLYLINE/VERTEX/SEQEND entities on layers')
+  lines.push('APERTURES and (if included) OUTLINE. Import directly into your laser-cutter')
+  lines.push('software (LightBurn, LaserGRBL, etc.) and cut from 0.15mm or 0.25mm Mylar/')
+  lines.push('polyester sheet.')
+  lines.push('')
+  lines.push('Rounded/macro pad shapes (e.g. KiCad RoundRect) are reproduced as the convex')
+  lines.push('hull of their resolved geometry — exact for any convex pad shape, which is the')
+  lines.push('overwhelming majority of real paste apertures.')
+  lines.push('')
+  lines.push('--- Files ---')
+  for (const f of stencilFiles) lines.push(f.filename)
+  folder.file('README.txt', lines.join('\n'))
+
+  const blob = await zip.generateAsync({ type: 'blob' })
+  saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_Stencil.zip`)
+}
+
+/**
  * The routing section of a README. Shared by both exports.
  *
  * The tool-center sentence is load-bearing: a fab opening the route layer has no

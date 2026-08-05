@@ -5,7 +5,7 @@
 import { create } from 'zustand'
 import JSZip from 'jszip'
 import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode, DrillMeta } from './gerber-parser'
-import { gerberToSvg, gerberRenderBoardView, checkCopperSpacing, BoardView, GerberSvgResult } from './gerber-svg'
+import { gerberToSvg, gerberRenderBoardView, checkCopperSpacing, extractStencilApertures, BoardView, GerberSvgResult } from './gerber-svg'
 import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
 import { runDfm } from './dfm/run-dfm'
 import type { DfmContext, DfmLayerInput, DfmReport, DfmRules } from './dfm/types'
@@ -32,20 +32,23 @@ import {
   type PanelArrayResult,
 } from './panel-array'
 import type { PanelTemplateSection, ResolvedPanelTemplateSettings } from './panel-template/types'
+import { DEFAULT_STENCIL_CONFIG, type StencilConfig, type StencilFile, type StencilPreviewData } from './stencil-types'
+import { tileAperturesAcrossPlacements, translateRings, type Point as StencilPoint } from './stencil-geometry'
+import { serializeStencilDxf, type DxfStencilLayer } from './stencil-dxf'
 
 export type { LayerType, LayerSide }
 
 /** The CAM tool's sidebar tabs. Previously this union was spelled out inline on
  *  both `activeTab` and `setActiveTab`, which meant adding a tab required
  *  editing two places that could silently drift apart. */
-export type CamTab = 'layers' | 'designs' | 'dfm' | 'panel' | 'routing' | 'gcode' | 'export'
+export type CamTab = 'layers' | 'designs' | 'dfm' | 'panel' | 'routing' | 'gcode' | 'stencil' | 'export'
 
 /** Tabs whose canvas shows the whole *panel* rather than the single imported
  *  PCB. `gerber-viewer.tsx` gates SIX separate things on this (bounds, the
  *  panel-overlay memo, the route-overlay memo, the two `<use>`-repeat render
  *  paths, and the status readout) — they must all agree, so the membership
  *  test lives here rather than being re-spelled as an `||` chain at each site. */
-export const PANEL_VIEW_TABS: ReadonlySet<CamTab> = new Set<CamTab>(['panel', 'routing', 'gcode', 'export'])
+export const PANEL_VIEW_TABS: ReadonlySet<CamTab> = new Set<CamTab>(['panel', 'routing', 'gcode', 'stencil', 'export'])
 
 export function isPanelViewTab(tab: CamTab): boolean {
   return PANEL_VIEW_TABS.has(tab)
@@ -305,6 +308,28 @@ interface AppState {
   panelArrayFiles: PanelArrayFiles | null
   generatePanelArrayFilesAction: () => void
   clearPanelArrayFiles: () => void
+
+  // SMD paste-stencil DXF export (see src/lib/stencil-geometry.ts,
+  // stencil-dxf.ts). Independent of RoutingResult/GcodeFiles — only needs
+  // the imported paste/outline layers and (for whole-panel scope) a
+  // computed PanelResult.
+  stencilConfig: StencilConfig
+  /** Shallow merge — StencilConfig is deliberately FLAT, same discipline as
+   *  RoutingConfig/GcodeContext/PanelArrayConfig. */
+  updateStencilConfig: (updates: Partial<StencilConfig>) => void
+  resetStencilConfig: () => void
+  stencilFiles: StencilFile[] | null
+  /** Preview geometry (original + reduced aperture hulls, outline rings),
+   *  set alongside `stencilFiles` — kept separate the same way
+   *  `panelArrayResult` (geometry) is kept separate from `panelArrayFiles`
+   *  (serialized output), for the canvas preview to read without
+   *  re-parsing DXF text. */
+  stencilPreview: StencilPreviewData | null
+  /** True only while `generateStencilFilesAction` is awaiting the worker
+   *  calls / outline traces. */
+  stencilGenerating: boolean
+  generateStencilFilesAction: () => Promise<void>
+  clearStencilFiles: () => void
 
   // Panelization templates (src/lib/panel-template/) — reusable "shop policy
   // and machine facts" bundles across panelConfig/outputFormat/routingConfig/
@@ -898,6 +923,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       routingResult: null, routingStale: false, routingFocus: null,
       gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
+      stencilFiles: null, stencilPreview: null,
       packCandidates: null, selectedCandidateId: null, packInfeasible: [],
       // The Designs tab doesn't exist in single mode — don't strand the
       // user on a hidden tab.
@@ -948,6 +974,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       panelResult: result,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
+      stencilFiles: null, stencilPreview: null,
     })
   },
 
@@ -1182,6 +1209,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       dfmReport: null, dfmFocus: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
+      stencilFiles: null, stencilPreview: null,
       packCandidates: null, selectedCandidateId: null,
     })
   },
@@ -1298,6 +1326,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       layers: updatedLayers, panelResult: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
+      stencilFiles: null, stencilPreview: null,
       packCandidates: null, selectedCandidateId: null,
     })
     void get().rebuildBoardView()
@@ -1985,6 +2014,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const clearAll = {
         panelResult: null, routingResult: null, routingStale: false, routingFocus: null,
         gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null,
+        stencilFiles: null, stencilPreview: null,
       }
 
       const specs = buildPackItemSpecs(designs, layers)
@@ -2033,7 +2063,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // happened to see first.
     const designLayers = activeDesignId ? layers.filter(l => l.designId === activeDesignId) : layers
     if (designLayers.length === 0) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, packCandidates: null, selectedCandidateId: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, packCandidates: null, selectedCandidateId: null })
       return
     }
 
@@ -2045,7 +2075,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const geometry = resolveDesignGeometry(designLayers)
 
     if (!geometry) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, packCandidates: null, selectedCandidateId: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, packCandidates: null, selectedCandidateId: null })
       return
     }
 
@@ -2053,7 +2083,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const pcbHeight = geometry.heightMm
 
     if (pcbWidth <= 0 || pcbHeight <= 0) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, packCandidates: null, selectedCandidateId: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, packCandidates: null, selectedCandidateId: null })
       return
     }
 
@@ -2150,7 +2180,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // A fresh panel invalidates any existing routing plan outright: tool paths
     // are panel-absolute, so keeping them would let a .rou export carry the
     // PREVIOUS panel's coordinates — the worst failure this feature can produce.
-    set({ panelResult: result, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null })
+    set({ panelResult: result, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null })
   },
 
   // View state
@@ -2158,7 +2188,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setTargetUnit: (unit) => {
     // Layer geometry is about to be rescaled in place, so any planned routing
     // is measured against dimensions that no longer exist.
-    set({ targetUnit: unit, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null })
+    set({ targetUnit: unit, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null })
     // Convert all layers to new unit
     const { layers } = get()
     for (const layer of layers) {
@@ -2521,6 +2551,177 @@ export const useAppStore = create<AppState>((set, get) => ({
     })
   },
   clearPanelArrayFiles: () => set({ panelArrayResult: null, panelArrayFiles: null }),
+
+  // SMD paste-stencil DXF export
+  stencilConfig: { ...DEFAULT_STENCIL_CONFIG },
+  updateStencilConfig: (updates) =>
+    set(state => ({ stencilConfig: { ...state.stencilConfig, ...updates } })),
+  resetStencilConfig: () => set({ stencilConfig: { ...DEFAULT_STENCIL_CONFIG }, stencilFiles: null, stencilPreview: null }),
+  stencilFiles: null,
+  stencilPreview: null,
+  stencilGenerating: false,
+  generateStencilFilesAction: async () => {
+    const { layers, panelResult, stencilConfig, panelInfo, activeDesignId } = get()
+
+    const sides: ('top' | 'bottom')[] = [
+      ...(stencilConfig.includeTopPaste ? (['top'] as const) : []),
+      ...(stencilConfig.includeBottomPaste ? (['bottom'] as const) : []),
+    ]
+    if (sides.length === 0) {
+      set({ stencilFiles: null, stencilPreview: null })
+      return
+    }
+
+    // Whole-panel scope tiles every design that actually has placements on
+    // THIS panel (panel.designs — never activeDesignId, same rule
+    // generateRouting/collectAllDesignsDrillHoles already follow). Single-PCB
+    // scope exports just the active design's own geometry, untranslated.
+    let designIds: string[]
+    if (stencilConfig.scope === 'panel') {
+      if (!panelResult) {
+        set({ stencilFiles: null, stencilPreview: null })
+        return
+      }
+      designIds = panelResult.designs.map(d => d.designId)
+    } else {
+      if (!activeDesignId) {
+        set({ stencilFiles: null, stencilPreview: null })
+        return
+      }
+      designIds = [activeDesignId]
+    }
+
+    set({ stencilGenerating: true })
+    try {
+      const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
+
+      // Per (design, side) paste-aperture extraction, all in parallel —
+      // mirrors generateRouting's Promise.all over independent per-design work.
+      const apertureJobs = designIds.flatMap(designId =>
+        sides
+          .map(side => ({
+            designId,
+            side,
+            layer: layers.find(l => l.designId === designId && l.type === 'paste' && l.side === side),
+          }))
+          .filter((j): j is { designId: string; side: 'top' | 'bottom'; layer: LayerEntry } => !!j.layer)
+      )
+      const apertureResults = await Promise.all(
+        apertureJobs.map(async (job) => ({
+          designId: job.designId,
+          side: job.side,
+          result: await extractStencilApertures({
+            layerName: job.layer.fileName,
+            contents: job.layer.rawContent,
+            reductionPct: stencilConfig.reductionPct,
+          }),
+        }))
+      )
+
+      // Outline scribe-line, per design, in parallel — reuses the same
+      // traceBoardContour this tool already uses for routing's contour mode.
+      let outlineByDesign = new Map<string, StencilPoint[][]>()
+      if (stencilConfig.includeOutline) {
+        const outlineJobs = designIds
+          .map(designId => ({ designId, layer: findOutlineBoundsLayer(layers.filter(l => l.designId === designId)) }))
+          .filter((j): j is { designId: string; layer: LayerEntry } => !!j.layer)
+
+        // boardShapeCoversContent's trust gate unconditionally rejects a null
+        // unionBoundsMm (board-contour.ts) — a real union of every imported
+        // layer's own bounds is required, same as generateRouting computes.
+        let unionMinX = Infinity, unionMinY = Infinity, unionMaxX = -Infinity, unionMaxY = -Infinity
+        for (const l of layers) {
+          const b = l.parsedLayer?.bounds
+          if (!b) continue
+          unionMinX = Math.min(unionMinX, b.minX); unionMinY = Math.min(unionMinY, b.minY)
+          unionMaxX = Math.max(unionMaxX, b.maxX); unionMaxY = Math.max(unionMaxY, b.maxY)
+        }
+        const unionBoundsMm = Number.isFinite(unionMinX) ? { minX: unionMinX, minY: unionMinY, maxX: unionMaxX, maxY: unionMaxY } : null
+
+        const traced = await Promise.all(
+          outlineJobs.map(async (j) => {
+            const contour = await traceBoardContour(
+              { fileName: j.layer.fileName, contents: j.layer.rawContent },
+              { toleranceMm: 0.01, unionBoundsMm, sourceFileName: j.layer.fileName }
+            )
+            return [j.designId, contour.rings.map(r => r.points)] as const
+          })
+        )
+        outlineByDesign = new Map(traced)
+      }
+
+      // Reference-identity staleness guard — mirrors generateRouting's own.
+      if (get().layers !== layers || get().panelResult !== panelResult) {
+        set({ stencilGenerating: false })
+        return
+      }
+
+      // One DXF per selected side, tiling each design's own hulls/outline
+      // across that design's own placement subset (whole-panel scope) using
+      // the same datum resolveDesignGeometry gives every other export.
+      //
+      // The preview accumulates ACROSS every selected side into one combined
+      // set (a physical stencil preview naturally overlays top/bottom, since
+      // they're separate cut sheets anyway) — outline rings are side-
+      // invariant (they don't depend on which paste layer was selected), so
+      // they're only added once rather than once per side.
+      const files: StencilFile[] = []
+      const previewOriginalRings: StencilPoint[][] = []
+      const previewReducedRings: StencilPoint[][] = []
+      const previewOutlineRings: StencilPoint[][] = []
+      for (const side of sides) {
+        const apertureRings: StencilPoint[][] = []
+        const originalApertureRings: StencilPoint[][] = []
+        const outlineRings: StencilPoint[][] = []
+
+        for (const designId of designIds) {
+          const designLayers = layers.filter(l => l.designId === designId)
+          const datum = resolveDesignGeometry(designLayers)?.datum ?? { x: 0, y: 0 }
+          const job = apertureResults.find(r => r.designId === designId && r.side === side)
+          const hulls = (job?.result.apertures ?? []).map(a => a.hull)
+          const originalHulls = (job?.result.apertures ?? []).map(a => a.originalHull)
+          const outline = outlineByDesign.get(designId) ?? []
+
+          if (stencilConfig.scope === 'panel' && panelResult) {
+            const placements = panelResult.placements.filter(p => p.designId === designId)
+            apertureRings.push(...tileAperturesAcrossPlacements(hulls, placements, datum))
+            originalApertureRings.push(...tileAperturesAcrossPlacements(originalHulls, placements, datum))
+            if (stencilConfig.includeOutline) outlineRings.push(...tileAperturesAcrossPlacements(outline, placements, datum))
+          } else {
+            apertureRings.push(...translateRings(hulls, 0, 0))
+            originalApertureRings.push(...translateRings(originalHulls, 0, 0))
+            if (stencilConfig.includeOutline) outlineRings.push(...translateRings(outline, 0, 0))
+          }
+        }
+
+        const dxfLayers: DxfStencilLayer[] = [{ name: 'APERTURES', rings: apertureRings }]
+        if (stencilConfig.includeOutline) dxfLayers.push({ name: 'OUTLINE', rings: outlineRings })
+
+        const sideLabel = side === 'top' ? 'Top' : 'Bottom'
+        files.push({
+          filename: `${partNumber}_${sideLabel}_Paste_Stencil.dxf`,
+          content: serializeStencilDxf(dxfLayers),
+        })
+
+        previewReducedRings.push(...apertureRings)
+        previewOriginalRings.push(...originalApertureRings)
+        if (side === sides[0]) previewOutlineRings.push(...outlineRings)
+      }
+
+      const preview: StencilPreviewData = {
+        scope: stencilConfig.scope,
+        originalRings: previewOriginalRings,
+        reducedRings: previewReducedRings,
+        outlineRings: previewOutlineRings,
+      }
+
+      set({ stencilFiles: files, stencilPreview: preview, stencilGenerating: false })
+    } catch (err) {
+      console.warn('generateStencilFilesAction failed:', err instanceof Error ? err.message : String(err))
+      set({ stencilFiles: null, stencilPreview: null, stencilGenerating: false })
+    }
+  },
+  clearStencilFiles: () => set({ stencilFiles: null, stencilPreview: null }),
 
   // Panelization templates
   panelTemplateId: null,

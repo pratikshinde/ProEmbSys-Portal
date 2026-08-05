@@ -35,8 +35,10 @@ export interface Capsule {
 // Arc flattening: an arc is split until each chord's sagitta is below this,
 // so the polyline never deviates from the true arc by more than this much.
 // 5µm is far below any clearance rule we grade against.
-const ARC_TOLERANCE_MM = 0.005
-const MAX_ARC_SEGMENTS = 64
+// Exported so stencil-geometry.ts's convex-hull sampling shares this exact
+// tolerance rather than defining its own — one arc-flattening standard, not two.
+export const ARC_TOLERANCE_MM = 0.005
+export const MAX_ARC_SEGMENTS = 64
 
 type AnyNode = Record<string, unknown>
 

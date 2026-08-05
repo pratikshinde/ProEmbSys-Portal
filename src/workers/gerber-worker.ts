@@ -27,6 +27,7 @@ import {
 import { toHtml } from 'hast-util-to-html'
 import { normalizeGerberMacroPrimitives, scalePlotTreeToMm } from '../lib/gerber-preprocess'
 import { flattenPlotTree, computeSpacing } from '../lib/dfm/capsules'
+import { extractPasteApertures } from '../lib/stencil-geometry'
 
 export interface GerberWorkerResult {
   svgFragment: string
@@ -362,7 +363,75 @@ function checkCopperSpacing(input: CopperSpacingInput): CopperSpacingOutput {
   }
 }
 
-const api = { parseGerber, renderBoardView, checkCopperSpacing }
+export interface StencilApertureInput {
+  layerName: string
+  /** rawContent of ONE paste Gerber layer. */
+  contents: string
+  /** 0 = exact match, no shrink. */
+  reductionPct: number
+  maxPrimitives?: number
+}
+
+export interface StencilApertureOutput {
+  layerName: string
+  /** One entry per resolved flash. `hull` is the actual cut geometry
+   *  (reduced, if a reduction% was requested); `originalHull` is the same
+   *  hull before reduction — kept for preview rendering, equal to `hull` by
+   *  value when reductionPct is 0. */
+  apertures: { hull: { x: number; y: number }[]; originalHull: { x: number; y: number }[] }[]
+  skippedNonFlashCount: number
+  truncated: boolean
+  error?: string
+}
+
+/**
+ * Paste-aperture outlines for one layer, for the stencil DXF export.
+ *
+ * Same parse/plot/normalise pipeline as checkCopperSpacing, for the same
+ * reason: plot() has already resolved macro apertures (KiCad's RoundRect
+ * included) into concrete primitives, which stencil-geometry.ts's convex
+ * hull needs — this codebase's own parser never resolves macro geometry.
+ * Paste layers are far sparser than copper (pad flashes only, no traces or
+ * pours), so the same DEFAULT_MAX_PRIMITIVES budget is generous here.
+ */
+function extractStencilApertures(input: StencilApertureInput): StencilApertureOutput {
+  const base: StencilApertureOutput = {
+    layerName: input.layerName,
+    apertures: [],
+    skippedNonFlashCount: 0,
+    truncated: false,
+  }
+  if (!input.contents || input.contents.trim().length === 0) {
+    return { ...base, error: 'Empty content' }
+  }
+
+  let image
+  try {
+    image = plot(parse(normalizeGerberMacroPrimitives(input.contents)))
+  } catch (err) {
+    return { ...base, error: `parse/plot failed: ${err instanceof Error ? err.message : String(err)}` }
+  }
+
+  scalePlotTreeToMm(image)
+
+  const budget = input.maxPrimitives ?? DEFAULT_MAX_PRIMITIVES
+  const childCount = Array.isArray((image as { children?: unknown[] })?.children)
+    ? (image as { children: unknown[] }).children.length
+    : 0
+  if (childCount > budget) {
+    return { ...base, truncated: true }
+  }
+
+  const { apertures, skippedNonFlashCount } = extractPasteApertures(image, input.reductionPct)
+  return {
+    layerName: input.layerName,
+    apertures: apertures.map((a) => ({ hull: a.hull, originalHull: a.originalHull })),
+    skippedNonFlashCount,
+    truncated: false,
+  }
+}
+
+const api = { parseGerber, renderBoardView, checkCopperSpacing, extractStencilApertures }
 export type GerberWorkerApi = typeof api
 
 Comlink.expose(api)
