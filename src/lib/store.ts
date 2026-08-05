@@ -2441,7 +2441,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   resetGcodeContext: () => set({ gcodeContext: { ...DEFAULT_GCODE_CONTEXT } }),
   gcodeFiles: null,
   generateGcodeFilesAction: () => {
-    const { routingResult, gcodeContext, layers, panelResult, panelInfo } = get()
+    const { routingResult, gcodeContext, layers, panelResult, panelInfo, panelConfig } = get()
     if (!routingResult || !panelResult) {
       set({ gcodeFiles: null })
       return
@@ -2450,9 +2450,40 @@ export const useAppStore = create<AppState>((set, get) => ({
     // then merged by diameter — panelResult.designs is the source of truth
     // for which designs actually have placements on THIS panel (matching
     // routing's own per-design scoping, not a single active design).
-    const drillHoleGroups = collectAllDesignsDrillHoles(layers, panelResult)
+    const componentHoleGroups = collectAllDesignsDrillHoles(layers, panelResult)
       .map(g => ({ diameterMm: g.diameterMm, holes: g.holes }))
     const drillSlotGroups = collectAllDesignsDrillSlots(layers, panelResult)
+
+    // Tooling/reference (PINN) holes were previously drilled only via the
+    // Excellon `_PINN.drl` export and the separate Multi-Panel Array G-code
+    // path (generatePanelArrayFilesAction, which already does this same
+    // merge) — the plain per-panel G-Code tab silently omitted them
+    // entirely, so a shop relying on G-code alone (not reading the Excellon
+    // file on their own CNC post) never got pinning/reference holes drilled
+    // for a single panel. Reported live: "Regenerate G-Code" produced 8
+    // drilling files where the Meta-Panel export (same board) produced 10 —
+    // missing exactly the tooling-hole diameter's second file and the
+    // reference-hole diameter entirely. Same {diameterMm, holes} merge
+    // pattern as generatePanelArrayFilesAction's own toolingHoleGroups.
+    let toolingHoleGroups: { diameterMm: number; holes: { x: number; y: number }[] }[] = []
+    if (panelConfig.enableToolingHoles) {
+      const byDia = new Map<number, { x: number; y: number }[]>()
+      for (const h of panelResult.toolingHoles) {
+        if (!byDia.has(h.diameter)) byDia.set(h.diameter, [])
+        byDia.get(h.diameter)!.push({ x: h.x, y: h.y })
+      }
+      toolingHoleGroups = [...byDia.entries()].map(([diameterMm, holes]) => ({ diameterMm, holes }))
+    }
+
+    const mergedByDia = new Map<number, { x: number; y: number }[]>()
+    for (const g of [...componentHoleGroups, ...toolingHoleGroups]) {
+      if (!mergedByDia.has(g.diameterMm)) mergedByDia.set(g.diameterMm, [])
+      mergedByDia.get(g.diameterMm)!.push(...g.holes)
+    }
+    const drillHoleGroups = [...mergedByDia.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([diameterMm, holes]) => ({ diameterMm, holes }))
+
     const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
     set({ gcodeFiles: buildGcodeFiles(routingResult, drillHoleGroups, partNumber, gcodeContext, drillSlotGroups) })
   },
