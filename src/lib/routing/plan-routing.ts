@@ -41,6 +41,7 @@ import {
   tangentAt,
   type ArcLengthTable,
 } from './offset'
+import { dGlobalToWorldCoord, findFacingPairs, worldCoordToDGlobal, worldPointToDGlobal } from './tab-alignment'
 import type {
   BoardContour,
   ContourRing,
@@ -425,7 +426,7 @@ export function planRouting(
       if (resolvedModeByDesign.get(designId) === 'bbox') bboxEntries.push(...entries)
     }
     if (bboxEntries.length > 0) {
-      runBboxModeRouting(bboxEntries, panel.toolingHoles, cfg, bit, r, paths, tabs)
+      runBboxModeRouting(bboxEntries, panel.placements, panel.toolingHoles, cfg, bit, r, paths, tabs)
     }
   }
 
@@ -588,6 +589,7 @@ export function planRouting(
  */
 function runBboxModeRouting(
   entries: { pos: PanelPlacement; pcbIndex: number }[],
+  allPlacements: PanelPlacement[],
   toolingHoles: PanelResult['toolingHoles'],
   cfg: RoutingConfig,
   bit: number,
@@ -599,13 +601,18 @@ function runBboxModeRouting(
   // deduped across PCB instances before being turned into paths.
   const pending: { pcbIndex: number; edge: RouteEdge; seg: RouteSegment }[] = []
 
-  // Two passes, not one — Phase 1 below computes each PCB's OWN tabs (needs
-  // nothing but that PCB's own geometry); Phase 2 (after the loop) folds in
+  // Three sub-passes, not one — Sub-pass 1 below computes each PCB's OWN
+  // default tabs (needs nothing but that PCB's own geometry, no emission
+  // yet); Sub-pass 1.5 reconciles tabs on FACING edges between adjacent
+  // placements (needs every PCB's defaults to already exist); Sub-pass 2
+  // emits the final `RouteTab`s. Phase 2 (after all of this) then folds in
   // silent interrupts for any FOREIGN PCB's tab that physically coincides
   // with this edge, which by definition can't be known until every PCB's
-  // tabs exist. See that phase's own comment for why this matters.
-  const perEdgeInfos: { pcbIndex: number; edge: RouteEdge; a: Pt; b: Pt; edgeLen: number; centersAlong: number[]; isReversedEdge: boolean }[] = []
+  // real tabs exist. See that phase's own comment for why that's separate.
+  const pathGap = cfg.tabWidthMm + bit
+  const perEdgeInfos: { pcbIndex: number; edge: RouteEdge; a: Pt; b: Pt; edgeLen: number; centersAlong: number[]; isReversedEdge: boolean; pos: PanelPlacement }[] = []
 
+  // ---- Sub-pass 1: each PCB's own default tab centers ----------------------
   for (const { pos, pcbIndex } of entries) {
     const corners = offsetRectOutward(pos.x, pos.y, pos.w, pos.h, r)
 
@@ -629,7 +636,10 @@ function runBboxModeRouting(
       // now-misaligned tab, silently destroying tabs on both sides with no
       // error. Canonicalise: always measure tab distance left-to-right for
       // horizontal edges and bottom-to-top for vertical edges, regardless of
-      // which edge label it is.
+      // which edge label it is. (This canonical "dGlobal" convention is also
+      // exactly what `tab-alignment.ts`'s `worldPointToDGlobal`/
+      // `dGlobalToWorldCoord`/`worldCoordToDGlobal` assume — no further
+      // reversal correction needed when using those.)
       const isReversedEdge = edge === 'top' || edge === 'left'
 
       const wantTabs = cfg.tabStyle !== 'none' && edgeEnabled(edge, cfg)
@@ -637,7 +647,6 @@ function runBboxModeRouting(
       if (wantTabs && edgeLen > 0) {
         const override = parseTabPositions(cfg.tabPositionsMm, edgeLen)
         const autoCenters = override.length > 0 ? override : evenTabCenters(edgeLen, cfg.tabsPerEdge)
-        const pathGap = cfg.tabWidthMm + bit
         centersAlong.push(...autoCenters)
 
         // ⚠ Protective tabs: a tooling/reference hole close enough to this
@@ -662,40 +671,177 @@ function runBboxModeRouting(
           const alreadyCovered = centersAlong.some(c => Math.abs(c - dGlobalForHole) < pathGap)
           if (!alreadyCovered) centersAlong.push(dGlobalForHole)
         }
-
-        for (const dGlobal of centersAlong) {
-          const d = isReversedEdge ? edgeLen - dGlobal : dGlobal
-
-          // The tab itself lives on the BOARD edge, not this offset tool path.
-          // Shift the point back inward by r along the edge's inward normal.
-          const tabCenter = boardEdgePoint(pos, edge, d, r)
-          const dir = { x: (b.x - a.x) / (edgeLen || 1), y: (b.y - a.y) / (edgeLen || 1) }
-          const holes =
-            cfg.tabStyle === 'mousebite'
-              ? mouseBiteHoleCenters(
-                  pullOutward(tabCenter, outwardNormalForEdge(edge), cfg.mouseBiteHoleDiameterMm, cfg.mouseBiteEdgeClearanceMm),
-                  dir,
-                  cfg.tabWidthMm,
-                  cfg.mouseBiteHoleDiameterMm,
-                  cfg.mouseBiteHolePitchMm
-                )
-              : []
-
-          tabs.push({
-            id: `tab-${pcbIndex}-${edge}-${dGlobal.toFixed(3)}`,
-            style: cfg.tabStyle === 'mousebite' ? 'mousebite' : 'solid',
-            center: tabCenter,
-            dir,
-            widthMm: cfg.tabWidthMm,
-            edge,
-            pcbIndex,
-            holes,
-            holeDiameterMm: cfg.mouseBiteHoleDiameterMm,
-          })
-        }
       }
 
-      perEdgeInfos.push({ pcbIndex, edge, a, b, edgeLen, centersAlong, isReversedEdge })
+      perEdgeInfos.push({ pcbIndex, edge, a, b, edgeLen, centersAlong, isReversedEdge, pos })
+    }
+  }
+
+  // ---- Sub-pass 1.5: align tabs on FACING edges between adjacent PCBs -----
+  // Deliberately placement-geometric (AABB-based via `findFacingPairs`), not
+  // grid-lattice-based — works the same for a uniform grid panel and a
+  // packed, non-uniform multi-design panel. Two cases are handled; a third
+  // (both sides contour-mode) is a documented, accepted v1 gap — see
+  // CLAUDE.md's routing section for why that one is harder (contour tabs are
+  // computed once per DESIGN in file space and shared across every instance,
+  // not per placement, so "align this one instance's tab" doesn't have a
+  // clean seam the way it does here).
+  //
+  // Confirmed on a real fabricated panel: a rounded (contour-mode) board's
+  // single bottom-edge tab landed at world X≈93mm while neither rectangular
+  // board below it had a tab anywhere near that X — this sub-pass is what
+  // makes the bbox follower(s) grow a REAL tab at that exact position
+  // instead of just silently avoiding a re-cut (which is all Phase 2 below
+  // has ever done).
+  //
+  // ⚠ SNAP-OR-ADD, never remove. An earlier version of this pass removed
+  // every one of the follower's own within-window defaults and replaced
+  // them with the anchor's — correct-looking on paper, but a contour design
+  // typically has far FEWER total tabs (`tabsPerContour`, spread across its
+  // WHOLE perimeter) than a facing bbox edge's own `tabsPerEdge`, so
+  // wholesale replacement could silently DROP tab support the follower
+  // would otherwise have had (2 defaults down to 1 aligned tab, confirmed
+  // live on a synthetic reproduction of the reported panel). This fix is
+  // about ALIGNMENT, not about how many tabs an edge gets — so for each
+  // anchor tab, the nearest follower default within `pathGap` is SNAPPED
+  // onto the anchor's exact position (no count change); only when no
+  // follower default is close enough is a genuinely NEW tab ADDED. Any
+  // follower default not claimed by a snap is left untouched.
+  {
+    const edgeInfoByPcb = new Map<number, Map<RouteEdge, (typeof perEdgeInfos)[number]>>()
+    for (const info of perEdgeInfos) {
+      if (!edgeInfoByPcb.has(info.pcbIndex)) edgeInfoByPcb.set(info.pcbIndex, new Map())
+      edgeInfoByPcb.get(info.pcbIndex)!.set(info.edge, info)
+    }
+
+    const inWindow = (worldCoord: number, pair: ReturnType<typeof findFacingPairs>[number]) =>
+      worldCoord >= pair.overlapStart - 1e-6 && worldCoord <= pair.overlapEnd + 1e-6
+
+    // Snap the nearest follower default (within pathGap, not already
+    // claimed by an earlier anchor tab in this same call) onto `d`; if none
+    // qualifies, add `d` as a new tab. `claimed` is per-edge so multiple
+    // anchor tabs against the same follower edge don't double-claim one
+    // default.
+    const snapOrAdd = (follower: (typeof perEdgeInfos)[number], d: number, claimed: Set<number>) => {
+      if (d < 0 || d > follower.edgeLen) return
+      let nearestIdx = -1
+      let nearestDist = Infinity
+      follower.centersAlong.forEach((c, idx) => {
+        if (claimed.has(idx)) return
+        const dist = Math.abs(c - d)
+        if (dist < nearestDist) { nearestDist = dist; nearestIdx = idx }
+      })
+      if (nearestIdx >= 0 && nearestDist < pathGap) {
+        follower.centersAlong[nearestIdx] = d
+        claimed.add(nearestIdx)
+      } else {
+        follower.centersAlong.push(d)
+      }
+    }
+
+    const facingPairs = findFacingPairs(
+      allPlacements.map((pos, pcbIndex) => ({ pos, pcbIndex })),
+      pathGap
+    )
+
+    for (const pair of facingPairs) {
+      const aInfo = edgeInfoByPcb.get(pair.aIndex)?.get(pair.aSide)
+      const bInfo = edgeInfoByPcb.get(pair.bIndex)?.get(pair.bSide)
+
+      if (aInfo && bInfo) {
+        // Both sides bbox: anchor = whichever side already has more tabs in
+        // the shared window (tie-break lower pcbIndex, for determinism).
+        // For an already-matching pair (same edge length + position — the
+        // common uniform-grid case) every anchor tab snaps onto an
+        // identical follower default at distance 0, so this is a no-op.
+        const aWindowCount = aInfo.centersAlong.filter(c => inWindow(dGlobalToWorldCoord(aInfo.pos, aInfo.edge, c, r), pair)).length
+        const bWindowCount = bInfo.centersAlong.filter(c => inWindow(dGlobalToWorldCoord(bInfo.pos, bInfo.edge, c, r), pair)).length
+        const anchorIsA = aWindowCount > bWindowCount || (aWindowCount === bWindowCount && pair.aIndex < pair.bIndex)
+        const anchor = anchorIsA ? aInfo : bInfo
+        const follower = anchorIsA ? bInfo : aInfo
+
+        const anchorWorldCoords = anchor.centersAlong
+          .filter(c => inWindow(dGlobalToWorldCoord(anchor.pos, anchor.edge, c, r), pair))
+          .map(c => dGlobalToWorldCoord(anchor.pos, anchor.edge, c, r))
+
+        const claimed = new Set<number>()
+        for (const worldCoord of anchorWorldCoords) {
+          snapOrAdd(follower, worldCoordToDGlobal(follower.pos, follower.edge, worldCoord, r), claimed)
+        }
+      } else if (aInfo || bInfo) {
+        // One side is contour-mode (not in `entries`/`edgeInfoByPcb` at
+        // all) — contour is always the anchor, since it already ran to
+        // completion and its real, final tab world positions already exist
+        // in `tabs`. The bbox side is always the follower here.
+        //
+        // A contour ring's tabs are spread by arc length across its WHOLE
+        // perimeter, not confined to one edge — filtering only by the
+        // perpendicular-axis window isn't enough, since a tab on the
+        // contour's far side can numerically land inside that window
+        // without being anywhere near this particular facing gap (caught by
+        // the headless synthetic-panel check: a tab on the contour design's
+        // TOP edge shared enough X-range with a bbox neighbour below its
+        // BOTTOM edge to pass the window filter alone). Also require the
+        // tab's SEPARATION-axis coordinate to sit close to the follower's
+        // own facing edge line — real facing tabs are within the gap
+        // distance of it by construction; anything farther is a different
+        // part of the same ring.
+        const bboxInfo = aInfo ?? bInfo!
+        const contourPcbIndex = aInfo ? pair.bIndex : pair.aIndex
+        const perpIsY = bboxInfo.edge === 'left' || bboxInfo.edge === 'right'
+        const followerEdgeCoord =
+          bboxInfo.edge === 'left' ? bboxInfo.pos.x
+          : bboxInfo.edge === 'right' ? bboxInfo.pos.x + bboxInfo.pos.w
+          : bboxInfo.edge === 'bottom' ? bboxInfo.pos.y
+          : bboxInfo.pos.y + bboxInfo.pos.h
+        const separationToleranceMm = pair.gapMm + pathGap
+
+        const anchorWorldPts = tabs
+          .filter(t => t.pcbIndex === contourPcbIndex)
+          .map(t => t.center)
+          .filter(p => inWindow(perpIsY ? p.y : p.x, pair))
+          .filter(p => Math.abs((perpIsY ? p.x : p.y) - followerEdgeCoord) <= separationToleranceMm)
+
+        const claimed = new Set<number>()
+        for (const worldPt of anchorWorldPts) {
+          snapOrAdd(bboxInfo, worldPointToDGlobal(bboxInfo.pos, bboxInfo.edge, worldPt, r), claimed)
+        }
+      }
+      // else: both sides contour-mode — documented v1 limitation, skip.
+    }
+  }
+
+  // ---- Sub-pass 2: emit tabs from the final (possibly reconciled) centers -
+  for (const { pos, edge, a, b, edgeLen, centersAlong, isReversedEdge, pcbIndex } of perEdgeInfos) {
+    for (const dGlobal of centersAlong) {
+      const d = isReversedEdge ? edgeLen - dGlobal : dGlobal
+
+      // The tab itself lives on the BOARD edge, not this offset tool path.
+      // Shift the point back inward by r along the edge's inward normal.
+      const tabCenter = boardEdgePoint(pos, edge, d, r)
+      const dir = { x: (b.x - a.x) / (edgeLen || 1), y: (b.y - a.y) / (edgeLen || 1) }
+      const holes =
+        cfg.tabStyle === 'mousebite'
+          ? mouseBiteHoleCenters(
+              pullOutward(tabCenter, outwardNormalForEdge(edge), cfg.mouseBiteHoleDiameterMm, cfg.mouseBiteEdgeClearanceMm),
+              dir,
+              cfg.tabWidthMm,
+              cfg.mouseBiteHoleDiameterMm,
+              cfg.mouseBiteHolePitchMm
+            )
+          : []
+
+      tabs.push({
+        id: `tab-${pcbIndex}-${edge}-${dGlobal.toFixed(3)}`,
+        style: cfg.tabStyle === 'mousebite' ? 'mousebite' : 'solid',
+        center: tabCenter,
+        dir,
+        widthMm: cfg.tabWidthMm,
+        edge,
+        pcbIndex,
+        holes,
+        holeDiameterMm: cfg.mouseBiteHoleDiameterMm,
+      })
     }
   }
 

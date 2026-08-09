@@ -140,10 +140,68 @@ export interface ZipImportResult {
   errors: string[]
 }
 
+/** Per-layer metadata saved alongside a CamJob — everything about a
+ *  LayerEntry EXCEPT its content (which lives on disk, keyed by
+ *  `layerFileId`, see src/lib/cam-job-files.ts) and its computed
+ *  `parsedLayer`/`svgData` (re-derived on load via addLayerToDesign). */
+export interface CamJobFileMeta {
+  /** The LayerEntry.id this file was saved from — also the on-disk filename
+   *  stem (uploads/cam-jobs/<jobId>/<layerFileId>.txt). A fresh id is
+   *  generated for the layer re-created on load; this is only a save-time
+   *  reference, never reused as the restored layer's own id. */
+  layerFileId: string
+  designId: string
+  fileName: string
+  type: LayerType
+  side: LayerSide
+  color: string
+  visible: boolean
+  opacity: number
+  fileSize: number
+}
+
+/**
+ * Everything needed to fully restore the CAM tool's working state, minus
+ * file content (CamJobFileMeta.layerFileId points at the on-disk copy) and
+ * minus every computed/derived field (panelResult, routingResult,
+ * gcodeFiles, dfmReport, boardContour, ... — recomputed by the user
+ * re-clicking Create Panel/Generate Routing/etc. after a load, matching the
+ * tool's existing "nothing auto-computes" convention). Deliberately omits
+ * `selectedCandidateId` too — packCandidates is always cleared on load, so a
+ * restored selection would dangle.
+ */
+export interface CamJobSnapshot {
+  camMode: 'single' | 'multi'
+  activeTab: CamTab
+  designs: DesignEntry[]
+  activeDesignId: string | null
+  materialSizeMm: { widthMm: number; heightMm: number }
+  panelConfig: PanelConfig
+  panelInfo: PanelInfo
+  outputFormat: OutputFormat
+  targetUnit: GerberUnit
+  boardViewSide: 'top' | 'bottom'
+  viewMode: 'board' | 'layers'
+  boardColor: BoardColorName
+  dfmTemplateId: string | null
+  dfmContext: DfmContext
+  routingConfig: RoutingConfig
+  gcodeContext: GcodeContext
+  panelArrayConfig: PanelArrayConfig
+  stencilConfig: StencilConfig
+  panelTemplateId: string | null
+  showGrid: boolean
+  showCrosshair: boolean
+  files: CamJobFileMeta[]
+}
+
 interface AppState {
   // Layers
   layers: LayerEntry[]
   addLayer: (file: File) => Promise<void>
+  /** Like addLayer, but joins an explicit design instead of the active one —
+   *  needed by loadCamJobSnapshot to restore a multi-design job faithfully. */
+  addLayerToDesign: (file: File, designId: string) => Promise<void>
   addLayersFromZip: (zipFile: File) => Promise<ZipImportResult>
   addLayersFromRar: (rarFile: File) => Promise<ZipImportResult>
   alignDrillLayersToBoard: () => Promise<void>
@@ -194,6 +252,14 @@ interface AppState {
   setLayerOpacity: (id: string, opacity: number) => void
   clearLayers: () => void
   rotateAllLayers: (direction: 'left' | 'right') => Promise<void>
+  /** Restore a saved CAM job (see src/lib/cam-job-files.ts / /api/cam-jobs) —
+   *  one atomic config `set()` (deliberately NOT composed from the individual
+   *  updateX/resetX setters, several of which have invalidation side-effects
+   *  that would fire redundantly during a bulk restore) followed by
+   *  sequential addLayerToDesign calls to rebuild `layers[]` with fresh,
+   *  freshly-computed parsedLayer/svgData. `contentByLayerFileId` supplies
+   *  each file's text content, keyed by `CamJobFileMeta.layerFileId`. */
+  loadCamJobSnapshot: (snapshot: CamJobSnapshot, contentByLayerFileId: Record<string, string>) => Promise<void>
 
   // Panel config
   panelConfig: PanelConfig
@@ -873,6 +939,136 @@ function buildPackedPanelResult(
   return finishPackedPanel(placements, designSummaries, panelWidth, panelHeight, panelConfig, panelInfo)
 }
 
+/**
+ * The shared body of `addLayer`/`addLayerToDesign` — parses one file and
+ * appends it to `layers[]` under the given `designId`. Extracted so a
+ * caller can supply an explicit target design (`addLayerToDesign`, used by
+ * `loadCamJobSnapshot` to restore a saved multi-design job) instead of
+ * always joining whatever `ensureActiveDesignId` resolves to (`addLayer`,
+ * the normal upload path). No other behavior change from the original
+ * inline `addLayer` body.
+ */
+async function importLayerFile(get: () => AppState, set: (fn: (s: AppState) => Partial<AppState>) => void, file: File, designId: string): Promise<void> {
+  const content = await file.text()
+  const fileName = file.name
+  try {
+    // Use Excellon parser for drill files, the rout-slot importer for
+    // incoming .rou milling files, Gerber parser for everything else
+    const drillOrRout = parseDrillOrRoutContent(content, fileName)
+    const parsedLayer: GerberLayer = drillOrRout ? drillOrRout.parsedLayer : parseGerber(content, fileName)
+
+    // Generate SVG using server API (also extracts TF.FileFunction if present)
+    const svgSourceContent = drillOrRout ? drillOrRout.svgSourceContent : content
+    let svgData: GerberSvgResult | null = null
+    try {
+      svgData = await gerberToSvg(svgSourceContent)
+
+      // If SVG generation failed (empty/error), create a fallback SVG from parsed data
+      if (!svgData || svgData.isEmpty || svgData.error) {
+        console.warn('SVG generation failed for', fileName, '- creating fallback SVG')
+        svgData = createFallbackSvg(parsedLayer, fileName)
+      }
+    } catch (svgErr) {
+      console.warn('SVG generation failed for', fileName, '- creating fallback SVG:', svgErr)
+      svgData = createFallbackSvg(parsedLayer, fileName)
+    }
+
+    // Layer type detection: prefer TF.FileFunction (from Gerber content),
+    // fall back to filename-based heuristics. Force 'drill' if content is
+    // Excellon or a milling rout file (see parseDrillOrRoutContent).
+    let type: LayerType, side: LayerSide
+    if (drillOrRout) {
+      type = 'drill'
+      side = 'none'
+    } else if (svgData?.layerAnalysis?.type) {
+      type = svgData.layerAnalysis.type as LayerType
+      side = svgData.layerAnalysis.side as LayerSide
+    } else {
+      type = detectLayerType(fileName)
+      side = detectLayerSide(fileName, type)
+    }
+    const color = getDefaultLayerColorByType(type, side)
+
+    // Convert to target unit if needed
+    const targetUnit = get().targetUnit
+    convertLayerUnits(parsedLayer, targetUnit)
+
+    // Auto-detect drill format by comparing against existing board layers
+    // — never for rout-derived layers, whose bounds are a handful of small
+    // milled slots, not the whole board (see DrillOrRoutResult.kind).
+    let finalContent = svgSourceContent
+    let finalParsed = parsedLayer
+    let finalSvg = svgData
+    if (type === 'drill' && drillOrRout?.kind !== 'rout' && parsedLayer.bounds) {
+      const existingLayers = get().layers.filter(l => l.designId === designId)
+      const boardLayers = existingLayers.filter(l => l.type !== 'drill' && l.type !== 'fab' && l.type !== 'other' && l.parsedLayer?.bounds)
+      if (boardLayers.length > 0) {
+        let boardMinX = Infinity, boardMinY = Infinity, boardMaxX = -Infinity, boardMaxY = -Infinity
+        for (const bl of boardLayers) {
+          const b = bl.parsedLayer.bounds!
+          boardMinX = Math.min(boardMinX, b.minX)
+          boardMinY = Math.min(boardMinY, b.minY)
+          boardMaxX = Math.max(boardMaxX, b.maxX)
+          boardMaxY = Math.max(boardMaxY, b.maxY)
+        }
+        const boardWidth = boardMaxX - boardMinX
+        const boardHeight = boardMaxY - boardMinY
+        const db = finalParsed.bounds!
+        const drillWidth = db.maxX - db.minX
+        const drillHeight = db.maxY - db.minY
+        const sizeRatioX = boardWidth > 0 ? Math.abs(drillWidth - boardWidth) / boardWidth : 0
+        const sizeRatioY = boardHeight > 0 ? Math.abs(drillHeight - boardHeight) / boardHeight : 0
+
+        if (sizeRatioX > 0.4 || sizeRatioY > 0.4) {
+          console.log(`[Drill Auto-Detect] ${fileName}: drill (${drillWidth.toFixed(1)}x${drillHeight.toFixed(1)}) vs board (${boardWidth.toFixed(1)}x${boardHeight.toFixed(1)}) — auto-detecting`)
+          const detected = autoDetectDrillFormat(content, fileName, boardWidth, boardHeight)
+          if (detected) {
+            console.log(`[Drill Auto-Detect] ${fileName}: detected ${detected.format.unit} ${detected.format.integer}:${detected.format.decimal} ${detected.format.zeroSuppression}`)
+            finalContent = generateNormalizedExcellon(content, detected.format)
+            finalParsed = detected.parsed
+            if (finalParsed.drillMeta) finalParsed.drillMeta.source = 'auto-detect'
+            convertLayerUnits(finalParsed, targetUnit)
+            try {
+              finalSvg = await gerberToSvg(finalContent)
+              if (!finalSvg || finalSvg.isEmpty || finalSvg.error) {
+                finalSvg = createFallbackSvg(finalParsed, fileName)
+              }
+            } catch {
+              finalSvg = createFallbackSvg(finalParsed, fileName)
+            }
+          }
+        }
+      }
+    }
+
+    const entry: LayerEntry = {
+      id: generateId(),
+      name: fileName.replace(/\.[^.]+$/, ''),
+      fileName,
+      rawContent: finalContent,
+      originalContent: content,
+      parsedLayer: finalParsed,
+      svgData: finalSvg,
+      color,
+      visible: true,
+      opacity: getDefaultOpacityByType(type),
+      type,
+      side,
+      designId,
+      variantRotationDeg: 0,
+    }
+
+    set(state => ({ layers: [...state.layers, entry], packCandidates: null, selectedCandidateId: null }))
+    if (type === 'drill') maybeSyncExportDrillFormat(get, set, finalParsed.drillMeta)
+    void get().rebuildBoardView()
+    // NOTE: Panel computation is now only triggered when user clicks "Panel Config" button
+    // Not automatically when layers are added
+  } catch (e) {
+    console.error('Failed to parse Gerber file:', e)
+    throw e
+  }
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   // Layers
   layers: [],
@@ -979,130 +1175,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   addLayer: async (file: File) => {
-    const content = await file.text()
-    const fileName = file.name
-    try {
-      // Use Excellon parser for drill files, the rout-slot importer for
-      // incoming .rou milling files, Gerber parser for everything else
-      const drillOrRout = parseDrillOrRoutContent(content, fileName)
-      const parsedLayer: GerberLayer = drillOrRout ? drillOrRout.parsedLayer : parseGerber(content, fileName)
+    await importLayerFile(get, set, file, ensureActiveDesignId(get, set))
+  },
 
-      // Generate SVG using server API (also extracts TF.FileFunction if present)
-      const svgSourceContent = drillOrRout ? drillOrRout.svgSourceContent : content
-      let svgData: GerberSvgResult | null = null
-      try {
-        svgData = await gerberToSvg(svgSourceContent)
-
-        // If SVG generation failed (empty/error), create a fallback SVG from parsed data
-        if (!svgData || svgData.isEmpty || svgData.error) {
-          console.warn('SVG generation failed for', fileName, '- creating fallback SVG')
-          svgData = createFallbackSvg(parsedLayer, fileName)
-        }
-      } catch (svgErr) {
-        console.warn('SVG generation failed for', fileName, '- creating fallback SVG:', svgErr)
-        svgData = createFallbackSvg(parsedLayer, fileName)
-      }
-
-      // Layer type detection: prefer TF.FileFunction (from Gerber content),
-      // fall back to filename-based heuristics. Force 'drill' if content is
-      // Excellon or a milling rout file (see parseDrillOrRoutContent).
-      let type: LayerType, side: LayerSide
-      if (drillOrRout) {
-        type = 'drill'
-        side = 'none'
-      } else if (svgData?.layerAnalysis?.type) {
-        type = svgData.layerAnalysis.type as LayerType
-        side = svgData.layerAnalysis.side as LayerSide
-      } else {
-        type = detectLayerType(fileName)
-        side = detectLayerSide(fileName, type)
-      }
-      const color = getDefaultLayerColorByType(type, side)
-
-      // A loose file joins the active design (creating the default "Design 1"
-      // on the very first import) — computed before the drill auto-detect
-      // below so that comparison only ever looks at THIS design's own board
-      // layers, never another design's.
-      const designId = ensureActiveDesignId(get, set)
-
-      // Convert to target unit if needed
-      const targetUnit = get().targetUnit
-      convertLayerUnits(parsedLayer, targetUnit)
-
-      // Auto-detect drill format by comparing against existing board layers
-      // — never for rout-derived layers, whose bounds are a handful of small
-      // milled slots, not the whole board (see DrillOrRoutResult.kind).
-      let finalContent = svgSourceContent
-      let finalParsed = parsedLayer
-      let finalSvg = svgData
-      if (type === 'drill' && drillOrRout?.kind !== 'rout' && parsedLayer.bounds) {
-        const existingLayers = get().layers.filter(l => l.designId === designId)
-        const boardLayers = existingLayers.filter(l => l.type !== 'drill' && l.type !== 'fab' && l.type !== 'other' && l.parsedLayer?.bounds)
-        if (boardLayers.length > 0) {
-          let boardMinX = Infinity, boardMinY = Infinity, boardMaxX = -Infinity, boardMaxY = -Infinity
-          for (const bl of boardLayers) {
-            const b = bl.parsedLayer.bounds!
-            boardMinX = Math.min(boardMinX, b.minX)
-            boardMinY = Math.min(boardMinY, b.minY)
-            boardMaxX = Math.max(boardMaxX, b.maxX)
-            boardMaxY = Math.max(boardMaxY, b.maxY)
-          }
-          const boardWidth = boardMaxX - boardMinX
-          const boardHeight = boardMaxY - boardMinY
-          const db = finalParsed.bounds!
-          const drillWidth = db.maxX - db.minX
-          const drillHeight = db.maxY - db.minY
-          const sizeRatioX = boardWidth > 0 ? Math.abs(drillWidth - boardWidth) / boardWidth : 0
-          const sizeRatioY = boardHeight > 0 ? Math.abs(drillHeight - boardHeight) / boardHeight : 0
-
-          if (sizeRatioX > 0.4 || sizeRatioY > 0.4) {
-            console.log(`[Drill Auto-Detect] ${fileName}: drill (${drillWidth.toFixed(1)}x${drillHeight.toFixed(1)}) vs board (${boardWidth.toFixed(1)}x${boardHeight.toFixed(1)}) — auto-detecting`)
-            const detected = autoDetectDrillFormat(content, fileName, boardWidth, boardHeight)
-            if (detected) {
-              console.log(`[Drill Auto-Detect] ${fileName}: detected ${detected.format.unit} ${detected.format.integer}:${detected.format.decimal} ${detected.format.zeroSuppression}`)
-              finalContent = generateNormalizedExcellon(content, detected.format)
-              finalParsed = detected.parsed
-              if (finalParsed.drillMeta) finalParsed.drillMeta.source = 'auto-detect'
-              convertLayerUnits(finalParsed, targetUnit)
-              try {
-                finalSvg = await gerberToSvg(finalContent)
-                if (!finalSvg || finalSvg.isEmpty || finalSvg.error) {
-                  finalSvg = createFallbackSvg(finalParsed, fileName)
-                }
-              } catch {
-                finalSvg = createFallbackSvg(finalParsed, fileName)
-              }
-            }
-          }
-        }
-      }
-
-      const entry: LayerEntry = {
-        id: generateId(),
-        name: fileName.replace(/\.[^.]+$/, ''),
-        fileName,
-        rawContent: finalContent,
-        originalContent: content,
-        parsedLayer: finalParsed,
-        svgData: finalSvg,
-        color,
-        visible: true,
-        opacity: getDefaultOpacityByType(type),
-        type,
-        side,
-        designId,
-        variantRotationDeg: 0,
-      }
-
-      set(state => ({ layers: [...state.layers, entry], packCandidates: null, selectedCandidateId: null }))
-      if (type === 'drill') maybeSyncExportDrillFormat(get, set, finalParsed.drillMeta)
-      void get().rebuildBoardView()
-      // NOTE: Panel computation is now only triggered when user clicks "Panel Config" button
-      // Not automatically when layers are added
-    } catch (e) {
-      console.error('Failed to parse Gerber file:', e)
-      throw e
-    }
+  // Explicit target design — the one thing addLayer's own internal
+  // ensureActiveDesignId call can't do, needed for faithfully restoring a
+  // saved multi-design CAM job (see loadCamJobSnapshot) where each
+  // reconstructed file must land back on the design it was saved from
+  // rather than joining whatever the active design happens to be.
+  addLayerToDesign: async (file: File, designId: string) => {
+    await importLayerFile(get, set, file, designId)
   },
 
   removeLayer: (id: string) => {
@@ -1212,6 +1294,64 @@ export const useAppStore = create<AppState>((set, get) => ({
       stencilFiles: null, stencilPreview: null,
       packCandidates: null, selectedCandidateId: null,
     })
+  },
+
+  loadCamJobSnapshot: async (snapshot: CamJobSnapshot, contentByLayerFileId: Record<string, string>) => {
+    // One atomic set: every config slice from the snapshot, plus the same
+    // clear-list clearLayers uses for every computed/derived field — a
+    // restored job starts from a clean slate exactly like a fresh import,
+    // ready for the user to re-click Create Panel/Generate Routing/etc.
+    set({
+      camMode: snapshot.camMode,
+      activeTab: snapshot.activeTab,
+      designs: snapshot.designs,
+      activeDesignId: snapshot.activeDesignId,
+      materialSizeMm: snapshot.materialSizeMm,
+      panelConfig: snapshot.panelConfig,
+      panelInfo: snapshot.panelInfo,
+      outputFormat: snapshot.outputFormat,
+      targetUnit: snapshot.targetUnit,
+      boardViewSide: snapshot.boardViewSide,
+      viewMode: snapshot.viewMode,
+      boardColor: snapshot.boardColor,
+      dfmTemplateId: snapshot.dfmTemplateId,
+      dfmContext: snapshot.dfmContext,
+      routingConfig: snapshot.routingConfig,
+      gcodeContext: snapshot.gcodeContext,
+      panelArrayConfig: snapshot.panelArrayConfig,
+      stencilConfig: snapshot.stencilConfig,
+      panelTemplateId: snapshot.panelTemplateId,
+      showGrid: snapshot.showGrid,
+      showCrosshair: snapshot.showCrosshair,
+      layers: [], panelResult: null, boardView: null, boardViewsByDesign: {},
+      dfmReport: null, dfmFocus: null,
+      routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
+      panelArrayResult: null, panelArrayFiles: null,
+      stencilFiles: null, stencilPreview: null,
+      packCandidates: null, selectedCandidateId: null,
+    })
+
+    // Sequential, not Promise.all — each addLayerToDesign call appends
+    // exactly one layer, so "the last entry in state().layers" reliably
+    // identifies the layer this file just created, needed to patch its
+    // saved color/visible/opacity back on (addLayerToDesign always assigns
+    // fresh defaults, which would otherwise silently discard the user's
+    // manual per-layer edits from save time).
+    for (const meta of snapshot.files) {
+      const content = contentByLayerFileId[meta.layerFileId]
+      if (content === undefined) continue
+      const file = new File([content], meta.fileName)
+      await get().addLayerToDesign(file, meta.designId)
+      const current = get().layers
+      const newLayer = current[current.length - 1]
+      if (newLayer) {
+        set(state => ({
+          layers: state.layers.map(l => l.id === newLayer.id
+            ? { ...l, color: meta.color, visible: meta.visible, opacity: meta.opacity }
+            : l),
+        }))
+      }
+    }
   },
 
   rotateAllLayers: async (direction: 'left' | 'right') => {

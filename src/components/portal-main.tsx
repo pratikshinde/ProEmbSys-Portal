@@ -15,6 +15,7 @@ import StencilPanel from './stencil-panel';
 import { Button } from './ui/button';
 import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck, Scissors, Terminal, Boxes, Square, Stamp } from 'lucide-react';
 import { useAppStore } from '../lib/store';
+import { loadCamJobById } from '../lib/load-cam-job';
 import JSZip from 'jszip';
 import { analyzeGerberSet, GerberQuoteAnalysis } from '../lib/gerber-analysis';
 import type { PcbQuoteBreakdownV2 } from '../lib/pricing-engine';
@@ -56,7 +57,7 @@ const C = {
 const NAV_ITEMS: { key: string; label: string; href?: string }[] = [
   { key:"home",  label:"Home" },
   { key:"order", label:"PCB Order" },
-  { key:"panel", label:"Panelization" },
+  { key:"panel", label:"Panelization", href:"/panelization" },
   { key:"assembly", label:"Assembly" },
   { key:"shop",  label:"Shop" },
   { key:"blog",  label:"Blog" },
@@ -192,6 +193,9 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
         <DropdownMenuItem asChild>
           <Link href="/orders">My Orders</Link>
         </DropdownMenuItem>
+        <DropdownMenuItem asChild>
+          <Link href="/cam-jobs">My CAM Jobs</Link>
+        </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onClick={()=>signOut({ callbackUrl: "/" })}>Sign out</DropdownMenuItem>
       </DropdownMenuContent>
@@ -255,6 +259,7 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
               <div style={{ fontSize:12, color:C.text2, padding:"4px 14px", fontFamily:"'DM Sans',sans-serif" }}>{session?.user?.name || session?.user?.email}</div>
               <Link href="/account" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.text1, fontFamily:"'DM Sans',sans-serif" }}>My Account</Link>
               <Link href="/orders" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.text1, fontFamily:"'DM Sans',sans-serif" }}>My Orders</Link>
+              <Link href="/cam-jobs" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.text1, fontFamily:"'DM Sans',sans-serif" }}>My CAM Jobs</Link>
               <button onClick={()=>signOut({ callbackUrl: "/" })} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textAlign:"left", background:"transparent", border:"none", color:C.text1, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" }}>Sign out</button>
             </>
           ) : (
@@ -384,6 +389,7 @@ function PCBSchematic() {
 
 function HomePage({ setPage }) {
   const isMobile = useIsMobile();
+  const router = useRouter();
   const [activeService, setActiveService] = useState(0);
   const [tick, setTick] = useState(0);
   const [homeBlogPosts, setHomeBlogPosts] = useState<BlogPostSummary[]>([]);
@@ -559,7 +565,7 @@ function HomePage({ setPage }) {
                 onMouseLeave={e=>{ e.currentTarget.style.transform="none"; e.currentTarget.style.boxShadow="0 4px 24px rgba(245,158,11,0.35)"; }}>
                 Order PCBs →
               </button>
-              <button onClick={()=>setPage("panel")} style={{
+              <button onClick={()=>router.push("/panelization")} style={{
                 background:"transparent", color:C.accent2,
                 border:`1.5px solid ${C.border2}`, padding:"13px 28px",
                 borderRadius:8, fontSize:15, cursor:"pointer",
@@ -740,7 +746,7 @@ function HomePage({ setPage }) {
                   ))}
                 </div>
 
-                <button onClick={()=>setPage(sv.key)} style={{
+                <button onClick={()=>sv.key === "panel" ? router.push("/panelization") : setPage(sv.key)} style={{
                   background:sv.color, color: sv.color===C.gold?"#020d1f":"#fff",
                   border:"none", padding:"13px 28px", borderRadius:8,
                   fontSize:14, fontWeight:800, cursor:"pointer", letterSpacing:0.3,
@@ -1791,7 +1797,7 @@ function getDefaultSidebarWidth() {
   return 420;                          // Large desktop
 }
 
-function PanelizationPage() {
+export function PanelizationPage() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(340);
   const resizing = useRef(false);
@@ -1801,6 +1807,7 @@ function PanelizationPage() {
   const setActiveTab = useAppStore(s => s.setActiveTab);
   const camMode = useAppStore(s => s.camMode);
   const setCamMode = useAppStore(s => s.setCamMode);
+  const layers = useAppStore(s => s.layers);
 
   const onResizeStart = useCallback((e) => {
     e.preventDefault();
@@ -1848,6 +1855,24 @@ function PanelizationPage() {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
+  }, []);
+
+  // ?load=<jobId> — reload a saved CAM job, mirroring PCBOrderPage's own
+  // ?reorder= effect. No session check needed here (unlike that one): this
+  // whole route already sits behind the auth gate in
+  // src/app/panelization/page.tsx. Runs once on mount; loading a job while
+  // the tool already has layers confirms first, same discipline
+  // designs-panel.tsx already uses for "remove design".
+  useEffect(() => {
+    const loadId = new URLSearchParams(window.location.search).get('load');
+    if (!loadId) return;
+    if (layers.length > 0 && !confirm('Load this saved job? Your current unsaved work will be replaced.')) return;
+    (async () => {
+      const result = await loadCamJobById(loadId);
+      if (result.ok) toast({ title: 'Job loaded', description: result.name });
+      else toast({ title: 'Could not load job', description: result.error });
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -2455,6 +2480,7 @@ function BlogPage() {
 // ─── FOOTER ───────────────────────────────────────────────────────────────────
 
 function Footer({ setPage }) {
+  const router = useRouter();
   return (
     <footer style={{ background:C.bg0, borderTop:`1px solid ${C.border}`, padding:"48px 40px 28px", fontFamily:"'DM Sans',sans-serif" }}>
       <div style={{ maxWidth:1000, margin:"0 auto" }}>
@@ -2493,7 +2519,7 @@ function Footer({ setPage }) {
                 const page = link[0]
                 const label = link[1]
                 return (
-                  <div key={label} onClick={()=>setPage(page)} style={{ fontSize:13, color:C.text2, marginBottom:9, cursor:"pointer", transition:"color 0.15s" }}
+                  <div key={label} onClick={()=>page === "panel" ? router.push("/panelization") : setPage(page)} style={{ fontSize:13, color:C.text2, marginBottom:9, cursor:"pointer", transition:"color 0.15s" }}
                     onMouseEnter={e=>e.currentTarget.style.color=C.accent2} onMouseLeave={e=>e.currentTarget.style.color=C.text2}>
                     {label}
                   </div>
@@ -2517,7 +2543,7 @@ function Footer({ setPage }) {
 
 // ─── ROOT APP ─────────────────────────────────────────────────────────────────
 
-const PAGE_KEYS = ["home", "order", "panel", "assembly", "shop", "blog"];
+const PAGE_KEYS = ["home", "order", "assembly", "shop", "blog"];
 
 export default function App() {
   const [page, setPageState] = useState("home");
@@ -2541,6 +2567,13 @@ export default function App() {
   useEffect(() => {
     const readPage = () => {
       const requested = new URLSearchParams(window.location.search).get("page");
+      // "panel" moved out of the switcher into the real, auth-gated
+      // /panelization route — old bookmarks/links using ?page=panel still
+      // redirect there instead of silently falling back to Home.
+      if (requested === "panel") {
+        window.location.replace("/panelization");
+        return;
+      }
       setPageState(requested && PAGE_KEYS.includes(requested) ? requested : "home");
     };
     readPage();
@@ -2551,7 +2584,6 @@ export default function App() {
   const pages: Record<string, React.ReactNode> = {
     home:     <HomePage setPage={setPage}/>,
     order:    <PCBOrderPage/>,
-    panel:    <PanelizationPage/>,
     assembly: <AssemblyPage/>,
     shop:     <ShopPage cart={cart} setCart={setCart}/>,
     blog:     <BlogPage/>,

@@ -8,10 +8,20 @@ import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { FileText, Download, Package, Settings2, RotateCcw, AlertTriangle, Wrench } from 'lucide-react'
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { FileText, Download, Package, Settings2, RotateCcw, AlertTriangle, Wrench, Save, FolderOpen } from 'lucide-react'
 import { exportPanelizedGerbers } from '@/lib/gerber-exporter'
 import { LayerFile } from '@/lib/gerber-exporter'
 import { DrillFormatPreset, DRILL_FORMAT_PRESETS, DrillCamCompatibility } from '@/lib/panelization-engine'
+import { toast } from '@/hooks/use-toast'
+import type { CamJobFileMeta, CamJobSnapshot } from '@/lib/store'
+import { loadCamJobById } from '@/lib/load-cam-job'
+
+interface CamJobListItem {
+  id: string
+  name: string
+  updatedAt: string
+}
 
 export default function ExportPanel() {
   const panelInfo = useAppStore(s => s.panelInfo)
@@ -43,6 +53,112 @@ export default function ExportPanel() {
   // the G-Code tab's array section.
   const panelArrayFiles = useAppStore(s => s.panelArrayFiles)
   const [exporting, setExporting] = React.useState(false)
+
+  // Save Job — everything else this snapshot needs beyond what's already
+  // selected above (allLayers, camMode, panelConfig, panelInfo,
+  // outputFormat). See CamJobSnapshot's own doc comment in store.ts for
+  // exactly what is (and deliberately isn't) captured.
+  const activeTab = useAppStore(s => s.activeTab)
+  const designs = useAppStore(s => s.designs)
+  const activeDesignId2 = useAppStore(s => s.activeDesignId)
+  const materialSizeMm = useAppStore(s => s.materialSizeMm)
+  const targetUnit = useAppStore(s => s.targetUnit)
+  const boardViewSide = useAppStore(s => s.boardViewSide)
+  const viewMode = useAppStore(s => s.viewMode)
+  const boardColor = useAppStore(s => s.boardColor)
+  const dfmTemplateId = useAppStore(s => s.dfmTemplateId)
+  const dfmContext = useAppStore(s => s.dfmContext)
+  const routingConfig = useAppStore(s => s.routingConfig)
+  const gcodeContext = useAppStore(s => s.gcodeContext)
+  const panelArrayConfig = useAppStore(s => s.panelArrayConfig)
+  const stencilConfig = useAppStore(s => s.stencilConfig)
+  const panelTemplateId = useAppStore(s => s.panelTemplateId)
+  const showGrid = useAppStore(s => s.showGrid)
+  const showCrosshair = useAppStore(s => s.showCrosshair)
+
+  const [saveDialogOpen, setSaveDialogOpen] = React.useState(false)
+  const [jobName, setJobName] = React.useState('')
+  const [savingJob, setSavingJob] = React.useState(false)
+
+  const [loadDialogOpen, setLoadDialogOpen] = React.useState(false)
+  const [jobList, setJobList] = React.useState<CamJobListItem[] | null>(null)
+  const [loadingJobId, setLoadingJobId] = React.useState<string | null>(null)
+
+  const openLoadDialog = async () => {
+    setLoadDialogOpen(true)
+    setJobList(null)
+    try {
+      const res = await fetch('/api/cam-jobs')
+      setJobList(res.ok ? await res.json() : [])
+    } catch {
+      setJobList([])
+    }
+  }
+
+  const handleLoadJob = async (jobId: string) => {
+    if (allLayers.length > 0 && !confirm('Load this saved job? Your current unsaved work will be replaced.')) return
+    setLoadingJobId(jobId)
+    try {
+      const result = await loadCamJobById(jobId)
+      if (result.ok) {
+        toast({ title: 'Job loaded', description: result.name })
+        setLoadDialogOpen(false)
+      } else {
+        toast({ title: 'Could not load job', description: result.error })
+      }
+    } finally {
+      setLoadingJobId(null)
+    }
+  }
+
+  const openSaveDialog = () => {
+    setJobName(panelInfo.pcbName || 'Untitled Job')
+    setSaveDialogOpen(true)
+  }
+
+  const handleSaveJob = async () => {
+    if (!jobName.trim() || allLayers.length === 0) return
+    setSavingJob(true)
+    try {
+      const files: CamJobFileMeta[] = allLayers.map(l => ({
+        layerFileId: l.id,
+        designId: l.designId,
+        fileName: l.fileName,
+        type: l.type,
+        side: l.side,
+        color: l.color,
+        visible: l.visible,
+        opacity: l.opacity,
+        fileSize: l.originalContent.length,
+      }))
+      const snapshot: CamJobSnapshot = {
+        camMode, activeTab, designs, activeDesignId: activeDesignId2, materialSizeMm,
+        panelConfig, panelInfo, outputFormat, targetUnit, boardViewSide, viewMode, boardColor,
+        dfmTemplateId, dfmContext, routingConfig, gcodeContext, panelArrayConfig, stencilConfig,
+        panelTemplateId, showGrid, showCrosshair, files,
+      }
+
+      const formData = new FormData()
+      formData.set('name', jobName.trim())
+      formData.set('config', JSON.stringify(snapshot))
+      for (const l of allLayers) {
+        formData.set(`file_${l.id}`, new File([l.originalContent], l.fileName))
+      }
+
+      const res = await fetch('/api/cam-jobs', { method: 'POST', body: formData })
+      const data = await res.json()
+      if (!res.ok) {
+        toast({ title: 'Could not save job', description: data.error ?? 'Please try again.' })
+        return
+      }
+      toast({ title: 'Job saved', description: jobName.trim() })
+      setSaveDialogOpen(false)
+    } catch (err) {
+      toast({ title: 'Could not save job', description: err instanceof Error ? err.message : 'Please try again.' })
+    } finally {
+      setSavingJob(false)
+    }
+  }
 
   const handleExport = async () => {
     if (!panelResult || exportLayers.length === 0) return
@@ -595,8 +711,86 @@ export default function ExportPanel() {
             {formatLabel}, {outputFormat.unit}, {outputFormat.zeroOmission} zero omit, {outputFormat.notation} · includes outline, fiducials & README
             {panelArrayFiles && ' · includes Meta-Panelization/ (multi-panel-array Gerber + Excellon)'}
           </p>
+          <div className="grid grid-cols-2 gap-2">
+            <Button
+              variant="outline"
+              onClick={openSaveDialog}
+              disabled={allLayers.length === 0}
+              className="h-9 border-[#1a3a5c] text-[#94b8d4] hover:text-white hover:bg-[#0f2848] text-sm"
+            >
+              <Save className="w-4 h-4 mr-2" />
+              Save Job
+            </Button>
+            <Button
+              variant="outline"
+              onClick={openLoadDialog}
+              className="h-9 border-[#1a3a5c] text-[#94b8d4] hover:text-white hover:bg-[#0f2848] text-sm"
+            >
+              <FolderOpen className="w-4 h-4 mr-2" />
+              Load Job
+            </Button>
+          </div>
+          <p className="text-[10px] text-[#4a6f94] text-center">
+            Saves your uploaded files and every setting — reload it later here or from My CAM Jobs. Each save creates a new job.
+          </p>
         </div>
       </CardContent>
+
+      <Dialog open={saveDialogOpen} onOpenChange={setSaveDialogOpen}>
+        <DialogContent className="bg-[#0a1e38] border-[#1a3a5c] text-[#f0f8ff]">
+          <DialogHeader>
+            <DialogTitle className="text-[#f0f8ff]">Save CAM Job</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label className="text-[10px] text-[#4a6f94]">Job Name</Label>
+            <Input
+              value={jobName}
+              onChange={(e) => setJobName(e.target.value)}
+              className="h-8 text-sm bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]"
+              placeholder="e.g. relay_current_monitoring rev 1.0"
+              autoFocus
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              onClick={handleSaveJob}
+              disabled={!jobName.trim() || savingJob}
+              className="bg-[#0ea5e9] hover:bg-[#0ea5e9]/80 text-white"
+            >
+              {savingJob ? 'Saving...' : 'Save'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={loadDialogOpen} onOpenChange={setLoadDialogOpen}>
+        <DialogContent className="bg-[#0a1e38] border-[#1a3a5c] text-[#f0f8ff]">
+          <DialogHeader>
+            <DialogTitle className="text-[#f0f8ff]">Load CAM Job</DialogTitle>
+          </DialogHeader>
+          <div className="max-h-80 overflow-y-auto space-y-1.5">
+            {jobList === null ? (
+              <p className="text-xs text-[#4a6f94] py-4 text-center">Loading...</p>
+            ) : jobList.length === 0 ? (
+              <p className="text-xs text-[#4a6f94] py-4 text-center">No saved jobs yet.</p>
+            ) : (
+              jobList.map(job => (
+                <button
+                  key={job.id}
+                  onClick={() => handleLoadJob(job.id)}
+                  disabled={loadingJobId !== null}
+                  className="w-full text-left rounded-md border border-[#1a3a5c] bg-[#061628]/80 px-3 py-2 hover:border-[#0ea5e9] disabled:opacity-50 transition-colors"
+                >
+                  <div className="text-sm text-[#f0f8ff]">{job.name}</div>
+                  <div className="text-[10px] text-[#4a6f94] mt-0.5">
+                    {loadingJobId === job.id ? 'Loading...' : new Date(job.updatedAt).toLocaleDateString()}
+                  </div>
+                </button>
+              ))
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </Card>
   )
 }

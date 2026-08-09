@@ -40,6 +40,7 @@ model User {
   shopOrders          ShopOrder[]
   dfmTemplates        DfmTemplate[]
   panelTemplates      PanelTemplate[]
+  camJobs             CamJob[]
 
   @@map("users")
 }
@@ -491,4 +492,35 @@ model PanelTemplate {
   @@index([userId])
   @@index([scope])
   @@map("panel_templates")
+}
+
+// A saved snapshot of the CAM Panelization tool's working state, so a
+// logged-in user can pick up a job later instead of losing it on refresh.
+// No scope/isSystem concept (unlike DfmTemplate/PanelTemplate) — this is
+// personal work-in-progress, never a shared/published resource, so userId
+// is required (not nullable) with a hard Cascade on delete.
+model CamJob {
+  id     String @id @default(cuid())
+  userId String
+  name   String
+
+  // CamJobSnapshot (src/lib/store.ts) — flat CAM config slices (panelConfig,
+  // routingConfig, gcodeContext, panelArrayConfig, stencilConfig, designs,
+  // panelInfo, etc.) plus a `files[]` metadata array (fileName, designId,
+  // type, side, color, visible, opacity, fileSize per layer). File CONTENT
+  // is never duplicated here — it lives on disk under uploads/cam-jobs/<id>/,
+  // see src/lib/cam-job-files.ts. Never includes computed/derived state
+  // (panelResult, routingResult, gcodeFiles, dfmReport, ...) — those are
+  // recomputed by the user re-clicking Create Panel/Generate Routing/etc.
+  // after a load, matching the tool's existing "nothing auto-computes"
+  // convention.
+  config Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("cam_jobs")
 }
