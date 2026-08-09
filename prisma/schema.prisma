@@ -504,6 +504,14 @@ model CamJob {
   userId String
   name   String
 
+  // Denormalized out of `config.panelInfo.revision` (trimmed) purely so a
+  // (name, revision) pair can be enforced unique per user at the DB level —
+  // "always save as new" still holds for every other case, this only blocks
+  // a byte-identical name+revision collision, which is almost always an
+  // accidental re-save rather than an intentional new job. Kept in sync with
+  // `config` at write time; never read back into the snapshot on load.
+  revision String @default("")
+
   // CamJobSnapshot (src/lib/store.ts) — flat CAM config slices (panelConfig,
   // routingConfig, gcodeContext, panelArrayConfig, stencilConfig, designs,
   // panelInfo, etc.) plus a `files[]` metadata array (fileName, designId,
@@ -521,6 +529,7 @@ model CamJob {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@unique([userId, name, revision])
   @@index([userId])
   @@map("cam_jobs")
 }

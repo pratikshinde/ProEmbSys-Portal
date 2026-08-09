@@ -40,6 +40,7 @@ export async function POST(req: Request) {
   if (!Array.isArray(config.files)) {
     return NextResponse.json({ error: "Invalid config: missing files list." }, { status: 400 })
   }
+  const revision = typeof config.panelInfo?.revision === "string" ? config.panelInfo.revision.trim() : ""
 
   // Collect the file parts (keyed "file_<layerFileId>", matching config.files
   // entries by layerFileId) and enforce the total-size cap before writing
@@ -58,13 +59,32 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "This job's total file size is too large to save." }, { status: 400 })
   }
 
-  const job = await db.camJob.create({
-    data: {
-      userId,
-      name: name.trim(),
-      config: config as unknown as Prisma.InputJsonValue,
-    },
-  })
+  let job
+  try {
+    job = await db.camJob.create({
+      data: {
+        userId,
+        name: name.trim(),
+        revision,
+        config: config as unknown as Prisma.InputJsonValue,
+      },
+    })
+  } catch (err) {
+    // A job with this exact name+revision already exists for this user
+    // (unique(userId, name, revision)) — block rather than silently create a
+    // second row that's indistinguishable in the job list from the first.
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      return NextResponse.json(
+        {
+          error: revision
+            ? `A job named "${name.trim()}" with revision "${revision}" already exists. Rename the job or change the Revision field, then save again.`
+            : `A job named "${name.trim()}" already exists. Rename it or set a Revision in Panel Information, then save again.`,
+        },
+        { status: 409 }
+      )
+    }
+    throw err
+  }
 
   try {
     for (const { layerFileId, file } of fileEntries) {

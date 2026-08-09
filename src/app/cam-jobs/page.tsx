@@ -17,6 +17,7 @@ export default async function CamJobsListPage() {
   const rows: CamJobRow[] = jobs.map((job) => ({
     id: job.id,
     name: job.name,
+    revision: job.revision,
     updatedAt: job.updatedAt.toISOString(),
     config: job.config as unknown as CamJobSnapshot,
   }))

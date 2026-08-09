@@ -9,7 +9,17 @@ import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { FileText, Download, Package, Settings2, RotateCcw, AlertTriangle, Wrench, Save, FolderOpen } from 'lucide-react'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { FileText, Download, Package, Settings2, RotateCcw, AlertTriangle, Wrench, Save, FolderOpen, Trash2 } from 'lucide-react'
 import { exportPanelizedGerbers } from '@/lib/gerber-exporter'
 import { LayerFile } from '@/lib/gerber-exporter'
 import { DrillFormatPreset, DRILL_FORMAT_PRESETS, DrillCamCompatibility } from '@/lib/panelization-engine'
@@ -20,6 +30,7 @@ import { loadCamJobById } from '@/lib/load-cam-job'
 interface CamJobListItem {
   id: string
   name: string
+  revision: string
   updatedAt: string
 }
 
@@ -83,6 +94,7 @@ export default function ExportPanel() {
   const [loadDialogOpen, setLoadDialogOpen] = React.useState(false)
   const [jobList, setJobList] = React.useState<CamJobListItem[] | null>(null)
   const [loadingJobId, setLoadingJobId] = React.useState<string | null>(null)
+  const [deletingJob, setDeletingJob] = React.useState<CamJobListItem | null>(null)
 
   const openLoadDialog = async () => {
     setLoadDialogOpen(true)
@@ -109,6 +121,17 @@ export default function ExportPanel() {
     } finally {
       setLoadingJobId(null)
     }
+  }
+
+  const handleDeleteJob = async (job: CamJobListItem) => {
+    const res = await fetch(`/api/cam-jobs/${job.id}`, { method: 'DELETE' })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      toast({ title: 'Could not delete job', description: err.error ?? 'Please try again.' })
+      return
+    }
+    setJobList((prev) => (prev ? prev.filter((j) => j.id !== job.id) : prev))
+    toast({ title: 'Job deleted', description: job.name })
   }
 
   const openSaveDialog = () => {
@@ -148,7 +171,10 @@ export default function ExportPanel() {
       const res = await fetch('/api/cam-jobs', { method: 'POST', body: formData })
       const data = await res.json()
       if (!res.ok) {
-        toast({ title: 'Could not save job', description: data.error ?? 'Please try again.' })
+        toast({
+          title: res.status === 409 ? 'Duplicate job name + revision' : 'Could not save job',
+          description: data.error ?? 'Please try again.',
+        })
         return
       }
       toast({ title: 'Job saved', description: jobName.trim() })
@@ -750,6 +776,10 @@ export default function ExportPanel() {
               placeholder="e.g. relay_current_monitoring rev 1.0"
               autoFocus
             />
+            <p className="text-[10px] text-[#4a6f94]">
+              Saved as &ldquo;{jobName.trim() || '…'}&rdquo; · Revision &ldquo;{panelInfo.revision || '(none)'}&rdquo;
+              {' — '}must be unique together. Change the job name or the Revision field (Panel Information, below) to save a new version.
+            </p>
           </div>
           <DialogFooter>
             <Button
@@ -775,22 +805,64 @@ export default function ExportPanel() {
               <p className="text-xs text-[#4a6f94] py-4 text-center">No saved jobs yet.</p>
             ) : (
               jobList.map(job => (
-                <button
+                <div
                   key={job.id}
-                  onClick={() => handleLoadJob(job.id)}
-                  disabled={loadingJobId !== null}
-                  className="w-full text-left rounded-md border border-[#1a3a5c] bg-[#061628]/80 px-3 py-2 hover:border-[#0ea5e9] disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-1.5 rounded-md border border-[#1a3a5c] bg-[#061628]/80 pr-1.5 hover:border-[#0ea5e9] transition-colors"
                 >
-                  <div className="text-sm text-[#f0f8ff]">{job.name}</div>
-                  <div className="text-[10px] text-[#4a6f94] mt-0.5">
-                    {loadingJobId === job.id ? 'Loading...' : new Date(job.updatedAt).toLocaleDateString()}
-                  </div>
-                </button>
+                  <button
+                    onClick={() => handleLoadJob(job.id)}
+                    disabled={loadingJobId !== null}
+                    className="flex-1 min-w-0 text-left px-3 py-2 disabled:opacity-50"
+                  >
+                    <div className="text-sm text-[#f0f8ff] truncate">
+                      {job.name}
+                      {job.revision && <span className="text-[#4a6f94]"> · Rev {job.revision}</span>}
+                    </div>
+                    <div className="text-[10px] text-[#4a6f94] mt-0.5">
+                      {loadingJobId === job.id ? 'Loading...' : new Date(job.updatedAt).toLocaleDateString()}
+                    </div>
+                  </button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={loadingJobId !== null}
+                    onClick={() => setDeletingJob(job)}
+                    className="h-7 w-7 p-0 text-[#4a6f94] hover:text-red-400 hover:bg-red-950/30 flex-shrink-0"
+                    title="Delete job"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </Button>
+                </div>
               ))
             )}
           </div>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog open={!!deletingJob} onOpenChange={(open) => !open && setDeletingJob(null)}>
+        <AlertDialogContent className="bg-[#0a1e38] border-[#1a3a5c] text-[#f0f8ff]">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-[#f0f8ff]">Delete &ldquo;{deletingJob?.name}&rdquo;?</AlertDialogTitle>
+            <AlertDialogDescription className="text-[#94b8d4]">
+              This removes the saved job and its uploaded files. This can&apos;t be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-[#1a3a5c] text-[#94b8d4] hover:text-white hover:bg-[#0f2848]">
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (deletingJob) handleDeleteJob(deletingJob)
+                setDeletingJob(null)
+              }}
+              className="bg-red-600 hover:bg-red-500 text-white"
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Card>
   )
 }

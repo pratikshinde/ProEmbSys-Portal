@@ -19,6 +19,7 @@ import type { CamJobSnapshot } from "@/lib/store"
 export interface CamJobRow {
   id: string
   name: string
+  revision: string
   updatedAt: string
   config: CamJobSnapshot
 }
@@ -63,7 +64,10 @@ export default function CamJobsList({ initialJobs }: { initialJobs: CamJobRow[] 
             className="flex items-center justify-between gap-3 rounded-lg border border-border bg-card p-4 transition-colors hover:border-primary"
           >
             <Link href={`/panelization?load=${job.id}`} className="block flex-1">
-              <div className="font-semibold text-foreground">{job.name}</div>
+              <div className="font-semibold text-foreground">
+                {job.name}
+                {job.revision && <span className="font-normal text-muted-foreground"> · Rev {job.revision}</span>}
+              </div>
               <div className="text-sm text-muted-foreground">
                 {job.config.camMode === "multi" ? "Multi-Design" : "Single Design"} · {designCount} design
                 {designCount === 1 ? "" : "s"} · {layerCount} layer{layerCount === 1 ? "" : "s"}
