@@ -63,10 +63,21 @@ export default function GerberViewer() {
   const routingResult = useAppStore(s => s.routingResult)
   const routingFocus = useAppStore(s => s.routingFocus)
   const boardContour = useAppStore(s => s.boardContour)
+  const designs = useAppStore(s => s.designs)
+  const setDesignMirrorOverride = useAppStore(s => s.setDesignMirrorOverride)
+  const toggleLayerVisibility = useAppStore(s => s.toggleLayerVisibility)
+  const setAllLayersVisibility = useAppStore(s => s.setAllLayersVisibility)
 
   const [viewState, setViewState] = useState<ViewState>({ viewBox: '0 0 200 200', zoom: 1 })
   const [cursorPos, setCursorPos] = useState<{ gx: number; gy: number } | null>(null)
   const [containerSize, setContainerSize] = useState({ w: 800, h: 600 })
+  // Compact per-layer visibility flyout, for panel-view tabs (Panel Config,
+  // Routing, G-Code, Stencil, Info & Export) — those tabs show the whole
+  // panel, not the Layers sidebar, so toggling a single layer's visibility
+  // used to require switching to the Layers tab, toggling it, then switching
+  // back. This mirrors the Layers tab's own eye-icon toggle without
+  // duplicating its full per-layer detail (cmds/bounds/etc).
+  const [layerTogglesOpen, setLayerTogglesOpen] = useState(false)
 
   // Refs for panning
   const isPanningRef = useRef(false)
@@ -111,7 +122,20 @@ export default function GerberViewer() {
     } else {
       // Active-design-scoped, matching `visibleLayers` — the fit/zoom frame
       // must describe what's actually drawn, not a hidden design's extents.
-      const svgLayers = layers.filter(l => l.visible && l.svgData && !l.svgData.isEmpty && (!activeDesignId || l.designId === activeDesignId))
+      const allSvgLayers = layers.filter(l => l.visible && l.svgData && !l.svgData.isEmpty && (!activeDesignId || l.designId === activeDesignId))
+      // Prefer recognized layer types over an unclassified 'other' one when
+      // computing the fit-to-view frame — same reasoning as
+      // `resolveDesignGeometry`'s fallback in panelization-engine.ts: an
+      // 'other' layer's real meaning is unknown and can be far larger than
+      // the actual board (e.g. a customer-supplied mechanical/array
+      // reference file), which zooms the whole view out to fit it and
+      // renders the real copper/mask/silk layers as a tiny speck in a
+      // corner — reading as "I can't see individual layers" even though
+      // they're all rendering, just at the wrong scale. Only fall back to
+      // including 'other' layers when nothing else has visible SVG data, so
+      // a genuinely unclassified import still fits the view.
+      const typedSvgLayers = allSvgLayers.filter(l => l.type !== 'other')
+      const svgLayers = typedSvgLayers.length > 0 ? typedSvgLayers : allSvgLayers
       native = svgLayers.length > 0 ? mergeLayerBounds(svgLayers.map(l => l.svgData!)) : null
     }
 
@@ -127,6 +151,35 @@ export default function GerberViewer() {
     if (!combinedBounds) return 0
     return (combinedBounds.minX + combinedBounds.maxX) / 2
   }, [combinedBounds])
+
+  // Per-design "this design's bottom-side geometry is already stored
+  // bottom-view-correct, don't apply our standard mirror" escape hatch — see
+  // DesignEntry.mirrorBottomOverride's doc comment in store.ts for the real
+  // customer file that motivated this. Purely a DISPLAY decision: never
+  // read by export/panelization/DFM/routing, only by this viewer.
+  const designMirrorOverride = useCallback(
+    (designId: string) => designs.find(d => d.id === designId)?.mirrorBottomOverride ?? false,
+    [designs]
+  )
+  const activeDesignMirrorOverride = activeDesignId ? designMirrorOverride(activeDesignId) : false
+
+  // The UNMODIFIED "should Board+Bottom content mirror" condition — panel-wide
+  // overlays (fiducials/rib text/tooling holes via panelOverlayContent, and
+  // routed tool paths via routeOverlayContent) are physical panel/manufacturing
+  // features, not any one design's silkscreen convention, so they always use
+  // this raw condition regardless of any design's override.
+  const standardBottomMirror = viewMode === 'board' && boardViewSide === 'bottom' && !!combinedBounds
+
+  // The mirror actually applied to a design's own artwork (gerber-content,
+  // "no layers" placeholder, DFM markers, cursor/pan math). In a non-panel
+  // (single-PCB) view there's exactly one design on screen, so the active
+  // design's override can suppress the mirror at this top level directly. In
+  // a PANEL view, several designs' placements may disagree, so the top level
+  // always keeps the standard mirror and each placement's own group re-applies
+  // it (reflection-of-a-reflection = identity) to cancel it out individually
+  // — see the per-placement board-view rendering below.
+  const contentBottomMirror = standardBottomMirror && !(!isPanelViewTab(activeTab) && activeDesignMirrorOverride)
+  const bottomMirrorTransform = `translate(${boundsCenterX}, 0) scale(-1, 1) translate(${-boundsCenterX}, 0)`
 
   // Screen-space convention: screenY = -gerberY (set by Python transforms)
   // Cursor display: gerberY = -screenY (simple negation, no layer-specific offset needed)
@@ -154,7 +207,20 @@ export default function GerberViewer() {
 
     // Center content (with aspect-ratio correction)
     const offsetX = (scaledW - contentW) / 2
-    const offsetY = (scaledH - contentH) / 2
+    const vSlack = scaledH - contentH
+    // Reserve extra room at the TOP specifically, so a tightly-fit panel's
+    // own top-rib text/fiducials don't end up rendered directly underneath
+    // the floating toolbar overlays (view-mode/side bar, plus the per-layer
+    // visibility flyout on panel-view tabs) — those are absolutely
+    // positioned on top of the SVG canvas, not accounted for by the SVG's
+    // own viewBox math, so a symmetric top/bottom margin can leave a panel
+    // whose top edge sits right at the toolbar's screen height. Reserving
+    // toolbarReservePx generously covers the tallest toolbar state (both
+    // rows) uniformly; harmless elsewhere as a bit of extra top whitespace.
+    // Capped at the available vertical slack so this never crops CONTENT
+    // itself, only trades away symmetric centering for it.
+    const toolbarReservePx = 80
+    const offsetY = Math.min(toolbarReservePx / scale, vSlack)
 
     setViewState({
       viewBox: `${combinedBounds.minX - padding - offsetX} ${combinedBounds.minY - padding - offsetY} ${scaledW} ${scaledH}`,
@@ -182,14 +248,23 @@ export default function GerberViewer() {
     const scale = Math.min(w, h) / windowMm
     const vbW = w / scale
     const vbH = h / scale
-    const isBottomBoardView = viewMode === 'board' && boardViewSide === 'bottom' && !!combinedBounds
-    const cx = isBottomBoardView ? 2 * boundsCenterX - focusPoint.x : focusPoint.x
+    // contentBottomMirror correctly reduces to the panel-wide standard mirror
+    // in panel view (where routingFocus applies) and to the design-aware
+    // suppressed value in non-panel view (where dfmFocus applies, always
+    // scoped to the single active design) — see its own definition above.
+    // Known gap: a routingFocus point landing on a MULTI-design panel
+    // placement whose own design has the override set would pan to that
+    // placement's un-overridden (top-level) position, not its actual
+    // per-placement counter-mirrored one — narrow enough (override set AND a
+    // routing focus click on exactly that placement) to accept rather than
+    // thread per-placement awareness through this effect too.
+    const cx = contentBottomMirror ? 2 * boundsCenterX - focusPoint.x : focusPoint.x
     const cy = -focusPoint.y
     setViewState({
       viewBox: `${cx - vbW / 2} ${cy - vbH / 2} ${vbW} ${vbH}`,
       zoom: scale,
     })
-  }, [focusPoint, containerSize, viewMode, boardViewSide, combinedBounds, boundsCenterX])
+  }, [focusPoint, containerSize, contentBottomMirror, boundsCenterX])
 
   // Auto-fit when layers change
   useEffect(() => {
@@ -221,16 +296,19 @@ export default function GerberViewer() {
     let svgX = vb.x + (sx / w) * vb.w
     const svgY = vb.y + (sy / h) * vb.h
 
-    // If bottom board view is active, mirror the horizontal coordinate
-    const isBottomBoardView = viewMode === 'board' && boardViewSide === 'bottom'
-    if (isBottomBoardView && combinedBounds) {
+    // If bottom board view is active, mirror the horizontal coordinate.
+    // contentBottomMirror already accounts for the active design's own
+    // mirrorBottomOverride escape hatch in non-panel view (see its
+    // definition above) — same known per-placement gap as the pan-to-focus
+    // effect for a multi-design panel's individually overridden placement.
+    if (contentBottomMirror && combinedBounds) {
       const boundsCenterX = (combinedBounds.minX + combinedBounds.maxX) / 2
       svgX = 2 * boundsCenterX - svgX
     }
 
     // Convert screen space to Gerber space: gerberY = -screenY
     return { gx: svgX, gy: -svgY }
-  }, [containerSize, parseViewBox, viewMode, boardViewSide, combinedBounds])
+  }, [containerSize, parseViewBox, contentBottomMirror, combinedBounds])
 
   // Mouse wheel zoom
   const handleWheel = useCallback((e: WheelEvent) => {
@@ -448,10 +526,20 @@ export default function GerberViewer() {
   const boardModeLayersByDesign = useMemo(() => {
     const map = new Map<string, LayerEntry[]>()
     if (!isBoardMode) return map
-    for (const l of layers) {
-      if (!l.visible || !l.svgData || l.svgData.isEmpty) continue
-      if (l.type === 'fab' || l.type === 'other') continue
-      if (!(l.type === 'outline' || l.type === 'drill' || l.side === boardViewSide || l.side === 'none')) continue
+    // Z-index sorted, same as `visibleLayers`'s `.sort(...)` above — without
+    // this, layers paint in raw import order instead of the intended
+    // outline→copper→mask→silk→drill stack-up. Confirmed on a real file
+    // where the drill layer was the FIRST file in the archive: painted
+    // first (bottom), then covered by copper/mask/silk painted after it,
+    // so every through-hole rendered as solid copper with no visible hole
+    // anywhere on the panelized Board view.
+    const sorted = layers
+      .filter(l => l.visible && l.svgData && !l.svgData.isEmpty)
+      .filter(l => l.type !== 'fab' && l.type !== 'other')
+      .filter(l => l.type === 'outline' || l.type === 'drill' || l.side === boardViewSide || l.side === 'none')
+      .slice()
+      .sort((a, b) => getLayerZIndex(a.type) - getLayerZIndex(b.type))
+    for (const l of sorted) {
       const arr = map.get(l.designId)
       if (arr) arr.push(l)
       else map.set(l.designId, [l])
@@ -711,7 +799,52 @@ export default function GerberViewer() {
     // already baked in — negate Y (screenY = -gerberY) and use fill-rule
     // evenodd so counters cut out. Stroke-font mode keeps the native <text>.
     const useRegionGlyphs = panelConfig.textFont === 'region'
+    // Each rib-text line carries TWO variants (see `pushHorizontalPair` in
+    // panelization-engine.ts): a normal-reading copy and a pre-mirrored one,
+    // occupying the SAME on-screen span — the exporter picks exactly one
+    // per physical layer (top-side layers get `mirrored:false`, bottom-side
+    // layers get `mirrored:true`; see its own `t.mirrored` filters). The
+    // preview must make the same choice instead of drawing both at once, or
+    // both copies render simultaneously, permanently superimposed —
+    // confirmed live as the reported "garbled overlapping rib text".
+    //
+    // In Board mode `isMirrored` (`viewMode==='board' && boardViewSide===
+    // 'bottom'`, defined above) says exactly "will this whole overlay group
+    // get flipped" — showing the variant whose own `mirrored` flag matches
+    // it means a flipped group shows its pre-mirrored copy (which the flip
+    // un-mirrors back to normal reading) and an unflipped group shows its
+    // normal copy directly.
+    //
+    // Layers (individual overlay) mode never applies that outer flip at all
+    // — it shows raw file coordinates, same convention every layer's own
+    // content already uses there — so `isMirrored` is always false and,
+    // naively, the rib text would always show its normal-reading copy
+    // regardless of which side you're actually inspecting. Confirmed live
+    // as a real follow-up complaint: with only "copper (bottom)" toggled
+    // visible, the branding text still read normal instead of mirrored,
+    // even though every other bottom-side visibility cue (color, silk
+    // text) does flip. Fixed by deriving an effective mirror state from
+    // which layers are actually visible right now (scoped to the active
+    // design, same convention as every other Layers-mode visibility
+    // decision in this file): bottom-only visible ⇒ show the mirrored
+    // copy directly (its glyphs are already flipped in place — no outer
+    // transform needed to make that read as a mirror image on screen).
+    // Board mode's own already-verified `isMirrored` is left untouched.
+    const activeVisibleLayers = layers.filter(l => l.visible && (!activeDesignId || l.designId === activeDesignId))
+    const hasVisibleTopLayer = activeVisibleLayers.some(l => l.side === 'top')
+    const hasVisibleBottomLayer = activeVisibleLayers.some(l => l.side === 'bottom')
+    const infoTextMirror = viewMode === 'board' ? isMirrored : (hasVisibleBottomLayer && !hasVisibleTopLayer)
+    // Per-layer identification labels (e.g. "Top Copper") carry
+    // `targetLayerType`/`targetLayerSide` (panel-meta lines like the
+    // customer name never set these). Per direct request: only show a
+    // label while its own layer is actually toggled visible — e.g.
+    // selecting just "copper (top)" via the flyout should show only "Top
+    // Copper", not every same-side label overlaid together. Multiple
+    // same-side labels can still legitimately overlap if their layers are
+    // visible simultaneously — that overlap is expected, not a bug.
     for (const [idx, info] of pr.infoTexts.entries()) {
+      if (!!info.mirrored !== infoTextMirror) continue
+      if (info.targetLayerType && !activeVisibleLayers.some(l => l.type === info.targetLayerType && l.side === info.targetLayerSide)) continue
       if (useRegionGlyphs) {
         if (!info.text) continue
         const { outer, inner } = getRegionTextPolygons(info)
@@ -817,7 +950,7 @@ export default function GerberViewer() {
     )
 
     return elements
-  }, [panelResult, panelConfig, activeTab, visibleLayerTypes, layers, routingResult, boardContour])
+  }, [panelResult, panelConfig, activeTab, visibleLayerTypes, layers, routingResult, boardContour, activeDesignId, viewMode, boardViewSide])
 
   // Route overlay — router tool paths, tabs and mouse bites.
   //
@@ -956,9 +1089,7 @@ export default function GerberViewer() {
             per-layer overlay otherwise. */}
         <g 
           data-layer="gerber-content"
-          transform={viewMode === 'board' && boardViewSide === 'bottom' && combinedBounds
-            ? `translate(${boundsCenterX}, 0) scale(-1, 1) translate(${-boundsCenterX}, 0)`
-            : undefined}
+          transform={contentBottomMirror ? bottomMirrorTransform : undefined}
         >
           {isBoardMode ? (() => {
             // Board view: per-layer compositing with PCB-realistic colors.
@@ -970,7 +1101,7 @@ export default function GerberViewer() {
             if (bLayers.length === 0) {
               return (
                 <text x="0" y="0" fill="#888" fontSize="3" textAnchor="middle"
-                  transform={viewMode === 'board' && boardViewSide === 'bottom' ? 'scale(-1, 1)' : undefined}>
+                  transform={contentBottomMirror ? 'scale(-1, 1)' : undefined}>
                   No layers for {boardViewSide} side
                 </text>
               )
@@ -1076,8 +1207,19 @@ export default function GerberViewer() {
                     ) : rawDBgRect
                     const tx = pos.x - refBounds.minX
                     const ty = -pos.y - refBounds.maxY
+                    // Per-placement mirror override: a reflection composed
+                    // with itself is the identity, so re-applying the exact
+                    // same panel-wide mirror ONE level deeper (still around
+                    // the same boundsCenterX axis, still before the tx/ty
+                    // shift into this placement's own local coordinates)
+                    // exactly cancels the outer one for just this placement
+                    // — letting one design in a multi-design panel opt out
+                    // of the standard bottom mirror while its neighbors keep
+                    // it. See DesignEntry.mirrorBottomOverride in store.ts.
+                    const counterMirror = standardBottomMirror && designMirrorOverride(pos.designId)
                     return (
                       <g key={`panel-pos-${posIdx}`} clipPath={`url(#pcb-clip-${posIdx})`}>
+                        <g transform={counterMirror ? bottomMirrorTransform : undefined}>
                         <g transform={`translate(${tx.toFixed(6)}, ${ty.toFixed(6)})`}>
                           {dBgRect}
                           {dLayers.map(layer => {
@@ -1112,6 +1254,7 @@ export default function GerberViewer() {
                               />
                             )
                           })}
+                        </g>
                         </g>
                       </g>
                     )
@@ -1215,8 +1358,12 @@ export default function GerberViewer() {
                   if (!refBounds) return null
                   const tx = pos.x - refBounds.minX
                   const ty = -pos.y - refBounds.maxY
+                  // Same reflection-cancels-reflection counter-mirror as the
+                  // board-view branch above.
+                  const counterMirror = standardBottomMirror && designMirrorOverride(pos.designId)
                   return (
                     <g key={`panel-pos-${posIdx}`} clipPath={`url(#pcb-clip-${posIdx})`}>
+                      <g transform={counterMirror ? bottomMirrorTransform : undefined}>
                       <g transform={`translate(${tx.toFixed(6)}, ${ty.toFixed(6)})`}>
                         {dLayers.map(layer => {
                           if (!layer.svgData) return null
@@ -1229,6 +1376,7 @@ export default function GerberViewer() {
                             />
                           )
                         })}
+                      </g>
                       </g>
                     </g>
                   )
@@ -1254,9 +1402,7 @@ export default function GerberViewer() {
         {panelOverlayContent && (
           <g 
             data-layer="panel-overlay"
-            transform={viewMode === 'board' && boardViewSide === 'bottom' && combinedBounds
-              ? `translate(${boundsCenterX}, 0) scale(-1, 1) translate(${-boundsCenterX}, 0)`
-              : undefined}
+            transform={standardBottomMirror ? bottomMirrorTransform : undefined}
           >
             {panelOverlayContent}
           </g>
@@ -1274,9 +1420,7 @@ export default function GerberViewer() {
         {routeOverlayContent && (
           <g
             data-layer="route-overlay"
-            transform={viewMode === 'board' && boardViewSide === 'bottom' && combinedBounds
-              ? `translate(${boundsCenterX}, 0) scale(-1, 1) translate(${-boundsCenterX}, 0)`
-              : undefined}
+            transform={standardBottomMirror ? bottomMirrorTransform : undefined}
           >
             {routeOverlayContent}
           </g>
@@ -1289,9 +1433,7 @@ export default function GerberViewer() {
         {dfmMarkers.length > 0 && (
           <g
             data-layer="dfm-markers"
-            transform={viewMode === 'board' && boardViewSide === 'bottom' && combinedBounds
-              ? `translate(${boundsCenterX}, 0) scale(-1, 1) translate(${-boundsCenterX}, 0)`
-              : undefined}
+            transform={contentBottomMirror ? bottomMirrorTransform : undefined}
           >
             {dfmMarkers.map((m, i) => {
               // Keep the marker a constant on-screen size regardless of zoom.
@@ -1382,6 +1524,20 @@ export default function GerberViewer() {
                     className={`px-2 py-1 rounded transition-colors ${boardViewSide === 'bottom' ? 'bg-[#38bdf8] text-white' : 'text-[#94b8d4] hover:bg-[#0f2848]/50'}`}
                     title={botHasCopperOrSilk ? 'Bottom side' : 'Bottom side (no copper/silk layers)'}
                   >Bottom{!botHasCopperOrSilk && <span className="ml-0.5 opacity-50">∅</span>}</button>
+                  {/* Per-design escape hatch for legacy CAM exports that store
+                      bottom-side artwork already bottom-view-correct instead
+                      of the now-universal "mirror it once for physical-bottom
+                      viewing" convention — see DesignEntry.mirrorBottomOverride
+                      in store.ts. Only meaningful while looking at the bottom
+                      side; cosmetic display-only, never touches exported
+                      Gerbers. */}
+                  {boardViewSide === 'bottom' && activeDesignId && (
+                    <button
+                      onClick={() => setDesignMirrorOverride(activeDesignId, !activeDesignMirrorOverride)}
+                      className={`px-2 py-1 rounded transition-colors text-[11px] ${activeDesignMirrorOverride ? 'bg-amber-500 text-white' : 'text-[#94b8d4] hover:bg-[#0f2848]/50'}`}
+                      title="Some legacy CAM exports store bottom-side layers already correctly oriented for direct viewing, instead of the standard mirrored-from-the-top convention this viewer normally flips back. If bottom-side text/silkscreen reads backwards for THIS design, toggle this to undo the standard flip. Per-design, display-only — never affects exported Gerbers."
+                    >⇋ Fix mirror</button>
+                  )}
                   {/* Soldermask color swatches — Board view only (cosmetic preview, no effect on export) */}
                   <span className="w-px bg-[#1a3a5c] mx-0.5" />
                   <div className="flex items-center gap-1 px-0.5">
@@ -1410,6 +1566,54 @@ export default function GerberViewer() {
         )
       })()}
 
+      {/* Compact per-layer visibility flyout — panel-view tabs only (Panel
+          Config/Routing/G-Code/Stencil/Info & Export). Those tabs render the
+          whole panel, not the Layers sidebar, so without this a user has to
+          switch to the Layers tab, toggle a layer, then switch back just to
+          check one feature (e.g. "does the L-shape mark show up on the Mask
+          layer") on the panelized output. Scoped to the active design, same
+          convention as `combinedBounds`/`visibleLayers` above. */}
+      {isPanelViewTab(activeTab) && layers.length > 0 && (() => {
+        const panelLayers = layers.filter(l => !activeDesignId || l.designId === activeDesignId)
+        const visibleCount = panelLayers.filter(l => l.visible).length
+        return (
+          <div className="absolute top-11 left-2 text-xs font-medium">
+            <button
+              onClick={() => setLayerTogglesOpen(o => !o)}
+              className={`px-2 py-1 rounded border transition-colors flex items-center gap-1 ${
+                layerTogglesOpen ? 'bg-[#0ea5e9] text-white border-[#0ea5e9]' : 'bg-[#020d1f]/85 text-[#94b8d4] border-[#1a3a5c] hover:bg-[#0f2848]/50'
+              }`}
+              title="Show/hide individual layers on the panelized view"
+            >
+              Layers {visibleCount}/{panelLayers.length} ▾
+            </button>
+            {layerTogglesOpen && (
+              <div className="mt-1 w-56 max-h-64 overflow-y-auto bg-[#020d1f]/95 rounded border border-[#1a3a5c] p-1.5 shadow-lg">
+                <div className="flex items-center justify-between px-1 pb-1 mb-1 border-b border-[#1a3a5c] text-[#4a6f94]">
+                  <span>Panel layers</span>
+                  <div className="flex gap-2">
+                    <button onClick={() => setAllLayersVisibility(true)} className="text-[#0ea5e9] hover:underline">Show all</button>
+                    <button onClick={() => setAllLayersVisibility(false)} className="text-[#0ea5e9] hover:underline">Hide all</button>
+                  </div>
+                </div>
+                {panelLayers.map(layer => (
+                  <button
+                    key={layer.id}
+                    onClick={() => toggleLayerVisibility(layer.id)}
+                    className="w-full flex items-center gap-1.5 px-1 py-1 rounded hover:bg-[#0f2848]/60 text-left"
+                  >
+                    <span className="w-2.5 h-2.5 rounded-full flex-shrink-0 border border-black/30" style={{ backgroundColor: layer.color }} />
+                    <span className={`flex-1 truncate ${layer.visible ? 'text-[#e2eefc]' : 'text-[#4a6f94]'}`}>
+                      {layer.type}{layer.side !== 'none' ? ` (${layer.side})` : ''}
+                    </span>
+                    <span className={layer.visible ? 'text-green-400' : 'text-[#4a6f94]'}>{layer.visible ? '●' : '○'}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )
+      })()}
 
       {/* Zoom controls */}
       <div className="absolute top-2 right-2 flex flex-col gap-1">

@@ -1586,9 +1586,23 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
       continue
     }
 
-    // % — End of header, start of body
+    // % — End of header, start of body. But some Protel/OrCAD exports (no
+    // M48 at all) open the file with a bare '%' as a vestigial/placeholder
+    // marker BEFORE the tool table, not after a real header — e.g.
+    // "%\nT2C0.039F200S100\nX000850Y004600\n...". Treating that leading '%'
+    // as end-of-header flips inBody=true before any tool def is read, so
+    // every T<n>C<dia> line that follows falls into body-parsing (which
+    // doesn't recognize tool defs) and is silently dropped — hole POSITIONS
+    // still parse fine via the body X/Y branch, but every hole ends up with
+    // no diameter (toolCount 0, apertures empty). Only honor '%' as ending a
+    // real header — one that actually opened via M48 or already yielded at
+    // least one tool/format token; otherwise it's a no-op and header parsing
+    // (including the tool-def regex below) continues, exactly as if this
+    // line were blank.
     if (clean === '%') {
-      inBody = true
+      if (sawM48 || apertures.size > 0 || formatFromHeader) {
+        inBody = true
+      }
       continue
     }
 
@@ -1737,6 +1751,19 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
             width: dia,
           })
         }
+        // Also select it. Harmless for the standard "declare every tool in
+        // the header, select by bare T<n> in the body" convention (the
+        // body's own select overwrites this before any flash is emitted)
+        // — but load-bearing for the interleaved definition+select dialect
+        // (see the body-mode toolDefInBodyMatch below): the FIRST such line
+        // in a file with no M48 is always read here, still in header mode,
+        // one line before the headerless-auto-detect heuristic ever flips
+        // to body parsing. Without this, that tool is never actually
+        // selected, and its holes silently inherit whatever `currentTool`
+        // fallback the first coordinate line defaults to instead (observed:
+        // every hole of the FIRST declared tool misattributed to a
+        // different tool's diameter).
+        currentTool = code
         continue
       }
 
@@ -1800,6 +1827,27 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
       const toolSelectMatch = clean.match(/^T(\d{1,2})$/i)
       if (toolSelectMatch) {
         currentTool = parseInt(toolSelectMatch[1], 10)
+        continue
+      }
+
+      // Tool select that ALSO (re)declares its diameter mid-body —
+      // "T2C0.039F200S100" — rather than the usual header-declares-all /
+      // body-selects-by-bare-number convention. Some Protel/OrCAD exports
+      // (no M48 at all) interleave a full definition+select line directly
+      // in front of that tool's own block of hits instead of ever using a
+      // bare "T01" select. The header-side tool-def match above only runs
+      // while still in header mode, so once body parsing starts (as it does
+      // here, well before a later tool like T3/T4 is reached) these lines
+      // would otherwise match nothing at all — silently leaving every hole
+      // drilled under that tool with `apertureCode: null` (no diameter).
+      const toolDefInBodyMatch = clean.match(/^T(\d{1,2})(?:[FSBH][\d.]+)*C([\d.]+)/i)
+      if (toolDefInBodyMatch) {
+        const code = parseInt(toolDefInBodyMatch[1], 10)
+        const dia = parseFloat(toolDefInBodyMatch[2])
+        if (dia > 0 && !apertures.has(code)) {
+          apertures.set(code, { code, shape: 'circle', width: dia })
+        }
+        currentTool = code
         continue
       }
 

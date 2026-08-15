@@ -125,6 +125,21 @@ export interface DesignEntry {
    *  materialization actually ships; nothing sets it today. */
   rotationBlockedReason: string | null
   priority: number
+  /** Some legacy CAM exports (pre-dating the now-universal "every layer
+   *  shares one coordinate system, viewed from the top" Gerber convention)
+   *  store BOTTOM-side layers already in bottom-view-correct orientation
+   *  instead of the mirrored-for-an-X-ray-view-from-the-top convention every
+   *  modern tool (KiCad/Altium/Eagle) uses. The Board view's Bottom-side
+   *  mirror (`gerber-viewer.tsx`) assumes the standard convention, so a file
+   *  like that renders backwards (confirmed on a real ~1990s-2000s Protel/
+   *  OrCAD export: reference-designator silkscreen text read correctly in
+   *  the raw parsed data but backwards once our standard mirror was
+   *  applied). No Gerber field declares which convention a file uses, so
+   *  this can't be auto-detected — it's a manual per-design escape hatch,
+   *  purely cosmetic (display-only, exactly like `boardColor` — never
+   *  touches exported Gerbers, panelization, DFM, or routing geometry).
+   *  Default false preserves today's behavior for every normal file. */
+  mirrorBottomOverride: boolean
 }
 
 /** Palette for auto-assigning a new design a distinguishing color — cycles
@@ -214,6 +229,12 @@ interface AppState {
   renameDesign: (id: string, name: string) => void
   updateDesign: (id: string, updates: Partial<Pick<DesignEntry, 'minCount' | 'maxCount' | 'allowRotation' | 'priority'>>) => void
   removeDesign: (id: string) => void
+  /** Purely cosmetic per-design display toggle — see `DesignEntry.mirrorBottomOverride`.
+   *  Deliberately separate from `updateDesign`: that setter nulls out
+   *  `packCandidates`/`selectedCandidateId` because min/max/rotation feed the
+   *  packer directly, but this field never does (matches `renameDesign`'s
+   *  no-side-effect shape, not `updateDesign`'s). */
+  setDesignMirrorOverride: (id: string, value: boolean) => void
 
   /**
    * Tool-wide mode: 'single' (default) is the classic one-board grid
@@ -786,6 +807,7 @@ function ensureActiveDesignId(get: () => AppState, set: (fn: (s: AppState) => Pa
     // (see findPackCandidatesAction's own doc). rotationBlockedReason is
     // reserved for when it is.
     minCount: 1, maxCount: null, allowRotation: false, rotationBlockedReason: null, priority: 0,
+    mirrorBottomOverride: false,
   }
   set(() => ({ designs: [entry], activeDesignId: id }))
   return id
@@ -824,6 +846,7 @@ function createDesignFromArchiveName(get: () => AppState, set: (fn: (s: AppState
   const entry: DesignEntry = {
     id, name, color: DESIGN_COLORS[designs.length % DESIGN_COLORS.length],
     minCount: 1, maxCount: null, allowRotation: false, rotationBlockedReason: null, priority: designs.length,
+    mirrorBottomOverride: false,
   }
   set(state => ({ designs: [...state.designs, entry], activeDesignId: id }))
   return id
@@ -1078,6 +1101,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   setActiveDesignId: (id: string) => set({ activeDesignId: id }),
   renameDesign: (id: string, name: string) =>
     set(state => ({ designs: state.designs.map(d => d.id === id ? { ...d, name } : d) })),
+
+  setDesignMirrorOverride: (id: string, value: boolean) =>
+    set(state => ({ designs: state.designs.map(d => d.id === id ? { ...d, mirrorBottomOverride: value } : d) })),
 
   updateDesign: (id, updates) =>
     set(state => ({
@@ -1482,7 +1508,16 @@ export const useAppStore = create<AppState>((set, get) => ({
 
       // Collect all Gerber-compatible files from the zip
       // Comprehensive extension list covering KiCad, Altium, Eagle, PADS, CAM350, etc.
-      const gerberExtensions = /\.(gerber|gtl|gbl|gts|gbs|gto|gbo|gko|gtp|gbp|drl|txt|text|gbr|gt1|gt2|gt3|gt4|gt5|gt6|gb1|gb2|gb3|gb4|gb5|gb6|gm1|gm2|gm3|top|bot|sold|smt|smc|smb|pts|pli|pho|asc|cmp|sol|bslk|scmp|tslk|drill|cnc|xln|tap|nc|exc|rou|board|outline|silk|mask|paste|fab|mech|dim|drawing|plumbing)$/i
+      // ssb/sst (PADS-style bottom/top silkscreen — sibling of the already-
+      // present smb/smt soldermask pair) and drd (Protel/OrCAD "drill
+      // drawing" reference layer) were missing: a real customer zip
+      // (WLC_Economy — 5 real Gerber/drill files, one non-Gerber layer-stack
+      // manifest) had its SSB and DRD files silently dropped on import, with
+      // the UI still reporting "3 of 3 layers imported successfully" since
+      // the fallback-to-all-files pass only runs when NOTHING in the archive
+      // matches this list at all — it never fires when some files match and
+      // others don't, so a partial drop like this produces zero warning.
+      const gerberExtensions = /\.(gerber|gtl|gbl|gts|gbs|gto|gbo|gko|gtp|gbp|drl|txt|text|gbr|gt1|gt2|gt3|gt4|gt5|gt6|gb1|gb2|gb3|gb4|gb5|gb6|gm1|gm2|gm3|top|bot|sold|smt|smc|smb|sst|ssb|pts|pli|pho|asc|cmp|sol|bslk|scmp|tslk|drill|drd|cnc|xln|tap|nc|exc|rou|board|outline|silk|mask|paste|fab|mech|dim|drawing|plumbing)$/i
 
       // Get all entries, filter to files (not directories) with matching extensions
       const entries: { path: string; file: JSZip.JSZipObject }[] = []
@@ -1708,7 +1743,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       const list = extractor.getFileList()
       const fileHeaders = [...list.fileHeaders]
       
-      const gerberExtensions = /\.(gerber|gtl|gbl|gts|gbs|gto|gbo|gko|gtp|gbp|drl|txt|text|gbr|gt1|gt2|gt3|gt4|gt5|gt6|gb1|gb2|gb3|gb4|gb5|gb6|gm1|gm2|gm3|top|bot|sold|smt|smc|smb|pts|pli|pho|asc|cmp|sol|bslk|scmp|tslk|drill|cnc|xln|tap|nc|exc|rou|board|outline|silk|mask|paste|fab|mech|dim|drawing|plumbing)$/i
+      // ssb/sst (PADS-style bottom/top silkscreen — sibling of the already-
+      // present smb/smt soldermask pair) and drd (Protel/OrCAD "drill
+      // drawing" reference layer) were missing: a real customer zip
+      // (WLC_Economy — 5 real Gerber/drill files, one non-Gerber layer-stack
+      // manifest) had its SSB and DRD files silently dropped on import, with
+      // the UI still reporting "3 of 3 layers imported successfully" since
+      // the fallback-to-all-files pass only runs when NOTHING in the archive
+      // matches this list at all — it never fires when some files match and
+      // others don't, so a partial drop like this produces zero warning.
+      const gerberExtensions = /\.(gerber|gtl|gbl|gts|gbs|gto|gbo|gko|gtp|gbp|drl|txt|text|gbr|gt1|gt2|gt3|gt4|gt5|gt6|gb1|gb2|gb3|gb4|gb5|gb6|gm1|gm2|gm3|top|bot|sold|smt|smc|smb|sst|ssb|pts|pli|pho|asc|cmp|sol|bslk|scmp|tslk|drill|drd|cnc|xln|tap|nc|exc|rou|board|outline|silk|mask|paste|fab|mech|dim|drawing|plumbing)$/i
       const excludeExtensions = /\.(pdf|doc|docx|xls|xlsx|png|jpg|jpeg|gif|bmp|svg|html|htm|csv|md|rtf|odt|zip|rar|7z|tar|gz)$/i
 
       // Filter entries by extension

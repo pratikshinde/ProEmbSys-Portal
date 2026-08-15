@@ -793,7 +793,21 @@ export function resolveDesignGeometry<T extends DesignGeometrySource>(layers: T[
   let boundsLayer = outlineLayer
   let fromFallback = false
   if (!boundsLayer) {
-    const visibleWithBounds = layers.filter(l => l.visible !== false && l.parsedLayer?.bounds)
+    const allVisibleWithBounds = layers.filter(l => l.visible !== false && l.parsedLayer?.bounds)
+    // Prefer a recognized layer type (copper/mask/silk/drill/paste/fab) over
+    // an unclassified 'other' one for the largest-area fallback — an 'other'
+    // layer's real meaning is unknown (could be a mechanical drawing, a
+    // customer-supplied panel/array reference, dimension annotations, etc.),
+    // and is often far larger than the real board, which silently inflates
+    // the whole panel to that layer's size instead of the PCB's own
+    // footprint. Confirmed on a real customer file: a 378.7×260.5mm
+    // unclassified "Other/Unspecified" layer (not a per-board outline) got
+    // picked over the real ~66×116mm copper/mask/silk bounds, sizing a 1×3
+    // panel at ~1147×270mm. Only fall back to 'other' layers when nothing
+    // else has usable bounds, so a genuinely unclassified single-layer
+    // import still panelizes rather than silently failing.
+    const typedWithBounds = allVisibleWithBounds.filter(l => l.type !== 'other')
+    const visibleWithBounds = typedWithBounds.length > 0 ? typedWithBounds : allVisibleWithBounds
     if (visibleWithBounds.length > 0) {
       boundsLayer = visibleWithBounds.reduce((best, layer) => {
         const b = layer.parsedLayer!.bounds!
@@ -1984,10 +1998,31 @@ export function generatePanelMetaText(
     firstCharX = clearedFirstCharX
   }
 
+  // Group-center around the rib's vertical middle, same as before — but the
+  // name line is forced to place even when `config.sideRibTop` is smaller
+  // than one line's height (`topLinesFit`'s `Math.max(1, ...)` floor, right
+  // above), since it's never dropped. Centering on a rib that's too small
+  // for it pushes the group's bottom edge past the rib's own lower boundary
+  // (`panelHeight - config.sideRibTop`, where the PCB grid starts) and
+  // straight onto the fabricated board's own silkscreen/copper — confirmed
+  // live with a 2mm top rib at the default 2.8mm font (line height 3.92mm):
+  // "Customer Name : PCB-001" rendered directly on top of the first row of
+  // component silkscreen. Glyphs span ±fontSize/2 around their own anchor
+  // (region-font.ts's `perpOffsetNorm = -0.5`), so shift the whole group
+  // UP by whatever the bottom-most glyph edge would otherwise overshoot by.
+  // This only engages when the rib is genuinely too small for the text
+  // (the common case, rib comfortably bigger than the font, is a no-op) —
+  // shifting outward past the panel's own top edge into blank border space
+  // is the correct trade against overlapping real board content, matching
+  // this text's own documented "cosmetic branding, not fabrication-safety"
+  // status elsewhere in this function.
+  const topGroupOffset = ((placedOnTop.length - 1) / 2) * topLineHeight
+  const topGroupBottomY = topRibY - topGroupOffset - topFontSize / 2
+  const topGridBoundaryY = panelHeight - config.sideRibTop
+  const topRibYShift = Math.max(0, topGridBoundaryY - topGroupBottomY)
+
   placedOnTop.forEach((lineText, i) => {
-    // Stack downward, centered as a group around the rib's vertical middle.
-    const groupOffset = ((placedOnTop.length - 1) / 2) * topLineHeight
-    const lineY = topRibY + groupOffset - i * topLineHeight
+    const lineY = topRibY + topRibYShift + topGroupOffset - i * topLineHeight
     console.log(`[Top Rib] Adding line ${i}: "${lineText}" at ${firstCharX.toFixed(2)}mm`)
     pushHorizontalPair(lineText, firstCharX, lineY, topFontSize, 'top-rib')
   })
