@@ -776,12 +776,15 @@ function identityPanelContext(): { panel: PanelResult; config: PanelConfig } {
       designs: [],
       toolingHoles: [], fiducials: [], infoTexts: [],
       source: 'grid',
+      vScoreLines: [],
     },
     config: {
       ...DEFAULT_PANEL_CONFIG,
       enableLShapeMarks: false,
       enableToolingHoles: false,
       enableFiducials: false,
+      enableVScoreMarks: false,
+      enableVScoreLayer: false,
     },
   }
 }
@@ -2353,7 +2356,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         pcbHeight,
         result.placements,
         result.toolingHoles,
-        result.fiducials
+        result.fiducials,
+        result.vScoreLines
       )
 
       // Append layer labels to the panel result's info texts

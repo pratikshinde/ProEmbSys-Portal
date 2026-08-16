@@ -3,7 +3,7 @@
 import React, { useRef, useEffect, useLayoutEffect, useCallback, useState, useMemo } from 'react'
 import { useAppStore, getLayerZIndex, isPanelViewTab, type LayerEntry } from '@/lib/store'
 import { mergeLayerBounds, GerberSvgResult } from '@/lib/gerber-svg'
-import { PanelResult, isRectangularOutline } from '@/lib/panelization-engine'
+import { PanelResult, isRectangularOutline, computeVScoreMarkStrokes } from '@/lib/panelization-engine'
 import { getRegionTextPolygons } from '@/lib/region-font'
 import { BOARD_COLOR_NAMES, BOARD_COLOR_PALETTE, EXPOSED_SUBSTRATE_COLOR, getPcbColor, PCB_OPACITY, silkColorFor, getMaskClipPairs } from '@/lib/board-colors'
 import { RawSvgGroup, RawSvgMask } from './raw-svg-group'
@@ -789,6 +789,39 @@ export default function GerberViewer() {
             )
           }
         })
+      }
+    }
+
+    // V-score alignment marks on the ribs (Y-inverted) — preview of the
+    // built-in copper/mask marks `generatePanelizedGerber` adds in export
+    // step 6.7. Gated exactly the same way the exporter gates it, and uses
+    // the SAME shared `computeVScoreMarkStrokes` generator so preview and
+    // export can never disagree on shape.
+    if (pc.enableVScoreMarks && (visibleLayerTypes.has('copper') || visibleLayerTypes.has('mask')) && pr.vScoreLines.length > 0) {
+      const strokes = computeVScoreMarkStrokes(pr.vScoreLines, pr.panelWidth, pr.panelHeight, pc)
+      strokes.forEach((stroke, si) => {
+        const d = stroke.map((pt, i) => `${i === 0 ? 'M' : 'L'}${pt.x} ${-pt.y}`).join('')
+        elements.push(
+          <path key={`vscore-mark-${si}`}
+            d={d} fill="none" stroke="rgba(255,165,0,0.9)" strokeWidth={0.15}
+            vectorEffect="non-scaling-stroke" />
+        )
+      })
+    }
+
+    // V-score standalone documentation layer preview (Y-inverted) — full-
+    // length dashed lines, distinct color, independent of which layer types
+    // are visible since it's its own separate file.
+    if (pc.enableVScoreLayer && pr.vScoreLines.length > 0) {
+      for (const [li, line] of pr.vScoreLines.entries()) {
+        const d = line.axis === 'x'
+          ? `M${line.coord} ${0}L${line.coord} ${-pr.panelHeight}`
+          : `M${0} ${-line.coord}L${pr.panelWidth} ${-line.coord}`
+        elements.push(
+          <path key={`vscore-line-${li}`}
+            d={d} fill="none" stroke="rgba(0,200,255,0.6)" strokeWidth={0.1}
+            strokeDasharray="1.5 1" vectorEffect="non-scaling-stroke" />
+        )
       }
     }
 

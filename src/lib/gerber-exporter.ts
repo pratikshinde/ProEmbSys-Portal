@@ -32,6 +32,7 @@ import {
 } from './panelization-engine'
 import { collectMouseBiteHoles, type RoutingResult } from './routing/types'
 import { generateRouteGerber } from './routing/emit-gerber'
+import { generateVScoreGerber } from './vscore/emit-gerber'
 import { generateRoutFile, generateMouseBiteDrill } from './routing/emit-excellon'
 import type { GcodeFile } from './routing/gcode'
 import type { PanelArrayResult } from './panel-array'
@@ -197,6 +198,13 @@ export async function exportPanelizedGerbers(
   // Generate panel outline with 0.1mm width
   const outlineGerber = generatePanelOutlineGerber(panel, { ...config, panelBorderWidth: 0.1 }, fmt)
   folder.file(`${partNumber}_Panel_Border.gerber`, outlineGerber)
+
+  // V-score documentation layer (full-length score lines + rib marks), when
+  // enabled and the panel actually has computed score lines.
+  if (config.enableVScoreLayer && panel.vScoreLines.length > 0) {
+    const vScoreGerber = generateVScoreGerber(panel, config, fmt)
+    folder.file(`${partNumber}_VScore.gerber`, vScoreGerber)
+  }
 
   // Routing (router tool paths + mouse bites), when a plan has been generated
   writeRouteFiles(folder, partNumber, routing, config, panel, fmt)
@@ -663,6 +671,13 @@ function generateReadme(
   lines.push(`Tooling Holes: ${config.enableToolingHoles ? `Enabled (${config.toolingHoleDiameter}mm)` : 'Disabled'}`)
   lines.push(`Reference Holes: ${config.enableToolingHoles ? `Enabled (${config.referenceHoleDiameter}mm)` : 'Disabled'}`)
   lines.push(`Fiducials: ${config.enableFiducials ? `Enabled (⌀ Copper: ${config.fiducialDiameter}mm, ⌀ Mask: ${config.fiducialClearance}mm, Top: ${config.fiducialsTop !== false ? 'Yes' : 'No'}, Bottom: ${config.fiducialsBottom !== false ? 'Yes' : 'No'})` : 'Disabled'}`)
+  if (config.enableVScoreMarks) {
+    const internalCount = panel.vScoreLines.filter(l => l.kind === 'internal').length
+    const railCount = panel.vScoreLines.filter(l => l.kind === 'rail').length
+    lines.push(`V-Score Marks: Enabled (style ${config.vScoreMarkStyle}, size ${config.vScoreMarkSizeMm}mm, ${internalCount} internal / ${railCount} rail)`)
+  } else {
+    lines.push('V-Score Marks: Disabled')
+  }
   lines.push('')
   lines.push('--- Drill Output Format ---')
   lines.push(`Format: ${config.drillFormat.integerDigits}:${config.drillFormat.decimalDigits}`)
@@ -689,6 +704,9 @@ function generateReadme(
     const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
     lines.push('--- Files ---')
     lines.push(`${partNumber}_Panel_Border.gerber - Panel outline (border only)`)
+    if (config.enableVScoreLayer && panel.vScoreLines.length > 0) {
+      lines.push(`${partNumber}_VScore.gerber - V-score alignment layer (score lines + rib marks)`)
+    }
     const hasDrills = layers.some(l => l.type === 'drill')
     if (hasDrills) {
       lines.push(`${partNumber}_Drill.drl - Panelized drill file (Excellon)`)

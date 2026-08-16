@@ -693,6 +693,156 @@ export default function PanelConfigPanel() {
               </p>
             </div>
 
+            {/* V-Score Marks */}
+            <div className="bg-[#061628]/50 rounded-lg p-3 border border-[#1a3a5c]">
+              <Label className="text-xs font-medium text-[#94b8d4] flex items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={panelConfig.enableVScoreMarks}
+                  onChange={(e) => updatePanelConfig({ enableVScoreMarks: e.target.checked })}
+                  className="h-3.5 w-3.5 rounded border-[#1a3a5c] bg-[#061628] text-[#0ea5e9] focus:ring-[#0ea5e9] accent-[#0ea5e9]"
+                />
+                V-Score Marks (Corner Marks)
+              </Label>
+              <p className="text-[9px] text-[#4a6f94] mt-1">
+                Alignment marks on the panel ribs for manual V-scoring machines — operators line the blade up against these on the physical panel.
+              </p>
+
+              {panelConfig.enableVScoreMarks && (
+                <>
+                  <div className="mt-2 grid grid-cols-4 gap-1.5">
+                    {([
+                      { id: 'arrow', label: 'Arrow' },
+                      { id: 'ticks', label: 'Ticks' },
+                      { id: 'stub', label: 'Stub' },
+                      { id: 'stub-arrow', label: 'Stub+Arrow' },
+                    ] as const).map(opt => {
+                      const selected = panelConfig.vScoreMarkStyle === opt.id
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => updatePanelConfig({ vScoreMarkStyle: opt.id })}
+                          className={`rounded border p-1 flex flex-col items-center gap-0.5 ${selected ? 'border-[#0ea5e9] bg-[#0f2848]' : 'border-[#1a3a5c] bg-[#061628]/40'}`}
+                        >
+                          <svg viewBox="0 0 88 56" className="w-full h-auto">
+                            <rect x={0} y={0} width={88} height={18} fill="rgba(255,255,255,0.04)" />
+                            <line x1={0} y1={18} x2={88} y2={18} stroke="#4a6f94" strokeWidth={1} />
+                            <line x1={44} y1={0} x2={44} y2={56} stroke="#4a6f94" strokeWidth={1} strokeDasharray="3 3" />
+                            {opt.id === 'arrow' && (
+                              <path d="M38 4 L50 4 L44 16 Z" fill="#0ea5e9" />
+                            )}
+                            {opt.id === 'ticks' && (
+                              <>
+                                <line x1={38} y1={6} x2={38} y2={16} stroke="#0ea5e9" strokeWidth={2} />
+                                <line x1={50} y1={6} x2={50} y2={16} stroke="#0ea5e9" strokeWidth={2} />
+                              </>
+                            )}
+                            {opt.id === 'stub' && (
+                              <line x1={44} y1={4} x2={44} y2={18} stroke="#0ea5e9" strokeWidth={3} />
+                            )}
+                            {opt.id === 'stub-arrow' && (
+                              <>
+                                <line x1={44} y1={2} x2={44} y2={18} stroke="#0ea5e9" strokeWidth={0.75} />
+                                <path d="M40 13 L44 18 L48 13" fill="none" stroke="#0ea5e9" strokeWidth={1.5} />
+                              </>
+                            )}
+                          </svg>
+                          <span className="text-[9px] text-[#94b8d4]">{opt.label}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <div>
+                      <Label className="text-[10px] text-[#4a6f94]">Mark Size (mm)</Label>
+                      <Input
+                        type="number"
+                        value={panelConfig.vScoreMarkSizeMm}
+                        onChange={(e) => updatePanelConfig({ vScoreMarkSizeMm: parseFloat(e.target.value) || 2.0 })}
+                        min={0.5}
+                        max={10}
+                        step={0.1}
+                        className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-[10px] text-[#4a6f94]">Line Width (mm)</Label>
+                      <Input
+                        type="number"
+                        value={panelConfig.vScoreMarkLineWidth}
+                        onChange={(e) => updatePanelConfig({ vScoreMarkLineWidth: parseFloat(e.target.value) || 0.254 })}
+                        min={0.1}
+                        max={2}
+                        step={0.01}
+                        className="h-7 text-xs bg-[#061628] border-[#1a3a5c] text-[#f0f8ff]"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="mt-2 flex flex-col gap-1.5">
+                    <Label className="text-[10px] text-[#94b8d4] flex items-center gap-1.5">
+                      <input
+                        type="checkbox"
+                        checked={panelConfig.vScoreMarkInternalSeams}
+                        onChange={(e) => updatePanelConfig({ vScoreMarkInternalSeams: e.target.checked })}
+                        className="h-3 w-3 rounded border-[#1a3a5c] bg-[#061628] text-[#0ea5e9] accent-[#0ea5e9]"
+                      />
+                      Mark internal seams (between rows/columns)
+                    </Label>
+                    <Label className="text-[10px] text-[#94b8d4] flex items-center gap-1.5">
+                      <input
+                        type="checkbox"
+                        checked={panelConfig.vScoreMarkRailBoundary}
+                        onChange={(e) => updatePanelConfig({ vScoreMarkRailBoundary: e.target.checked })}
+                        className="h-3 w-3 rounded border-[#1a3a5c] bg-[#061628] text-[#0ea5e9] accent-[#0ea5e9]"
+                      />
+                      Mark panel outer boundary
+                    </Label>
+                  </div>
+
+                  {(panelConfig.gapX > 0 || panelConfig.gapY > 0) && (
+                    <div className="mt-2 bg-[#3a1a0a]/60 border border-[#7a4a1a] rounded p-2">
+                      <p className="text-[9px] text-[#f0c090]">
+                        V-scoring needs boards butted together (gap = 0) — a blade can&apos;t score across an air gap.
+                        Current gap: X={panelConfig.gapX}mm Y={panelConfig.gapY}mm. Note gap=0 is also incompatible with per-PCB routing (Routing tab) — pick one depaneling method.
+                      </p>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="mt-1.5 h-6 text-[10px] border-[#7a4a1a] text-[#f0c090] hover:bg-[#4a2a0a]"
+                        onClick={() => { updatePanelConfig({ gapX: 0, gapY: 0 }); computePanelResult() }}
+                      >
+                        Set gaps to 0 &amp; rebuild panel
+                      </Button>
+                    </div>
+                  )}
+
+                  <p className="mt-2 text-[9px] text-[#4a6f94]">
+                    {panelResult
+                      ? panelResult.vScoreLines.length > 0
+                        ? `${panelResult.vScoreLines.length} score line(s): ${panelResult.vScoreLines.filter(l => l.kind === 'internal').length} internal / ${panelResult.vScoreLines.filter(l => l.kind === 'rail').length} rail.`
+                        : 'No full-width score line exists for this panel layout — this is common for packed/non-uniform panels.'
+                      : 'Create/re-create the panel to see computed score lines.'}
+                  </p>
+                </>
+              )}
+
+              <Label className="mt-3 text-xs font-medium text-[#94b8d4] flex items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={panelConfig.enableVScoreLayer}
+                  onChange={(e) => updatePanelConfig({ enableVScoreLayer: e.target.checked })}
+                  className="h-3.5 w-3.5 rounded border-[#1a3a5c] bg-[#061628] text-[#0ea5e9] focus:ring-[#0ea5e9] accent-[#0ea5e9]"
+                />
+                Standalone V-Score documentation layer
+              </Label>
+              <p className="text-[9px] text-[#4a6f94] mt-1">
+                Adds a separate *_VScore.gerber file with full-length score lines + marks — independent of the built-in copper/mask marks above.
+              </p>
+            </div>
+
           </TabsContent>
         </Tabs>
 

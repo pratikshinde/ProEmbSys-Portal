@@ -136,6 +136,13 @@ const panelSectionSchema = z.object({
   textFont: z.enum(['stroke', 'region']),
   topRibFontSize: z.number().positive(),
   bottomRibFontSize: z.number().positive(),
+  enableVScoreMarks: z.boolean(),
+  vScoreMarkStyle: z.enum(['arrow', 'ticks', 'stub', 'stub-arrow']),
+  vScoreMarkSizeMm: z.number().positive(),
+  vScoreMarkLineWidth: z.number().positive(),
+  vScoreMarkInternalSeams: z.boolean(),
+  vScoreMarkRailBoundary: z.boolean(),
+  enableVScoreLayer: z.boolean(),
 }).partial()
 
 const outputSectionSchema = z.object({

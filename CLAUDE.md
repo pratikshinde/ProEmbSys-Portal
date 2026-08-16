@@ -82,7 +82,7 @@ Requires a running Postgres and a populated `.env` (`DATABASE_URL`, `AUTH_SECRET
 | `src/lib/gerber-svg.ts` | Type definitions + `gerberToSvg()` Comlink client (lazy-instantiates the worker) |
 | `src/workers/gerber-worker.ts` | Web Worker — tracespace parse/plot/render, returns the `GerberSvgResult` shape |
 | `src/lib/drill-alignment.ts` | Exact drill↔Gerber origin-offset recovery (pad-pattern voting, ported from delta-gerber) + modal-coordinate flash-center resolution |
-| `src/lib/panelization-engine.ts` | Panel layout, Gerber output format helpers, V-score/fiducial/tooling geometry |
+| `src/lib/panelization-engine.ts` | Panel layout, Gerber output format helpers, V-score/fiducial/tooling geometry (`computeVScoreLines`/`computeVScoreMarkStrokes`, see "V-score alignment marks" below) |
 | `src/lib/gerber-exporter.ts` | ZIP export — panelized Gerber files per layer. Naming: archive is `PartNumber_CustomerName_Version_Date_Panel.zip`, each file inside is `PartNumber_LayerName.gerber` (drill stays `.drl`) — all four `PanelInfo` fields go through `sanitizeForFilename` first, since they're free-text user input |
 | `src/lib/stroke-font.ts` | Single-stroke (polyline) font for `textFont: 'stroke'` panel text |
 | `src/lib/region-font.ts` / `region-font-data.ts` | Filled-region font for `textFont: 'region'` (default) — real glyph outlines from an embedded Geist subset via opentype.js |
@@ -325,6 +325,55 @@ If you touch grid placement, the invariant is that these must all agree:
 generators (`ribHeight = sideRibBottom` for the bottom rib, `sideRibTop` for the
 top), and the hole placement (`sideRibBottom/2` low, `panelHeight − sideRibTop/2`
 high).
+
+### V-score alignment marks on panel ribs
+
+For jobs depanelled on a manual V-scoring machine, `computeVScoreLines` (called
+from `finishPanel`, BEFORE tooling holes/fiducials/rib text so all three can
+avoid the marks) derives every full-panel-width/height score seam from the
+placements' own bbox — never from `rows`/`cols`, so it works for grid and
+packed layouts alike. Candidate coordinates come from every placement edge,
+**clustered with tolerance `max(gapX,ε)`/`max(gapY,ε)` and emitted as the
+cluster midpoint** — without this, a nonzero gap produces two lines per seam
+(one board's edge, the next board's edge) instead of one line at the channel's
+physical centre; at `gap = 0` the duplicates already coincide so this is a
+no-op there. A candidate is rejected if it passes through any placement's
+interior (panel-wide — a line valid for one row/column but cutting through
+another board isn't a score line), and classified `'rail'` (panel's outer
+boundary) vs `'internal'` against the placements' own bbox, never against
+`config.sideRibLeft`/etc (wrong in packed mode).
+
+`computeVScoreMarkStrokes` is the ONE shared geometry generator for the rib-
+confined mark polylines (four styles: arrow/ticks/stub/stub-arrow) — used by
+the built-in copper/mask emission, the standalone `*_VScore.gerber` layer
+(`src/lib/vscore/emit-gerber.ts`, mirroring `routing/emit-gerber.ts`'s
+"own file ⇒ own aperture namespace" precedent), and the viewer preview, so
+none of the three can disagree on shape the way L-shape marks' independently-
+re-derived preview/export geometry could.
+
+⚠ **Built-in marks need their own D-code allocation in BOTH Gerber emitters**,
+not just `generatePanelizedGerber` — `generateMergedPanelizedGerber` has its
+own independent allocation block (multi-design), so `vScoreApertureCode =
+baseCode + 5` must be added in both places or a multi-design export silently
+collides D-codes. All four/five overlay codes (`lShapeCornerCode` ..
+`vScoreApertureCode`) are always allocated together in each function.
+
+Marks are **immovable** — their coordinate is fixed by the score line they
+annotate — so `vScoreMarksAsHoles` (an adapter to the same `{x,diameter}[]`
+obstacle shape `fiducialsAsHoles` already produces) is folded into every
+existing hole-avoidance site (`worstCaseBottomRibLabelZone`,
+`generateLayerLabels`, `generatePanelMetaText`'s top and bottom tiers,
+`isValidPosition` for fiducial placement, `addHole` for tooling/reference
+holes) so everything else yields around a mark instead of the reverse.
+
+Both `enableVScoreMarks` and `enableVScoreLayer` default `false` — a template
+back-fill (`PANEL_SECTION_DEFAULTS`) would otherwise silently turn the
+feature on for every saved customer template. V-scoring physically requires
+`gapX = gapY = 0` (a blade can't score across an air gap between boards) —
+the UI surfaces this as a warning + one-click fix rather than silently
+producing marks at unscoreable positions, and also warns that a zero gap is
+mutually exclusive with per-PCB routing (`plan-routing.ts` raises
+`gap-too-small` there).
 
 ### Routing (depaneling) — conventions that must not drift
 

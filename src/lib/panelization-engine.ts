@@ -609,6 +609,15 @@ export interface PanelConfig {
   // Font sizes for rib text (mm, cap height)
   topRibFontSize: number // customer/PCB reference text on the top rib
   bottomRibFontSize: number // per-layer labels on the bottom rib
+  // V-groove / V-scoring alignment marks on panel ribs (manual V-scoring machines)
+  enableVScoreMarks: boolean
+  vScoreMarkStyle: 'arrow' | 'ticks' | 'stub' | 'stub-arrow'
+  vScoreMarkSizeMm: number
+  vScoreMarkLineWidth: number
+  vScoreMarkInternalSeams: boolean
+  vScoreMarkRailBoundary: boolean
+  // Standalone documentation layer with full-length score lines (own Gerber file)
+  enableVScoreLayer: boolean
 }
 
 export interface PanelInfo {
@@ -673,7 +682,19 @@ export interface PanelResult {
   totalPCBs: number
   grid?: { rows: number; cols: number }
   source: 'grid' | 'pack'
+  /** V-groove/V-scoring alignment marks on the panel ribs — see `computeVScoreLines`. */
+  vScoreLines: VScoreLine[]
 }
+
+/**
+ * One V-score line spanning the whole panel — a straight seam a V-scoring
+ * blade would cut along. `axis: 'x'` = a vertical line at constant X
+ * (crosses the top/bottom ribs); `axis: 'y'` = a horizontal line at constant
+ * Y (crosses the left/right ribs). `kind: 'rail'` = the panel's own outer
+ * boundary seam (bbox edge of the placements); `'internal'` = a seam between
+ * two rows/columns of boards. See `computeVScoreLines` for derivation.
+ */
+export type VScoreLine = { axis: 'x' | 'y'; coord: number; kind: 'internal' | 'rail' }
 
 export interface InfoText {
   x: number
@@ -734,6 +755,13 @@ export const DEFAULT_PANEL_CONFIG: PanelConfig = {
   textFont: 'region',
   topRibFontSize: 2.8,
   bottomRibFontSize: 2.8,
+  enableVScoreMarks: false,
+  vScoreMarkStyle: 'arrow',
+  vScoreMarkSizeMm: 2.0,
+  vScoreMarkLineWidth: 0.254,
+  vScoreMarkInternalSeams: true,
+  vScoreMarkRailBoundary: true,
+  enableVScoreLayer: false,
 }
 
 // ============================================================================
@@ -933,6 +961,157 @@ export function finishPackedPanel(
  * has no idea whether `placements` came from a uniform lattice or a packed,
  * multi-design layout.
  */
+/**
+ * Derives every full-panel-width/height V-score seam from the placements
+ * themselves (never from `rows`/`cols`), so it works identically for grid
+ * and packed layouts. Must run BEFORE tooling holes, fiducials, and rib text
+ * in `finishPanel` so all three can avoid the marks (see `vScoreMarksAsHoles`).
+ */
+export function computeVScoreLines(
+  placements: PanelPlacement[],
+  panelWidth: number,
+  panelHeight: number,
+  config: PanelConfig
+): VScoreLine[] {
+  if (!config.enableVScoreMarks || placements.length === 0) return []
+
+  const EPS = 0.01
+
+  let plMinX = Infinity, plMinY = Infinity, plMaxX = -Infinity, plMaxY = -Infinity
+  for (const p of placements) {
+    plMinX = Math.min(plMinX, p.x)
+    plMinY = Math.min(plMinY, p.y)
+    plMaxX = Math.max(plMaxX, p.x + p.w)
+    plMaxY = Math.max(plMaxY, p.y + p.h)
+  }
+
+  function deriveAxis(getLo: (p: PanelPlacement) => number, getHi: (p: PanelPlacement) => number, gap: number, bboxMin: number, bboxMax: number): { coord: number; kind: 'internal' | 'rail' }[] {
+    // Collect raw candidate coordinates from every placement edge.
+    const raw: number[] = []
+    for (const p of placements) {
+      raw.push(getLo(p), getHi(p))
+    }
+    raw.sort((a, b) => a - b)
+
+    // Cluster within tolerance and emit the cluster midpoint — collapses the
+    // two edges of a gapped seam (board-right-edge, next-board-left-edge)
+    // into one physically-correct score line at the channel centre. At
+    // gap = 0 the duplicates already coincide, so this is a no-op there.
+    const tol = Math.max(gap, EPS)
+    const clusters: number[][] = []
+    for (const v of raw) {
+      const last = clusters[clusters.length - 1]
+      if (last && v - last[last.length - 1] <= tol) {
+        last.push(v)
+      } else {
+        clusters.push([v])
+      }
+    }
+    const candidates = clusters.map(c => c.reduce((a, b) => a + b, 0) / c.length)
+
+    // Reject any candidate that passes through a placement's interior —
+    // panel-wide: the blade crosses the whole panel width/height, so a line
+    // valid for one row/column but cutting through another board is invalid.
+    const valid = candidates.filter(c => !placements.some(p => c > getLo(p) + EPS && c < getHi(p) - EPS))
+
+    return valid.map(coord => ({
+      coord,
+      kind: (Math.abs(coord - bboxMin) <= tol || Math.abs(coord - bboxMax) <= tol) ? 'rail' : 'internal',
+    }))
+  }
+
+  const xLines = deriveAxis(p => p.x, p => p.x + p.w, config.gapX, plMinX, plMaxX) as { coord: number; kind: 'internal' | 'rail' }[]
+  const yLines = deriveAxis(p => p.y, p => p.y + p.h, config.gapY, plMinY, plMaxY) as { coord: number; kind: 'internal' | 'rail' }[]
+
+  const lines: VScoreLine[] = []
+  for (const l of xLines) {
+    if (l.kind === 'internal' && !config.vScoreMarkInternalSeams) continue
+    if (l.kind === 'rail' && !config.vScoreMarkRailBoundary) continue
+    lines.push({ axis: 'x', coord: l.coord, kind: l.kind })
+  }
+  for (const l of yLines) {
+    if (l.kind === 'internal' && !config.vScoreMarkInternalSeams) continue
+    if (l.kind === 'rail' && !config.vScoreMarkRailBoundary) continue
+    lines.push({ axis: 'y', coord: l.coord, kind: l.kind })
+  }
+  return lines
+}
+
+/**
+ * Renders each V-score line into rib-confined mark polylines (panel-absolute
+ * Gerber Y-up mm) — the ONE shared geometry generator used by the
+ * single-design emitter, the merged emitter, the standalone doc layer, and
+ * the viewer preview, so all four can never disagree on shape.
+ *
+ * An `axis:'x'` (vertical) line crosses the top and bottom ribs → one mark
+ * on each; an `axis:'y'` (horizontal) line crosses the left and right ribs →
+ * one mark on each. A rib of zero width is skipped (warned, not invented).
+ * All styles stay confined to the rib band — never enter the PCB grid area,
+ * since built-in marks are injected into the customer's own copper/mask.
+ */
+export function computeVScoreMarkStrokes(
+  lines: VScoreLine[],
+  panelWidth: number,
+  panelHeight: number,
+  config: PanelConfig
+): { x: number; y: number }[][] {
+  const strokes: { x: number; y: number }[][] = []
+  const size = config.vScoreMarkSizeMm
+  const style = config.vScoreMarkStyle
+
+  // One mark centered at `coord` along the rib's transverse axis, spanning
+  // the rib band [bandLo, bandHi] along the rib's own axis.
+  function pushMark(coord: number, bandLo: number, bandHi: number, transverse: 'x' | 'y') {
+    if (bandHi - bandLo <= 0) return
+    const mid = (bandLo + bandHi) / 2
+    const mk = (a: number, b: number): { x: number; y: number } => transverse === 'x' ? { x: a, y: b } : { x: b, y: a }
+
+    switch (style) {
+      case 'arrow':
+        strokes.push([
+          mk(coord - size / 2, bandLo),
+          mk(coord + size / 2, bandLo),
+          mk(coord, bandHi),
+          mk(coord - size / 2, bandLo),
+        ])
+        break
+      case 'ticks':
+        strokes.push([mk(coord - size / 2, bandLo), mk(coord - size / 2, bandHi)])
+        strokes.push([mk(coord + size / 2, bandLo), mk(coord + size / 2, bandHi)])
+        break
+      case 'stub':
+        strokes.push([mk(coord, bandLo), mk(coord, bandHi)])
+        break
+      case 'stub-arrow':
+        strokes.push([mk(coord, bandLo), mk(coord, bandHi)])
+        strokes.push([
+          mk(coord - size / 2, mid - size / 4),
+          mk(coord, mid + size / 4),
+          mk(coord + size / 2, mid - size / 4),
+        ])
+        break
+    }
+  }
+
+  for (const line of lines) {
+    if (line.axis === 'x') {
+      // vertical line -> marks on top/bottom ribs
+      if (config.sideRibBottom > 0) pushMark(line.coord, 0, config.sideRibBottom, 'x')
+      else console.warn('[V-Score] skipped bottom-rib mark: sideRibBottom is 0')
+      if (config.sideRibTop > 0) pushMark(line.coord, panelHeight - config.sideRibTop, panelHeight, 'x')
+      else console.warn('[V-Score] skipped top-rib mark: sideRibTop is 0')
+    } else {
+      // horizontal line -> marks on left/right ribs
+      if (config.sideRibLeft > 0) pushMark(line.coord, 0, config.sideRibLeft, 'y')
+      else console.warn('[V-Score] skipped left-rib mark: sideRibLeft is 0')
+      if (config.sideRibRight > 0) pushMark(line.coord, panelWidth - config.sideRibRight, panelWidth, 'y')
+      else console.warn('[V-Score] skipped right-rib mark: sideRibRight is 0')
+    }
+  }
+
+  return strokes
+}
+
 function finishPanel(
   placements: PanelPlacement[],
   designs: PanelDesignSummary[],
@@ -957,6 +1136,10 @@ function finishPanel(
   }
   const gridWidth = placements.length > 0 ? plMaxX - plMinX : 0
   const gridHeight = placements.length > 0 ? plMaxY - plMinY : 0
+
+  // V-score lines must be computed before tooling holes, fiducials, and rib
+  // text, so all three can avoid the marks (see `vScoreMarksAsHoles`).
+  const vScoreLines = computeVScoreLines(placements, panelWidth, panelHeight, config)
 
   // Representative single-board size for the parts of this function that
   // still assume one board (the rib-text call just below) — always correct
@@ -1022,6 +1205,17 @@ function finishPanel(
       if (isOverlapping(x, y, type)) {
         console.log(`[${type} hole] Position (${x.toFixed(2)}, ${y.toFixed(2)}) rejected: overlapping`)
         return
+      }
+      // Must not land on a V-score mark — marks are immovable.
+      const onTopRib = y >= panelHeight - config.sideRibTop - 0.01
+      const onBottomRib = y <= config.sideRibBottom + 0.01
+      if (onTopRib || onBottomRib) {
+        for (const mark of vScoreMarksAsHoles(vScoreLines, config, onTopRib)) {
+          if (Math.abs(mark.x - x) < mark.diameter / 2 + diameter / 2 + 2.0) {
+            console.log(`[${type} hole] Position (${x.toFixed(2)}, ${y.toFixed(2)}) rejected: V-score mark`)
+            return
+          }
+        }
       }
 
       // Apply xy override if specified by the user
@@ -1202,7 +1396,7 @@ function finishPanel(
     // be revisited, so this still has to guess at a WORST-CASE label zone
     // the way it always did (see `worstCaseBottomRibLabelZone`'s own docs).
     interface XInterval { min: number; max: number }
-    const worstCase = worstCaseBottomRibLabelZone(config, panelWidth, toolingHoles)
+    const worstCase = worstCaseBottomRibLabelZone(config, panelWidth, toolingHoles, vScoreLines)
     const bottomRibIntervals: XInterval[] = [{ min: worstCase.minX, max: worstCase.maxX }]
     const bottomRibBandY = { min: 0, max: config.sideRibBottom }
 
@@ -1241,6 +1435,18 @@ function finishPanel(
         const minSpacing = (config.fiducialDiameter / 2) + clearanceOffset + (hole.diameter / 2) + 2.0
         if (dist < minSpacing) {
           return false
+        }
+      }
+
+      // 3b. Must not overlap a V-score mark — marks are immovable, a
+      // fiducial must dodge them the same way it dodges a real hole.
+      // Vertical (axis:'x') marks live on the top/bottom ribs; horizontal
+      // (axis:'y') marks live on the left/right ribs — check whichever rib
+      // this candidate is actually on.
+      const onBottomOrTopRib = y <= config.sideRibBottom + 0.01 || y >= panelHeight - config.sideRibTop - 0.01
+      if (onBottomOrTopRib) {
+        for (const mark of vScoreMarksAsHoles(vScoreLines, config, y >= panelHeight - config.sideRibTop - 0.01)) {
+          if (Math.abs(mark.x - x) < mark.diameter / 2 + (config.fiducialDiameter / 2) + clearanceOffset + 2.0) return false
         }
       }
 
@@ -1504,7 +1710,7 @@ function finishPanel(
   // through — see the reordering note at `infoTexts`'s declaration above for
   // why this flipped from an earlier version that ran text first.
   if (info) {
-    const metaTexts = generatePanelMetaText(info, pcbWidth, pcbHeight, panelWidth, panelHeight, config, toolingHoles, fiducials)
+    const metaTexts = generatePanelMetaText(info, pcbWidth, pcbHeight, panelWidth, panelHeight, config, toolingHoles, fiducials, vScoreLines)
     infoTexts.push(...metaTexts)
   }
 
@@ -1519,6 +1725,7 @@ function finishPanel(
     totalPCBs: placements.length,
     grid: source === 'grid' ? { rows: config.rows, cols: config.cols } : undefined,
     source,
+    vScoreLines,
   }
 }
 
@@ -1592,6 +1799,30 @@ function fiducialsAsHoles(
 }
 
 /**
+ * V-score marks as obstacles, same `{x, diameter}[]` shape `fiducialsAsHoles`
+ * already produces for `clearHolesAlongAxis` — marks are IMMOVABLE (their
+ * coordinate is fixed by the score line they annotate), so everything else
+ * (rib text, fiducials, tooling/reference holes) must yield around them, not
+ * the reverse. Only `axis:'x'` (vertical) lines mark the top/bottom ribs,
+ * which are the ribs carrying the horizontal text these callers place.
+ * `diameter` is the mark's full X extent — `clearHolesAlongAxis` adds its
+ * own clearance on top, same as for a real hole.
+ */
+function vScoreMarksAsHoles(
+  vScoreLines: VScoreLine[],
+  config: PanelConfig,
+  ribIsTop: boolean
+): { x: number; diameter: number }[] {
+  if (!config.enableVScoreMarks) return []
+  const ribWidth = ribIsTop ? config.sideRibTop : config.sideRibBottom
+  if (ribWidth <= 0) return []
+  return vScoreLines
+    .filter(l => l.axis === 'x')
+    .filter(l => (l.kind === 'internal' && config.vScoreMarkInternalSeams) || (l.kind === 'rail' && config.vScoreMarkRailBoundary))
+    .map(l => ({ x: l.coord, diameter: config.vScoreMarkSizeMm }))
+}
+
+/**
  * The free-width zone on the RIGHT side of the bottom rib that
  * `generateLayerLabels`'s per-layer labels will eventually occupy. The real
  * layer list isn't known this early (`computePanel` has no access to it —
@@ -1637,7 +1868,8 @@ function fiducialsAsHoles(
 function worstCaseBottomRibLabelZone(
   config: PanelConfig,
   panelWidth: number,
-  toolingHoles?: PanelResult['toolingHoles']
+  toolingHoles?: PanelResult['toolingHoles'],
+  vScoreLines?: VScoreLine[]
 ): { minX: number; maxX: number } {
   const bottomRibFontSizeMm = config.bottomRibFontSize ?? 1.8
   const worstCaseLabelWidth = measureRegionText('Bottom Copper') * bottomRibFontSizeMm
@@ -1645,7 +1877,10 @@ function worstCaseBottomRibLabelZone(
   const topGroupAnchorX = panelWidth - 30
   const holeClearanceMm = 2.5
   const ribHeight = config.sideRibBottom
-  const bottomRibHoles = (toolingHoles ?? []).filter(h => h.y >= -0.01 && h.y <= ribHeight + 0.01)
+  const bottomRibHoles: { x: number; diameter: number }[] = (toolingHoles ?? [])
+    .filter(h => h.y >= -0.01 && h.y <= ribHeight + 0.01)
+    .map(h => ({ x: h.x, diameter: h.diameter }))
+    .concat(vScoreMarksAsHoles(vScoreLines ?? [], config, false))
   const clearedBottomAnchorX = clearHolesAlongAxis(bottomGroupAnchorX, worstCaseLabelWidth, bottomRibHoles, 'left', holeClearanceMm)
   const clearedTopAnchorX = clearHolesAlongAxis(topGroupAnchorX, worstCaseLabelWidth, bottomRibHoles, 'right', holeClearanceMm)
   return {
@@ -1731,7 +1966,8 @@ export function generateLayerLabels(
   pcbHeight: number,
   pcbPositions: PanelPlacement[],
   toolingHoles?: PanelResult['toolingHoles'],
-  fiducials?: PanelResult['fiducials']
+  fiducials?: PanelResult['fiducials'],
+  vScoreLines?: VScoreLine[]
 ): InfoText[] {
   const texts: InfoText[] = []
 
@@ -1805,7 +2041,8 @@ export function generateLayerLabels(
   // REAL final position (not a guess at where it might land) — see the
   // reordering note on `computePanel`'s own fiducial block.
   const bottomRibFiducialHoles = fiducialsAsHoles(fiducials ?? [], 0, ribHeight)
-  const bottomRibHolesWithFid = [...bottomRibHoles, ...bottomRibFiducialHoles]
+  const bottomRibVScoreMarks = vScoreMarksAsHoles(vScoreLines ?? [], config, false)
+  const bottomRibHolesWithFid = [...bottomRibHoles, ...bottomRibFiducialHoles, ...bottomRibVScoreMarks]
 
   const topAnchorX = topLabels.length > 0 ? clearHolesAlongAxis(topFirstCharX, maxTopWidth, bottomRibHolesWithFid, 'right', holeClearanceMm) : topFirstCharX
   const bottomAnchorX = bottomLabels.length > 0 ? clearHolesAlongAxis(bottomFirstCharX, maxBottomWidth, bottomRibHolesWithFid, 'left', holeClearanceMm) : bottomFirstCharX
@@ -1914,7 +2151,8 @@ export function generatePanelMetaText(
   panelHeight: number,
   config: PanelConfig,
   toolingHoles?: PanelResult['toolingHoles'],
-  fiducials?: PanelResult['fiducials']
+  fiducials?: PanelResult['fiducials'],
+  vScoreLines?: VScoreLine[]
 ): InfoText[] {
   const texts: InfoText[] = []
   if (!info) return texts
@@ -1982,7 +2220,8 @@ export function generatePanelMetaText(
   // land here, same `clearHolesAlongAxis` machinery `generateLayerLabels` uses.
   const topRibHoles = (toolingHoles ?? []).filter(h => h.y >= panelHeight - config.sideRibTop - 0.01)
   const topRibFiducialHoles = fiducialsAsHoles(fiducials ?? [], panelHeight - config.sideRibTop, panelHeight)
-  const topRibHolesWithFid = [...topRibHoles, ...topRibFiducialHoles]
+  const topRibVScoreMarks = vScoreMarksAsHoles(vScoreLines ?? [], config, true)
+  const topRibHolesWithFid = [...topRibHoles, ...topRibFiducialHoles, ...topRibVScoreMarks]
   const maxTopMetaWidth = placedOnTop.reduce((max, l) => Math.max(max, measureTextWidth(l, topFontSize)), 0)
   const clearedFirstCharX = clearHolesAlongAxis(firstCharX, maxTopMetaWidth, topRibHolesWithFid, 'right', holeClearanceMm)
   // The name line is never dropped, so it must never be pushed off the panel
@@ -2035,7 +2274,7 @@ export function generatePanelMetaText(
     const bottomLineHeight = lineHeightOf(bottomFontSize)
     const bottomLinesFitByHeight = Math.max(0, Math.floor((ribHeight - marginMm) / bottomLineHeight))
     const bottomRibHoles = (toolingHoles ?? []).filter(h => h.y >= -0.01 && h.y <= ribHeight + 0.01)
-    const zone = worstCaseBottomRibLabelZone(config, panelWidth, toolingHoles)
+    const zone = worstCaseBottomRibLabelZone(config, panelWidth, toolingHoles, vScoreLines)
     const bottomStartX = config.sideRibLeft + 2.0
     const bottomCenterY = ribHeight / 2
 
@@ -2047,7 +2286,8 @@ export function generatePanelMetaText(
     // `computePanel` places fiducials before calling this function
     // specifically so this is the fiducial's real final position.
     const bottomRibFiducialHoles = fiducialsAsHoles(fiducials ?? [], 0, ribHeight)
-    const bottomRibHolesWithFid = [...bottomRibHoles, ...bottomRibFiducialHoles]
+    const bottomRibVScoreMarks = vScoreMarksAsHoles(vScoreLines ?? [], config, false)
+    const bottomRibHolesWithFid = [...bottomRibHoles, ...bottomRibFiducialHoles, ...bottomRibVScoreMarks]
 
     const placedOnBottom: string[] = []
     for (const lineText of remaining) {
@@ -2583,6 +2823,7 @@ export function generatePanelizedGerber(
   const strokeFontApertureCode = baseCode + 2
   const donutApertureCode = baseCode + 3
   const fiducialApertureCode = baseCode + 4
+  const vScoreApertureCode = baseCode + 5
 
   // ---- 1. Format header ----
   lines.push(generateFSCommand(fmt))
@@ -2708,6 +2949,23 @@ export function generatePanelizedGerber(
       lShapeBorderCode
     )
     lines.push(...panelBorderLShapes)
+  }
+
+  // ---- 6.7. V-score alignment marks on panel ribs (copper & mask only) ----
+  // Coordinates are already panel-absolute — do NOT add baseOffsetX/baseOffsetY
+  // (same trap documented at the panel-border L-shape block above).
+  if (config.enableVScoreMarks && layerType && layerNeedsLShapeMarks(layerType) && panel.vScoreLines.length > 0) {
+    const strokes = computeVScoreMarkStrokes(panel.vScoreLines, panel.panelWidth, panel.panelHeight, config)
+    if (strokes.length > 0) {
+      lines.push(`%ADD${vScoreApertureCode}C,${config.vScoreMarkLineWidth.toFixed(6)}*%`)
+      const f = (v: number) => formatCoordinate(v, fmt)
+      lines.push(`G54D${vScoreApertureCode}*`)
+      for (const stroke of strokes) {
+        stroke.forEach((pt, i) => {
+          lines.push(`X${f(pt.x)}Y${f(pt.y)}D${i === 0 ? '02' : '01'}*`)
+        })
+      }
+    }
   }
 
   // ---- 7. Donut ring shapes around reference holes (for copper/mask/silkscreen) ----
@@ -2972,6 +3230,7 @@ export function generateMergedPanelizedGerber(
   const strokeFontApertureCode = baseCode + 2
   const donutApertureCode = baseCode + 3
   const fiducialApertureCode = baseCode + 4
+  const vScoreApertureCode = baseCode + 5
 
   // ---- 1. Format header ----
   lines.push(generateFSCommand(fmt))
@@ -3047,6 +3306,22 @@ export function generateMergedPanelizedGerber(
   // ---- 6.5. L-shape marks on panel border — panel-wide, not per-design. ----
   if (panelConfig.enablePanelBorderLShape && layerType && layerNeedsLShapeMarks(layerType)) {
     lines.push(...generatePanelBorderLShapeGerberCommands(panel.panelWidth, panel.panelHeight, panelConfig, fmt, lShapeBorderCode))
+  }
+
+  // ---- 6.7. V-score alignment marks on panel ribs — panel-wide, reads
+  // panelConfig (not a contributor's effectiveConfig), same as 6.5 above.
+  if (panelConfig.enableVScoreMarks && layerType && layerNeedsLShapeMarks(layerType) && panel.vScoreLines.length > 0) {
+    const strokes = computeVScoreMarkStrokes(panel.vScoreLines, panel.panelWidth, panel.panelHeight, panelConfig)
+    if (strokes.length > 0) {
+      lines.push(`%ADD${vScoreApertureCode}C,${panelConfig.vScoreMarkLineWidth.toFixed(6)}*%`)
+      const f = (v: number) => formatCoordinate(v, fmt)
+      lines.push(`G54D${vScoreApertureCode}*`)
+      for (const stroke of strokes) {
+        stroke.forEach((pt, i) => {
+          lines.push(`X${f(pt.x)}Y${f(pt.y)}D${i === 0 ? '02' : '01'}*`)
+        })
+      }
+    }
   }
 
   // ---- 7. Donut rings around reference holes — panel-wide. ----
