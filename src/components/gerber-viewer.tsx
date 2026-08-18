@@ -1240,20 +1240,42 @@ export default function GerberViewer() {
                     ) : rawDBgRect
                     const tx = pos.x - refBounds.minX
                     const ty = -pos.y - refBounds.maxY
-                    // Per-placement mirror override: a reflection composed
-                    // with itself is the identity, so re-applying the exact
-                    // same panel-wide mirror ONE level deeper (still around
-                    // the same boundsCenterX axis, still before the tx/ty
-                    // shift into this placement's own local coordinates)
-                    // exactly cancels the outer one for just this placement
-                    // — letting one design in a multi-design panel opt out
-                    // of the standard bottom mirror while its neighbors keep
-                    // it. See DesignEntry.mirrorBottomOverride in store.ts.
+                    // Per-placement mirror override: reflection composed with
+                    // itself is the identity, so re-applying the same mirror
+                    // one level deeper exactly cancels the panel-wide outer
+                    // one for just this placement — letting one design in a
+                    // multi-design panel opt out while its neighbors keep it.
+                    // See DesignEntry.mirrorBottomOverride in store.ts.
+                    //
+                    // ⚠ The counter-mirror axis must be this placement's OWN
+                    // local center (refBounds), applied INSIDE the tx/ty
+                    // translate — NOT the panel-wide `boundsCenterX` applied
+                    // outside it. `clip-path="url(#pcb-clip-N)"` is evaluated
+                    // in this element's own local frame, established by its
+                    // ANCESTORS (which already include the panel-wide outer
+                    // mirror) — it does NOT see whatever this element's own
+                    // descendants (this translate/mirror pair) do. A mirror
+                    // around the PANEL center, applied to content already
+                    // translated into ITS OWN slot, moves that content into a
+                    // DIFFERENT placement's slot in this local frame — so the
+                    // clip rect here (still this placement's own [pos.x,
+                    // pos.x+w]) cuts it away entirely. Confirmed live on a
+                    // real 1x3 panel: only the middle placement (whose local
+                    // center happens to coincide with the panel center)
+                    // survived; the two outer ones vanished completely.
+                    // Mirroring around this placement's OWN local center
+                    // instead keeps the content within its own footprint
+                    // (and hence its own clip rect) — the panel-wide outer
+                    // mirror then still correctly repositions the whole
+                    // placement to its swapped panel slot afterward, exactly
+                    // like every non-override placement.
                     const counterMirror = standardBottomMirror && designMirrorOverride(pos.designId)
+                    const localMirrorCenterX = (refBounds.minX + refBounds.maxX) / 2
+                    const localMirrorTransform = `translate(${localMirrorCenterX}, 0) scale(-1, 1) translate(${-localMirrorCenterX}, 0)`
                     return (
                       <g key={`panel-pos-${posIdx}`} clipPath={`url(#pcb-clip-${posIdx})`}>
-                        <g transform={counterMirror ? bottomMirrorTransform : undefined}>
                         <g transform={`translate(${tx.toFixed(6)}, ${ty.toFixed(6)})`}>
+                        <g transform={counterMirror ? localMirrorTransform : undefined}>
                           {dBgRect}
                           {dLayers.map(layer => {
                             const clipPair = maskClipByMaskId.get(layer.id)
@@ -1392,12 +1414,19 @@ export default function GerberViewer() {
                   const tx = pos.x - refBounds.minX
                   const ty = -pos.y - refBounds.maxY
                   // Same reflection-cancels-reflection counter-mirror as the
-                  // board-view branch above.
+                  // board-view branch above — and the same local-vs-panel-
+                  // center axis fix: mirror around THIS placement's own
+                  // refBounds center, applied inside the tx/ty translate, not
+                  // the panel-wide `boundsCenterX` outside it (see that
+                  // branch's own doc comment for why the panel-wide axis
+                  // moves content out of its own clip-path entirely).
                   const counterMirror = standardBottomMirror && designMirrorOverride(pos.designId)
+                  const localMirrorCenterX = (refBounds.minX + refBounds.maxX) / 2
+                  const localMirrorTransform = `translate(${localMirrorCenterX}, 0) scale(-1, 1) translate(${-localMirrorCenterX}, 0)`
                   return (
                     <g key={`panel-pos-${posIdx}`} clipPath={`url(#pcb-clip-${posIdx})`}>
-                      <g transform={counterMirror ? bottomMirrorTransform : undefined}>
                       <g transform={`translate(${tx.toFixed(6)}, ${ty.toFixed(6)})`}>
+                      <g transform={counterMirror ? localMirrorTransform : undefined}>
                         {dLayers.map(layer => {
                           if (!layer.svgData) return null
                           return (
