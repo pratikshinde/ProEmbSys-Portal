@@ -2729,6 +2729,75 @@ export function rotateGerberLayer(layer: GerberLayer, direction: 'left' | 'right
 }
 
 /**
+ * Mirrors a GerberLayer horizontally (reflects every X coordinate around a
+ * given local axis `centerX`). Mutates the layer object in place — mirrors
+ * `rotateGerberLayer`'s own shape/conventions exactly, just for a reflection
+ * instead of a 90° turn.
+ *
+ * Used to materialize the effect of the CAM tool's per-design "Fix mirror"
+ * override into REAL exported geometry — that override was originally
+ * preview-only (a pure SVG transform, zero effect on `rawContent`/
+ * `parsedLayer`), which is correct for a file whose raw data already matches
+ * the standard "one shared top-down coordinate system, bottom layers
+ * pre-mirrored in the file" Gerber convention. But for a genuinely legacy
+ * file that stores bottom-side artwork already bottom-view-correct (the
+ * exact case the toggle exists to diagnose), the raw data itself needs this
+ * correction — otherwise the exported fabrication files ship backward
+ * (confirmed live: text and copper geometry read mirrored when opened in a
+ * neutral third-party Gerber viewer that applies no side-aware auto-flip).
+ *
+ * @param layer The layer to mirror
+ * @param centerX The local (native, pre-panel-offset) X axis to reflect around
+ */
+export function mirrorGerberLayerX(layer: GerberLayer, centerX: number): void {
+  // 1. Mirror commands
+  for (const cmd of layer.commands) {
+    if (cmd.coordinate.x !== undefined) {
+      cmd.coordinate.x = 2 * centerX - cmd.coordinate.x
+    }
+    // I is the arc center's X offset relative to the start point — mirroring
+    // the X axis flips its sign. J (the Y offset) is untouched.
+    if (cmd.coordinate.i !== undefined) {
+      cmd.coordinate.i = -cmd.coordinate.i
+    }
+    // A reflection reverses the sense of rotation, so a clockwise arc must
+    // become counter-clockwise (and vice versa) to still trace the same
+    // physical curve through the mirrored endpoints.
+    if (cmd.type === 'arc_cw') {
+      cmd.type = 'arc_ccw'
+    } else if (cmd.type === 'arc_ccw') {
+      cmd.type = 'arc_cw'
+    }
+  }
+
+  // 2. Mirror apertures. Symmetric shapes (circle/rectangle/obround) need no
+  // dimension change from an X-mirror (unlike a 90° rotation, which swaps
+  // width/height) — only their own rotation angle, if any, reverses sign.
+  for (const ap of layer.apertures.values()) {
+    if (ap.shape === 'rectangle' || ap.shape === 'obround' || ap.shape === 'polygon') {
+      if (ap.rotation !== undefined) {
+        ap.rotation = -ap.rotation
+      }
+    } else if (ap.shape === 'macro' && ap.macroName && ap.parameters && /RoundRect/i.test(ap.macroName)) {
+      // Same KiCad RoundRect special-case rotateGerberLayer documents — the
+      // macro's 4 corners are parameterized directly as $2,$3/$4,$5/$6,$7/
+      // $8,$9 (x,y pairs) in the aperture's own local frame around the flash
+      // origin, so mirroring just the X of each pair rigidly mirrors the
+      // whole rendered pad. Does not generalize to other macro names.
+      const corners: [string, string][] = [['$2', '$3'], ['$4', '$5'], ['$6', '$7'], ['$8', '$9']]
+      for (const [xk] of corners) {
+        const px = ap.parameters[xk]
+        if (px === undefined) continue
+        ap.parameters[xk] = -px
+      }
+    }
+  }
+
+  // 3. Recompute bounds
+  layer.bounds = calculateBounds(layer.commands, layer.apertures)
+}
+
+/**
  * Serialize a parsed GerberLayer (specifically a drill layer) back to a valid Excellon format.
  * The output uses explicit decimal coordinates in METRIC (millimetres), e.g. X12.3456Y78.9012.
  * This guarantees tracespace (and standard CAM tools) will parse it without scale/format ambiguity.
