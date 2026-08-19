@@ -55,8 +55,15 @@ export interface LayerFile {
  * Sanitize a user-entered PanelInfo field (part number, customer name, etc.)
  * for safe use inside a filename — strips characters invalid on Windows/macOS
  * filesystems and collapses whitespace/repeated separators to a single "_".
+ * Exported so the store's own generation-time filename stamping
+ * (generateGcodeFilesAction/generateStencilFilesAction/
+ * generatePanelArrayFilesAction) uses the exact same rules as export —
+ * those three used to reimplement only the first `.replace()` (no trim, no
+ * `_+`→`_` collapse, no fallback for a whitespace-only name), so a
+ * whitespace-only part number could produce `_` inside the ZIP but `PCB` on
+ * the ZIP's own name for the same panel.
  */
-function sanitizeForFilename(value: string | undefined, fallback: string): string {
+export function sanitizeForFilename(value: string | undefined, fallback: string): string {
   const cleaned = (value || '').trim().replace(/[<>:"/\\|?*\s]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '')
   return cleaned || fallback
 }

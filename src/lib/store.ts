@@ -16,7 +16,7 @@ import { planRouting, resolveOutlineMode } from './routing/plan-routing'
 import { DEFAULT_ROUTING_CONFIG, type BoardContour, type RoutingConfig, type RoutingResult } from './routing/types'
 import { generateGcodeFiles as buildGcodeFiles, generateMetaPanelGcodeFiles, DEFAULT_GCODE_CONTEXT, type GcodeContext, type GcodeFile } from './routing/gcode'
 import { isRoutGcodeFile, parseRoutSlots, routSlotsToGerber } from './routing/import-rout'
-import { collectPanelizedDrillHoles, collectPanelizedDrillSlots, generateMetaPanelDrill } from './gerber-exporter'
+import { collectPanelizedDrillHoles, collectPanelizedDrillSlots, generateMetaPanelDrill, sanitizeForFilename } from './gerber-exporter'
 import { traceBoardContour } from './board-contour'
 import { BoardColorName } from './board-colors'
 import {
@@ -2184,9 +2184,20 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   updatePanelInfo: (updates) => {
-    set(state => ({
-      panelInfo: { ...state.panelInfo, ...updates },
-    }))
+    set(state => {
+      // G-Code/Stencil/Meta-Panel bake the part-number prefix into their
+      // inner filenames at GENERATION time (Routing is already export-time
+      // and unaffected) — editing pcbName after generating leaves a bundle
+      // whose downloaded files are stamped with the OLD name. Only checked
+      // for an actual pcbName change (not every keystroke in the other
+      // fields), matching updatePanelConfig's existing invalidation
+      // discipline elsewhere in this file.
+      const pcbNameChanged = updates.pcbName !== undefined && updates.pcbName !== state.panelInfo.pcbName
+      return {
+        panelInfo: { ...state.panelInfo, ...updates },
+        ...(pcbNameChanged ? { gcodeFiles: null, stencilFiles: null, stencilPreview: null, panelArrayFiles: null } : {}),
+      }
+    })
   },
 
   // Output format (default 4.6 to handle boards up to 9999mm)
@@ -2736,7 +2747,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       ? mirrorSlotGroupsForArray(drillSlotGroups, panelResult.panelWidth)
       : drillSlotGroups
 
-    const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
+    const partNumber = sanitizeForFilename(panelInfo?.pcbName, 'PCB')
     set({ gcodeFiles: buildGcodeFiles(routingResult, drillHoleGroups, partNumber, gcodeContext, mirroredDrillSlotGroups) })
   },
   clearGcodeFiles: () => set({ gcodeFiles: null }),
@@ -2833,7 +2844,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const tiledHoleGroups = tileHolesAcrossArray(mirroredHoleGroups, array)
     const tiledSlotGroups = tileSlotsAcrossArray(mirroredSlotGroups, array)
 
-    const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
+    const partNumber = sanitizeForFilename(panelInfo?.pcbName, 'PCB')
 
     const borderMarksGerber = generateBorderMarksGerber(array, panelArrayConfig, outputFormat)
     const drillContent = generateMetaPanelDrill(
@@ -2905,7 +2916,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     set({ stencilGenerating: true })
     try {
-      const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
+      const partNumber = sanitizeForFilename(panelInfo?.pcbName, 'PCB')
 
       // Per (design, side) paste-aperture extraction, all in parallel —
       // mirrors generateRouting's Promise.all over independent per-design work.

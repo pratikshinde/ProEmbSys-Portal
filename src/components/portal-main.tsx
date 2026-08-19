@@ -1896,10 +1896,15 @@ export function PanelizationPage() {
             { key: 'designs' as const, icon: Boxes, label: 'Designs' },
             { key: 'dfm' as const, icon: ShieldCheck, label: 'DFM Check' },
             { key: 'panel' as const, icon: LayoutGrid, label: 'Panel Config' },
+            // Info & Export sits here (before Routing/G-Code/Stencil, not
+            // after) so the part number is entered before those tabs bake
+            // it into generated filenames — visiting them first previously
+            // meant downloading files stamped with the "PCB"/"PCB-001"
+            // placeholder instead of the real part number.
+            { key: 'export' as const, icon: Download, label: 'Info & Export' },
             { key: 'routing' as const, icon: Scissors, label: 'Routing' },
             { key: 'gcode' as const, icon: Terminal, label: 'G-Code' },
             { key: 'stencil' as const, icon: Stamp, label: 'Stencil' },
-            { key: 'export' as const, icon: Download, label: 'Info & Export' },
           ].filter(t => camMode === 'multi' || t.key !== 'designs').map(({ key, icon: Icon, label }) => (
             <button
               key={key}
