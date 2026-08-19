@@ -184,6 +184,18 @@ class ParserState {
   /** Currently selected interpolation mode */
   interpolationMode: CommandType = 'interpolate';
 
+  /**
+   * G74 (single-quadrant) vs G75 (multi-quadrant) arc mode. In single-
+   * quadrant mode I/J are UNSIGNED magnitudes and the true center must be
+   * disambiguated (see `resolveSingleQuadrantIJ`) — every arc command
+   * built while this is 'single' has its i/j resolved to the canonical
+   * SIGNED multi-quadrant form before being stored, so nothing downstream
+   * (the exporter, which always declares G75, DFM, routing) ever needs to
+   * know this mode existed. Defaults to 'multi' per the RS-274X default,
+   * though real files nearly always declare one explicitly.
+   */
+  quadrantMode: 'single' | 'multi' = 'multi';
+
   /** Whether we are inside a G36 region */
   regionMode = false;
   /** Index of the first command in the current region, or null */
@@ -571,6 +583,79 @@ function extractCoordinates(cmd: string): { x?: string; y?: string; i?: string; 
   return result;
 }
 
+/**
+ * Resolve a G74 (single-quadrant) arc's UNSIGNED I/J into the canonical
+ * SIGNED multi-quadrant form every downstream consumer (the exporter, which
+ * always declares G75; DFM; routing) already assumes.
+ *
+ * In single-quadrant mode, I/J give only the MAGNITUDE of the center offset
+ * from the arc's start point — the true signed offset is one of 4
+ * candidates (±I, ±J), and per spec must be the one that (a) places the
+ * center equidistant from both the start and end point (a real circle) and
+ * (b) sweeps ≤90° in the command's own direction (the "single quadrant"
+ * restriction). Re-emitting the raw unsigned magnitudes under a
+ * self-declared G75 header — which is what this codebase's exporter always
+ * does — makes a real viewer solve for the WRONG candidate (start-radius
+ * only, ignoring the end point), producing a mathematically inconsistent
+ * arc: confirmed on a real G74 source file where the naive (+I,+J)
+ * reading gives mismatched start/end radii (944.1 vs 924.0) while the
+ * correct (−I,+J) reading matches exactly (944.1 vs 944.0) — the visible
+ * symptom is silkscreen/copper circles and pad fillets rendering distorted.
+ *
+ * @returns the resolved {i, j}, signed and ready to store as-is
+ */
+function resolveSingleQuadrantIJ(
+  startX: number, startY: number, endX: number, endY: number,
+  iMag: number, jMag: number, direction: 'arc_cw' | 'arc_ccw'
+): { i: number; j: number } {
+  const iAbs = Math.abs(iMag);
+  const jAbs = Math.abs(jMag);
+  const candidates = [
+    { i: iAbs, j: jAbs },
+    { i: iAbs, j: -jAbs },
+    { i: -iAbs, j: jAbs },
+    { i: -iAbs, j: -jAbs },
+  ];
+
+  function radiusError(c: { i: number; j: number }): number {
+    const cx = startX + c.i;
+    const cy = startY + c.j;
+    const r1 = Math.hypot(startX - cx, startY - cy);
+    const r2 = Math.hypot(endX - cx, endY - cy);
+    return Math.abs(r1 - r2);
+  }
+
+  function sweepDeg(c: { i: number; j: number }): number {
+    const cx = startX + c.i;
+    const cy = startY + c.j;
+    const a1 = Math.atan2(startY - cy, startX - cx);
+    const a2 = Math.atan2(endY - cy, endX - cx);
+    let sweep = direction === 'arc_ccw' ? a2 - a1 : a1 - a2;
+    if (sweep < 0) sweep += 2 * Math.PI;
+    return sweep * 180 / Math.PI;
+  }
+
+  // Prefer the best radius match among candidates that actually satisfy the
+  // single-quadrant (≤90°) restriction; only fall back to ignoring that
+  // restriction (picking the overall best radius match) on a malformed file
+  // where no candidate qualifies, so a bad file still produces a plausible
+  // arc rather than aborting the parse.
+  let best: { i: number; j: number } | null = null;
+  let bestErr = Infinity;
+  for (const c of candidates) {
+    if (sweepDeg(c) > 90 + 1e-6) continue;
+    const err = radiusError(c);
+    if (err < bestErr) { bestErr = err; best = c; }
+  }
+  if (!best) {
+    for (const c of candidates) {
+      const err = radiusError(c);
+      if (err < bestErr) { bestErr = err; best = c; }
+    }
+  }
+  return best ?? { i: iAbs, j: jAbs };
+}
+
 // ============================================================================
 // Command Line Processing
 // ============================================================================
@@ -642,7 +727,15 @@ function processDataBlock(block: string, state: ParserState, _cmdIdx: number): v
     state.units = 'mm';
   }
 
-  // G75 — Multi quadrant arc mode (default, no special handling needed)
+  // G74 — Single quadrant arc mode (I/J are unsigned; see `quadrantMode`)
+  if (trimmed.includes('G74')) {
+    state.quadrantMode = 'single';
+  }
+
+  // G75 — Multi quadrant arc mode (I/J are signed; the RS-274X default)
+  if (trimmed.includes('G75')) {
+    state.quadrantMode = 'multi';
+  }
 
   // ---- LP — Level Polarity ----
   if (trimmed.includes('LPD')) {
@@ -656,7 +749,16 @@ function processDataBlock(block: string, state: ParserState, _cmdIdx: number): v
   // Extract the D-code from the END of the command string.
   // In RS-274X, the D-code is always the last element: X<val>Y<val>I<val>J<val>D<nn>
   // This approach avoids the operator precedence bug with includes() substring matching.
-  const dcodeMatch = trimmed.match(/D(\d{1,2})\s*$/);
+  // ⚠ Must NOT cap the digit count. Aperture-select D-codes routinely run into
+  // 3+ digits on any real board with more than ~90 distinct apertures (a
+  // `\d{1,2}` cap, as this had, silently fails to match D100+ entirely —
+  // confirmed on a real customer mask layer with 546 defined apertures and
+  // explicit `G54D549*`/`G54D494*` selections: those selections matched
+  // nothing, fell through to the "omitted D-code" branch, and inherited
+  // whatever 2-digit aperture was last correctly recognized instead —
+  // collapsing dozens of intended aperture sizes down to a handful and
+  // reading as "every D-code looks the same" once opened in a real viewer.
+  const dcodeMatch = trimmed.match(/D(\d+)\s*$/);
   const dcode = dcodeMatch ? parseInt(dcodeMatch[1], 10) : null;
 
   if (dcode === 1 || dcode === 2 || dcode === 3) {
@@ -668,9 +770,11 @@ function processDataBlock(block: string, state: ParserState, _cmdIdx: number): v
     const coords = extractCoordinates(block);
     const x = state.parseCoordinateValue(coords.x, 'x');
     const y = state.parseCoordinateValue(coords.y, 'y');
-    const i = state.parseCoordinateValue(coords.i, 'ij');
-    const j = state.parseCoordinateValue(coords.j, 'ij');
+    let i = state.parseCoordinateValue(coords.i, 'ij');
+    let j = state.parseCoordinateValue(coords.j, 'ij');
 
+    const prevX = state.currentX;
+    const prevY = state.currentY;
     if (x !== undefined) state.currentX = x;
     if (y !== undefined) state.currentY = y;
 
@@ -681,6 +785,21 @@ function processDataBlock(block: string, state: ParserState, _cmdIdx: number): v
         i === undefined && j === undefined) {
       state.interpolationMode = 'interpolate';
       state.warnings.push('Circular interpolation lacks I and J parameters. Assuming G01 (Linear) mode for this and subsequent commands.');
+    }
+
+    // G74 (single-quadrant) arcs carry UNSIGNED I/J — resolve to the
+    // canonical signed multi-quadrant form once, here, so every downstream
+    // consumer (the exporter, which always declares G75) can treat i/j as
+    // already-correct. See resolveSingleQuadrantIJ's own docs.
+    if (state.quadrantMode === 'single' && i !== undefined && j !== undefined &&
+        (state.interpolationMode === 'arc_cw' || state.interpolationMode === 'arc_ccw') &&
+        prevX !== null && prevY !== null) {
+      const resolved = resolveSingleQuadrantIJ(
+        prevX, prevY, state.currentX ?? prevX, state.currentY ?? prevY,
+        i, j, state.interpolationMode
+      );
+      i = resolved.i;
+      j = resolved.j;
     }
 
     state.commands.push({
@@ -759,9 +878,11 @@ function processDataBlock(block: string, state: ParserState, _cmdIdx: number): v
       const activeDCode = state.lastDCode !== null ? state.lastDCode : 1;
       const x = state.parseCoordinateValue(coords.x, 'x');
       const y = state.parseCoordinateValue(coords.y, 'y');
-      const i = state.parseCoordinateValue(coords.i, 'ij');
-      const j = state.parseCoordinateValue(coords.j, 'ij');
+      let i = state.parseCoordinateValue(coords.i, 'ij');
+      let j = state.parseCoordinateValue(coords.j, 'ij');
 
+      const prevX = state.currentX;
+      const prevY = state.currentY;
       if (x !== undefined) state.currentX = x;
       if (y !== undefined) state.currentY = y;
 
@@ -771,6 +892,19 @@ function processDataBlock(block: string, state: ParserState, _cmdIdx: number): v
             i === undefined && j === undefined) {
           state.interpolationMode = 'interpolate';
           state.warnings.push('Circular interpolation lacks I and J parameters. Assuming G01 (Linear) mode for this and subsequent commands.');
+        }
+
+        // Same G74 single-quadrant I/J disambiguation as the explicit-D01
+        // branch above — see resolveSingleQuadrantIJ's docs.
+        if (state.quadrantMode === 'single' && i !== undefined && j !== undefined &&
+            (state.interpolationMode === 'arc_cw' || state.interpolationMode === 'arc_ccw') &&
+            prevX !== null && prevY !== null) {
+          const resolved = resolveSingleQuadrantIJ(
+            prevX, prevY, state.currentX ?? prevX, state.currentY ?? prevY,
+            i, j, state.interpolationMode
+          );
+          i = resolved.i;
+          j = resolved.j;
         }
 
         state.commands.push({

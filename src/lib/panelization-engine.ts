@@ -2625,19 +2625,29 @@ function generateBodyFromCommands(
     if (cmd.coordinate.x !== undefined) posX = cmd.coordinate.x
     if (cmd.coordinate.y !== undefined) posY = cmd.coordinate.y
 
+    // --- Region close ---
+    // Must run BEFORE a polarity change: %LP is not legal inside an open
+    // G36/G37 region statement. Also fires when the polarity is about to
+    // change while STILL inside a region (two adjacent source G36..G37
+    // blocks of different polarity collapse into one contiguous regionMode
+    // run in `commands`, so this is the only place that split can be
+    // detected) — closing, switching polarity, then reopening below keeps
+    // both region statements legal instead of emitting %LP mid-region.
+    if (inRegion && (!cmd.regionMode || cmd.polarity !== lastPolarity)) {
+      lines.push('G37*')
+      inRegion = false
+    }
+
     // --- Polarity changes ---
     if (cmd.polarity !== lastPolarity) {
       lines.push(cmd.polarity === 'clear' ? '%LPC*%' : '%LPD*%')
       lastPolarity = cmd.polarity
     }
 
-    // --- Region boundaries ---
+    // --- Region open ---
     if (cmd.regionMode && !inRegion) {
       lines.push('G36*')
       inRegion = true
-    } else if (!cmd.regionMode && inRegion) {
-      lines.push('G37*')
-      inRegion = false
     }
 
     // --- Interpolation mode ---
@@ -2724,6 +2734,28 @@ function generateBodyFromCommands(
   // Close any unclosed region
   if (inRegion) {
     lines.push('G37*')
+  }
+
+  // Restore dark polarity before returning. Without this, a copy whose last
+  // drawing command was clear-polarity (a thermal relief / pour cutout /
+  // anti-pad — extremely common on real copper layers) leaves the emitted
+  // FILE in %LPC*% while this function's own `lastPolarity` is about to be
+  // thrown away and reinitialized to 'dark' on the NEXT call — so the next
+  // panel copy's first dark command sees `cmd.polarity === lastPolarity`
+  // and wrongly skips re-emitting %LPD*%. Every subsequent copy is then
+  // drawn in ERASE mode and renders invisible — confirmed live on a real
+  // customer panel: 3 evenly-spaced, fully-populated copper copies in the
+  // data, but only the first one visible in a neutral third-party Gerber
+  // viewer, because copies 2 and 3 were silently clearing instead of
+  // drawing. The same gap left every panel overlay appended AFTER the
+  // placement loop (L-shapes, V-score marks, donuts, fiducials, rib text)
+  // in whatever polarity the LAST copy happened to end on. Must come AFTER
+  // the G37* close directly above — %LP is not legal inside an open region
+  // statement. Byte-identical for the overwhelmingly common case (any layer
+  // whose last drawing command is already dark — every mask/silk/paste and
+  // most copper).
+  if (lastPolarity !== 'dark') {
+    lines.push('%LPD*%')
   }
 
   return currentInterp
