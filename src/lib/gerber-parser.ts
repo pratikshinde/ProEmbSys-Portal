@@ -1084,7 +1084,7 @@ function calculateBounds(
  * board whose only geometry is a slot (or whose slot pokes past its other
  * holes) panelizes with a bounding box too small to actually contain it.
  */
-function expandBoundsForSlots(bounds: GerberBounds | null, slots: DrillSlot[]): GerberBounds | null {
+export function expandBoundsForSlots(bounds: GerberBounds | null, slots: DrillSlot[]): GerberBounds | null {
   if (slots.length === 0) return bounds;
   let { minX, minY, maxX, maxY } = bounds ?? {
     minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity,
@@ -2858,8 +2858,21 @@ export function rotateGerberLayer(layer: GerberLayer, direction: 'left' | 'right
     }
   }
 
-  // 3. Recompute bounds
-  layer.bounds = calculateBounds(layer.commands, layer.apertures)
+  // 1b. Rotate drill slots (start/end are outside `commands` — see
+  // `GerberLayer.drillSlots`'s own docs — so `calculateBounds` never sees
+  // them and every geometric transform must handle them explicitly).
+  for (const slot of layer.drillSlots ?? []) {
+    for (const pt of [slot.start, slot.end]) {
+      const x = pt.x, y = pt.y
+      if (direction === 'right') { pt.x = y; pt.y = -x }
+      else { pt.x = -y; pt.y = x }
+    }
+  }
+
+  // 3. Recompute bounds — must fold in slots (`expandBoundsForSlots`) or a
+  // board whose only geometry near an edge is a slot rotates into a bounds
+  // box too small to contain it.
+  layer.bounds = expandBoundsForSlots(calculateBounds(layer.commands, layer.apertures), layer.drillSlots ?? [])
 }
 
 /**
@@ -2882,8 +2895,14 @@ export function rotateGerberLayer(layer: GerberLayer, direction: 'left' | 'right
  *
  * @param layer The layer to mirror
  * @param centerX The local (native, pre-panel-offset) X axis to reflect around
+ * @returns `hasUnmirroredMacro: true` when the layer has a custom aperture
+ *   macro whose local coordinate layout this function doesn't know how to
+ *   mirror (anything other than KiCad's RoundRect) — that pad's FLASH
+ *   POSITION is still mirrored correctly, but its own outline shape is not,
+ *   same documented gap `rotateGerberLayer` has for rotation. Callers
+ *   should surface this rather than silently shipping a wrong pad shape.
  */
-export function mirrorGerberLayerX(layer: GerberLayer, centerX: number): void {
+export function mirrorGerberLayerX(layer: GerberLayer, centerX: number): { hasUnmirroredMacro: boolean } {
   // 1. Mirror commands
   for (const cmd of layer.commands) {
     if (cmd.coordinate.x !== undefined) {
@@ -2904,13 +2923,29 @@ export function mirrorGerberLayerX(layer: GerberLayer, centerX: number): void {
     }
   }
 
+  // 1b. Mirror drill slots — same "outside `commands`, every transform must
+  // handle it explicitly" reasoning as the rotate path above.
+  for (const slot of layer.drillSlots ?? []) {
+    slot.start.x = 2 * centerX - slot.start.x
+    slot.end.x = 2 * centerX - slot.end.x
+  }
+
   // 2. Mirror apertures. Symmetric shapes (circle/rectangle/obround) need no
   // dimension change from an X-mirror (unlike a 90° rotation, which swaps
   // width/height) — only their own rotation angle, if any, reverses sign.
+  let hasUnmirroredMacro = false
   for (const ap of layer.apertures.values()) {
-    if (ap.shape === 'rectangle' || ap.shape === 'obround' || ap.shape === 'polygon') {
+    if (ap.shape === 'rectangle' || ap.shape === 'obround') {
       if (ap.rotation !== undefined) {
         ap.rotation = -ap.rotation
+      }
+    } else if (ap.shape === 'polygon') {
+      // A regular n-gon's vertices sit at rot + k*360/n; reflecting about a
+      // vertical axis maps them to 180 - rot - k*360/n. That's congruent to
+      // -rot (the rectangle/obround formula) only when n is EVEN — an odd
+      // vertex count (triangle, pentagon, ...) needs the real 180-rot form.
+      if (ap.rotation !== undefined) {
+        ap.rotation = 180 - ap.rotation
       }
     } else if (ap.shape === 'macro' && ap.macroName && ap.parameters && /RoundRect/i.test(ap.macroName)) {
       // Same KiCad RoundRect special-case rotateGerberLayer documents — the
@@ -2924,11 +2959,21 @@ export function mirrorGerberLayerX(layer: GerberLayer, centerX: number): void {
         if (px === undefined) continue
         ap.parameters[xk] = -px
       }
+    } else if (ap.shape === 'macro') {
+      // A macro this codebase doesn't know the coordinate layout of — its
+      // flash position still mirrors correctly (step 1 above), but the
+      // shape drawn at that position does not. Legacy Protel/OrCAD/CAM350
+      // files (the exact vintage the mirror override targets) are the
+      // heaviest real-world users of hand-rolled macros, so this is a real,
+      // not theoretical, gap.
+      hasUnmirroredMacro = true
     }
   }
 
-  // 3. Recompute bounds
-  layer.bounds = calculateBounds(layer.commands, layer.apertures)
+  // 3. Recompute bounds — must fold in slots, see the rotate path above.
+  layer.bounds = expandBoundsForSlots(calculateBounds(layer.commands, layer.apertures), layer.drillSlots ?? [])
+
+  return { hasUnmirroredMacro }
 }
 
 /**

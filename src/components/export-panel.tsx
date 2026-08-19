@@ -22,8 +22,8 @@ import {
 import { FileText, Download, Package, Settings2, RotateCcw, AlertTriangle, Wrench, Save, FolderOpen, Trash2 } from 'lucide-react'
 import { exportPanelizedGerbers } from '@/lib/gerber-exporter'
 import { LayerFile } from '@/lib/gerber-exporter'
-import { DrillFormatPreset, DRILL_FORMAT_PRESETS, DrillCamCompatibility, resolveDesignGeometry } from '@/lib/panelization-engine'
-import { mirrorGerberLayerX } from '@/lib/gerber-parser'
+import { DrillFormatPreset, DRILL_FORMAT_PRESETS, DrillCamCompatibility } from '@/lib/panelization-engine'
+import { getMirroredLayers } from '@/lib/design-mirror'
 import { toast } from '@/hooks/use-toast'
 import type { CamJobFileMeta, CamJobSnapshot } from '@/lib/store'
 import { loadCamJobById } from '@/lib/load-cam-job'
@@ -193,39 +193,19 @@ export default function ExportPanel() {
     setExporting(true)
     try {
       // Materialize each mirrored design's "Fix mirror" override into the
-      // ACTUAL exported geometry, not just the on-screen preview transform.
-      // That override used to be purely cosmetic (a reflection composed with
-      // itself cancels the panel's own auto-mirror, with zero effect on
-      // rawContent/parsedLayer) — correct for a file that already matches
-      // the standard top-down Gerber convention, but for a genuinely legacy
-      // pre-mirrored file (the exact case the toggle exists to diagnose) the
-      // raw data itself is backward. Confirmed live: opening the exported
-      // Gerbers in a neutral third-party viewer (no side-aware auto-flip)
-      // showed mirrored text and geometry. See mirrorGerberLayerX's own docs.
-      const mirroredParsedLayerById = new Map<string, typeof exportLayers[number]['parsedLayer']>()
-      const mirroredDesignIds = new Set(designs.filter(d => d.mirrorBottomOverride).map(d => d.id))
-      for (const designId of mirroredDesignIds) {
-        const designLayers = exportLayers.filter(l => l.designId === designId)
-        const geometry = resolveDesignGeometry(designLayers)
-        if (!geometry) continue
-        // resolveDesignGeometry's datum is -bounds.min; the design's own
-        // local mirror axis is its bounds center in that same native space —
-        // the same reference point the viewer's now-fixed counter-mirror
-        // uses (refBounds center), so exported geometry matches the preview.
-        const centerX = -geometry.datum.x + geometry.widthMm / 2
-        for (const l of designLayers) {
-          if (!l.parsedLayer) continue
-          const cloned = structuredClone(l.parsedLayer)
-          mirrorGerberLayerX(cloned, centerX)
-          mirroredParsedLayerById.set(l.id, cloned)
-        }
-      }
+      // ACTUAL exported geometry, not just the on-screen preview transform
+      // — see getMirroredLayers's own docs for why this is the ONE shared
+      // point every file-producing consumer (this export, routing, G-code,
+      // stencil, meta-panel array) goes through, so none of them can
+      // silently disagree with a mirrored Gerber export.
+      const { layers: mirroredLayers, warnings: mirrorWarnings } = getMirroredLayers(exportLayers, designs)
+      for (const w of mirrorWarnings) console.warn('[Export mirror]', w)
 
-      const layerFiles: LayerFile[] = exportLayers.map(l => ({
+      const layerFiles: LayerFile[] = mirroredLayers.map(l => ({
         name: l.name,
         fileName: `panel_${l.type}_${l.id}.gerber`,
         content: l.rawContent,
-        parsedLayer: mirroredParsedLayerById.get(l.id) ?? l.parsedLayer,
+        parsedLayer: l.parsedLayer,
         type: l.type,
         side: l.side,
         designId: l.designId,

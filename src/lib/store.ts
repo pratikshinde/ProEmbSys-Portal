@@ -4,7 +4,7 @@
 
 import { create } from 'zustand'
 import JSZip from 'jszip'
-import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode, DrillMeta } from './gerber-parser'
+import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode, DrillMeta, expandBoundsForSlots } from './gerber-parser'
 import { gerberToSvg, gerberRenderBoardView, checkCopperSpacing, extractStencilApertures, BoardView, GerberSvgResult } from './gerber-svg'
 import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
 import { runDfm } from './dfm/run-dfm'
@@ -35,6 +35,7 @@ import type { PanelTemplateSection, ResolvedPanelTemplateSettings } from './pane
 import { DEFAULT_STENCIL_CONFIG, type StencilConfig, type StencilFile, type StencilPreviewData } from './stencil-types'
 import { tileAperturesAcrossPlacements, translateRings, type Point as StencilPoint } from './stencil-geometry'
 import { serializeStencilDxf, type DxfStencilLayer } from './stencil-dxf'
+import { getMirroredLayers, mirrorRingsX, mirrorBoardContourX } from './design-mirror'
 
 export type { LayerType, LayerSide }
 
@@ -135,10 +136,18 @@ export interface DesignEntry {
    *  OrCAD export: reference-designator silkscreen text read correctly in
    *  the raw parsed data but backwards once our standard mirror was
    *  applied). No Gerber field declares which convention a file uses, so
-   *  this can't be auto-detected — it's a manual per-design escape hatch,
-   *  purely cosmetic (display-only, exactly like `boardColor` — never
-   *  touches exported Gerbers, panelization, DFM, or routing geometry).
-   *  Default false preserves today's behavior for every normal file. */
+   *  this can't be auto-detected — it's a manual per-design escape hatch.
+   *  The viewer's own on-screen counter-mirror is still display-only, but
+   *  every FILE-PRODUCING consumer (panelized Gerber/Excellon export,
+   *  routing, G-code, stencil, the meta-panel array) materializes a real
+   *  mirror via `getMirroredLayers`/`mirrorRingsX`/`mirrorBoardContourX`
+   *  (design-mirror.ts) — an export-only mirror was tried first and found
+   *  to leave routing/G-code/stencil silently disagreeing with a mirrored
+   *  Gerber export, a real fabrication-scrap risk. Deliberately NOT wired
+   *  into DFM (every measurement is a distance; reflection is an isometry,
+   *  so results are identical either way) or panel sizing/board-view
+   *  preview (bounds-driven / display-only). Default false preserves
+   *  today's behavior for every normal file. */
   mirrorBottomOverride: boolean
 }
 
@@ -1436,15 +1445,24 @@ export const useAppStore = create<AppState>((set, get) => ({
             if (newCoord.y !== undefined) newCoord.y += globalBaseOffset.y
             return { ...cmd, coordinate: newCoord }
           })
-          const shiftedBounds = layer.parsedLayer.bounds ? {
+          // Slots live outside `commands` (see GerberLayer.drillSlots's own
+          // docs) — omitting this shift left a slot behind while every hole
+          // around it moved, throwing the two out of registration.
+          const shiftedSlots = (layer.parsedLayer.drillSlots ?? []).map(slot => ({
+            ...slot,
+            start: { x: slot.start.x + globalBaseOffset.x, y: slot.start.y + globalBaseOffset.y },
+            end: { x: slot.end.x + globalBaseOffset.x, y: slot.end.y + globalBaseOffset.y },
+          }))
+          const shiftedBounds = expandBoundsForSlots(layer.parsedLayer.bounds ? {
             minX: layer.parsedLayer.bounds.minX + globalBaseOffset.x,
             maxX: layer.parsedLayer.bounds.maxX + globalBaseOffset.x,
             minY: layer.parsedLayer.bounds.minY + globalBaseOffset.y,
             maxY: layer.parsedLayer.bounds.maxY + globalBaseOffset.y
-          } : null
+          } : null, shiftedSlots)
           drillToSerialize = {
             ...layer.parsedLayer,
             commands: shiftedCommands,
+            drillSlots: shiftedSlots,
             bounds: shiftedBounds
           }
         }
@@ -2523,7 +2541,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   boardContour: null,
   routingGenerating: false,
   generateRouting: async () => {
-    const { panelResult, panelConfig, routingConfig, layers, activeDesignId } = get()
+    const { panelResult, panelConfig, routingConfig, layers, designs, activeDesignId } = get()
     if (!panelResult) {
       set({ routingResult: null, routingStale: false, boardContour: null, gcodeFiles: null })
       return
@@ -2583,6 +2601,21 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
 
       boardContourByDesign = new Map(traced)
+
+      // Contour mode traces the real profile from rawContent, which
+      // getMirroredLayers's parsedLayer clone never reaches — mirror the
+      // resulting rings directly instead, same as the stencil outline path.
+      // Bbox-mode routing needs no equivalent: it reads pos.w/h/x/y off
+      // placements, and mirroring a design about its own bounds centre
+      // preserves its bounding box exactly.
+      for (const designId of needsTrace) {
+        if (!designs.find(d => d.id === designId)?.mirrorBottomOverride) continue
+        const contour = boardContourByDesign.get(designId)
+        const geometry = resolveDesignGeometry(layers.filter(l => l.designId === designId))
+        if (!contour || !geometry) continue
+        const centerX = -geometry.datum.x + geometry.widthMm / 2
+        boardContourByDesign.set(designId, mirrorBoardContourX(contour, centerX))
+      }
     }
 
     const designsCtx: Record<string, { outlineLayer: GerberLayer | null; boardContour: BoardContour | null; outlineBoundsMm: { minX: number; minY: number } | null }> = {}
@@ -2629,18 +2662,24 @@ export const useAppStore = create<AppState>((set, get) => ({
   resetGcodeContext: () => set({ gcodeContext: { ...DEFAULT_GCODE_CONTEXT } }),
   gcodeFiles: null,
   generateGcodeFilesAction: () => {
-    const { routingResult, gcodeContext, layers, panelResult, panelInfo, panelConfig } = get()
+    const { routingResult, gcodeContext, layers, designs, panelResult, panelInfo, panelConfig } = get()
     if (!routingResult || !panelResult) {
       set({ gcodeFiles: null })
       return
     }
+    // Apply each mirrored design's "Fix mirror" override before collecting
+    // drill hits — see getMirroredLayers's own docs. Without this, a
+    // mirrored panelized Gerber export and its own drilling G-code would
+    // silently disagree on where the holes are.
+    const { layers: mirroredLayers, warnings: mirrorWarnings } = getMirroredLayers(layers, designs)
+    for (const w of mirrorWarnings) console.warn('[G-Code mirror]', w)
     // Every design's own drill hits, each against its own datum/placements
     // then merged by diameter — panelResult.designs is the source of truth
     // for which designs actually have placements on THIS panel (matching
     // routing's own per-design scoping, not a single active design).
-    const componentHoleGroups = collectAllDesignsDrillHoles(layers, panelResult)
+    const componentHoleGroups = collectAllDesignsDrillHoles(mirroredLayers, panelResult)
       .map(g => ({ diameterMm: g.diameterMm, holes: g.holes }))
-    const drillSlotGroups = collectAllDesignsDrillSlots(layers, panelResult)
+    const drillSlotGroups = collectAllDesignsDrillSlots(mirroredLayers, panelResult)
 
     // Tooling/reference (PINN) holes were previously drilled only via the
     // Excellon `_PINN.drl` export and the separate Multi-Panel Array G-code
@@ -2686,7 +2725,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   panelArrayResult: null,
   panelArrayFiles: null,
   generatePanelArrayFilesAction: () => {
-    const { panelResult, panelArrayConfig, layers, panelConfig, gcodeContext, panelInfo, outputFormat } = get()
+    const { panelResult, panelArrayConfig, layers, designs, panelConfig, gcodeContext, panelInfo, outputFormat } = get()
     if (!panelResult) {
       set({ panelArrayResult: null, panelArrayFiles: null })
       return
@@ -2697,10 +2736,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       return
     }
 
+    // Same mirror-materialization as generateGcodeFilesAction — see
+    // getMirroredLayers's own docs.
+    const { layers: mirroredLayers, warnings: mirrorWarnings } = getMirroredLayers(layers, designs)
+    for (const w of mirrorWarnings) console.warn('[Meta-panel mirror]', w)
+
     // Every design's own drill hits, each against its own datum/placements
     // then merged by diameter — same reasoning as generateGcodeFilesAction.
-    const componentHoleGroups = collectAllDesignsDrillHoles(layers, panelResult)
-    const componentSlotGroups = collectAllDesignsDrillSlots(layers, panelResult)
+    const componentHoleGroups = collectAllDesignsDrillHoles(mirroredLayers, panelResult)
+    const componentSlotGroups = collectAllDesignsDrillSlots(mirroredLayers, panelResult)
 
     // Tooling/reference holes join the same {diameterMm, holes} shape so they
     // ride along in the same tiled drill program as the component holes —
@@ -2780,7 +2824,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   stencilPreview: null,
   stencilGenerating: false,
   generateStencilFilesAction: async () => {
-    const { layers, panelResult, stencilConfig, panelInfo, activeDesignId } = get()
+    const { layers, designs, panelResult, stencilConfig, panelInfo, activeDesignId } = get()
 
     const sides: ('top' | 'bottom')[] = [
       ...(stencilConfig.includeTopPaste ? (['top'] as const) : []),
@@ -2895,11 +2939,24 @@ export const useAppStore = create<AppState>((set, get) => ({
 
         for (const designId of designIds) {
           const designLayers = layers.filter(l => l.designId === designId)
-          const datum = resolveDesignGeometry(designLayers)?.datum ?? { x: 0, y: 0 }
+          const geometry = resolveDesignGeometry(designLayers)
+          const datum = geometry?.datum ?? { x: 0, y: 0 }
           const job = apertureResults.find(r => r.designId === designId && r.side === side)
-          const hulls = (job?.result.apertures ?? []).map(a => a.hull)
-          const originalHulls = (job?.result.apertures ?? []).map(a => a.originalHull)
-          const outline = outlineByDesign.get(designId) ?? []
+          let hulls = (job?.result.apertures ?? []).map(a => a.hull)
+          let originalHulls = (job?.result.apertures ?? []).map(a => a.originalHull)
+          let outline = outlineByDesign.get(designId) ?? []
+
+          // Apertures/outline come from the worker over rawContent, not
+          // parsedLayer, so getMirroredLayers's parsedLayer clone never
+          // reaches this path — mirror the already-extracted point geometry
+          // directly instead. Same local-centre reference as every other
+          // mirror consumer.
+          if (designs.find(d => d.id === designId)?.mirrorBottomOverride && geometry) {
+            const centerX = -geometry.datum.x + geometry.widthMm / 2
+            hulls = mirrorRingsX(hulls, centerX)
+            originalHulls = mirrorRingsX(originalHulls, centerX)
+            outline = mirrorRingsX(outline, centerX)
+          }
 
           if (stencilConfig.scope === 'panel' && panelResult) {
             const placements = panelResult.placements.filter(p => p.designId === designId)
