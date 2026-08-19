@@ -28,6 +28,8 @@ import {
   tileSlotsAcrossArray,
   rotateHoleGroupsForArray,
   rotateSlotGroupsForArray,
+  mirrorHoleGroupsForArray,
+  mirrorSlotGroupsForArray,
   type PanelArrayConfig,
   type PanelArrayResult,
 } from './panel-array'
@@ -66,6 +68,12 @@ export interface PanelArrayFiles {
   drillFilename: string
   drillContent: string
   gcodeFiles: GcodeFile[]
+  /** Echoes `PanelArrayConfig.mirrorX` at generation time — the border
+   *  marks are identical whether or not the drill program is mirrored, so
+   *  the file LIST alone can't tell an operator which one they're holding.
+   *  Surfaced in the meta-panel README (`exportMetaPanelFiles`); a mirrored
+   *  program handed over with no note is a real scrap risk. */
+  mirroredX: boolean
 }
 
 export interface LayerEntry {
@@ -2658,8 +2666,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   // G-code
   gcodeContext: { ...DEFAULT_GCODE_CONTEXT },
   updateGcodeContext: (updates) =>
-    set(state => ({ gcodeContext: { ...state.gcodeContext, ...updates } })),
-  resetGcodeContext: () => set({ gcodeContext: { ...DEFAULT_GCODE_CONTEXT } }),
+    // Same reasoning as updatePanelArrayConfig: any context edit (mirrorX
+    // in particular) can change what an already-generated gcodeFiles bundle
+    // should contain — drop it rather than leave a stale program
+    // downloadable. "Generate G-Code" is one click to rebuild.
+    set(state => ({ gcodeContext: { ...state.gcodeContext, ...updates }, gcodeFiles: null })),
+  resetGcodeContext: () => set({ gcodeContext: { ...DEFAULT_GCODE_CONTEXT }, gcodeFiles: null }),
   gcodeFiles: null,
   generateGcodeFilesAction: () => {
     const { routingResult, gcodeContext, layers, designs, panelResult, panelInfo, panelConfig } = get()
@@ -2707,19 +2719,38 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!mergedByDia.has(g.diameterMm)) mergedByDia.set(g.diameterMm, [])
       mergedByDia.get(g.diameterMm)!.push(...g.holes)
     }
-    const drillHoleGroups = [...mergedByDia.entries()]
+    const mergedHoleGroups = [...mergedByDia.entries()]
       .sort(([a], [b]) => a - b)
       .map(([diameterMm, holes]) => ({ diameterMm, holes }))
 
+    // Single-sided PCBs must be drilled with copper facing UP on the CNC —
+    // same reasoning and same reused mirror primitive as the meta-panel
+    // array's own mirrorX (panel-array.ts), just about the plain panel's
+    // own width (this tab has no array-tiling/rotation concept). The
+    // cutting/routing program (buildGcodeFiles' own routingResult path) is
+    // untouched — mirroring only ever applies to the drilling programs.
+    const drillHoleGroups = gcodeContext.mirrorX
+      ? mirrorHoleGroupsForArray(mergedHoleGroups, panelResult.panelWidth)
+      : mergedHoleGroups
+    const mirroredDrillSlotGroups = gcodeContext.mirrorX
+      ? mirrorSlotGroupsForArray(drillSlotGroups, panelResult.panelWidth)
+      : drillSlotGroups
+
     const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
-    set({ gcodeFiles: buildGcodeFiles(routingResult, drillHoleGroups, partNumber, gcodeContext, drillSlotGroups) })
+    set({ gcodeFiles: buildGcodeFiles(routingResult, drillHoleGroups, partNumber, gcodeContext, mirroredDrillSlotGroups) })
   },
   clearGcodeFiles: () => set({ gcodeFiles: null }),
 
   // Meta-panelization (multi-panel-array CNC batch)
   panelArrayConfig: { ...DEFAULT_PANEL_ARRAY_CONFIG },
   updatePanelArrayConfig: (updates) =>
-    set(state => ({ panelArrayConfig: { ...state.panelArrayConfig, ...updates } })),
+    // Any config edit can change what the already-generated files should
+    // contain (mirrorX/rotatePanel90/mark geometry/etc) — drop them rather
+    // than leave a stale bundle sitting downloadable in the file list.
+    // panelArrayResult (the layout) is left alone: "Generate Array Files"
+    // always fully recomputes it, and it's cheap to regenerate — same
+    // deliberate scope cut updatePanelConfig already documents.
+    set(state => ({ panelArrayConfig: { ...state.panelArrayConfig, ...updates }, panelArrayFiles: null })),
   resetPanelArrayConfig: () =>
     set({ panelArrayConfig: { ...DEFAULT_PANEL_ARRAY_CONFIG }, panelArrayResult: null, panelArrayFiles: null }),
   panelArrayResult: null,
@@ -2782,8 +2813,25 @@ export const useAppStore = create<AppState>((set, get) => ({
       ? rotateSlotGroupsForArray(componentSlotGroups, panelResult.panelHeight)
       : componentSlotGroups
 
-    const tiledHoleGroups = tileHolesAcrossArray(rotatedHoleGroups, array)
-    const tiledSlotGroups = tileSlotsAcrossArray(rotatedSlotGroups, array)
+    // Single-sided PCBs must be drilled with copper facing UP on the CNC —
+    // the panel is physically flipped over first, so every hole/slot's X
+    // mirrors within its own panel. Same "before tiling, in the panel's own
+    // (already-rotated, if applicable) frame" placement as the rotation
+    // step above — mirroring after rotation means the effective width is
+    // the ROTATED frame's width (panelHeight when rotated), matching
+    // computePanelArray's own effPanelWidthMm convention exactly. Tooling/
+    // reference holes were already merged in above, so they mirror too —
+    // correct, since the whole panel flips, pinning holes included.
+    const effPanelWidthMm = panelArrayConfig.rotatePanel90 ? panelResult.panelHeight : panelResult.panelWidth
+    const mirroredHoleGroups = panelArrayConfig.mirrorX
+      ? mirrorHoleGroupsForArray(rotatedHoleGroups, effPanelWidthMm)
+      : rotatedHoleGroups
+    const mirroredSlotGroups = panelArrayConfig.mirrorX
+      ? mirrorSlotGroupsForArray(rotatedSlotGroups, effPanelWidthMm)
+      : rotatedSlotGroups
+
+    const tiledHoleGroups = tileHolesAcrossArray(mirroredHoleGroups, array)
+    const tiledSlotGroups = tileSlotsAcrossArray(mirroredSlotGroups, array)
 
     const partNumber = (panelInfo?.pcbName || 'PCB').replace(/[<>:"/\\|?*\s]+/g, '_')
 
@@ -2810,6 +2858,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         drillFilename: `${partNumber}_MetaPanel_Drill.drl`,
         drillContent,
         gcodeFiles,
+        mirroredX: panelArrayConfig.mirrorX,
       },
     })
   },

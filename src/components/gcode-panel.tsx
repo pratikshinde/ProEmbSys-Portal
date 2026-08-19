@@ -221,6 +221,16 @@ export default function GcodePanel() {
               className="scale-75"
             />
           </div>
+          <div className="flex items-center justify-between mt-2">
+            <Label className="text-xs text-[#94b8d4]" title="Single-sided boards are drilled with copper facing UP — mirrors every hole/slot X to match the physically flipped panel. Drilling only; the cutting/routing program is unaffected.">
+              Mirror drilling (copper-up drilling)
+            </Label>
+            <Switch
+              checked={ctx.mirrorX}
+              onCheckedChange={v => updateGcodeContext({ mirrorX: v })}
+              className="scale-75"
+            />
+          </div>
         </div>
 
         <Separator className="bg-[#1a3a5c]" />
@@ -443,6 +453,21 @@ export default function GcodePanel() {
                   className="scale-75"
                 />
               </div>
+              <div className="mt-2 flex items-center justify-between">
+                <div>
+                  <Label className={fieldLabelCls}>Mirror drilling for copper-up drilling</Label>
+                  <p className="text-[9px] text-[#4a6f94] mt-0.5 max-w-[220px]">
+                    Single-sided boards are drilled with copper facing UP — mirrors every
+                    hole/slot X to match the physically flipped panel. Drilling only; the
+                    routing/cutting program and the corner marks are unaffected.
+                  </p>
+                </div>
+                <Switch
+                  checked={panelArrayConfig.mirrorX}
+                  onCheckedChange={v => updatePanelArrayConfig({ mirrorX: v })}
+                  className="scale-75"
+                />
+              </div>
               <div className="mt-2 grid grid-cols-2 gap-2">
                 <div>
                   <Label className={fieldLabelCls}>Manual columns (blank = auto)</Label>
@@ -603,7 +628,7 @@ export default function GcodePanel() {
 
             {panelArrayResult && (
               <div className="bg-[#061628]/80 rounded-md p-2 text-[10px] font-mono text-[#94b8d4] space-y-0.5">
-                <div>Layout: {panelArrayResult.cols} × {panelArrayResult.rows} = {panelArrayResult.totalPanels} panels{panelArrayConfig.rotatePanel90 ? ' (rotated 90°)' : ''}</div>
+                <div>Layout: {panelArrayResult.cols} × {panelArrayResult.rows} = {panelArrayResult.totalPanels} panels{panelArrayConfig.rotatePanel90 ? ' (rotated 90°)' : ''}{panelArrayConfig.mirrorX ? ' (mirrored)' : ''}</div>
                 <div>Cell footprint: {panelArrayResult.cellWidthMm.toFixed(1)} × {panelArrayResult.cellHeightMm.toFixed(1)}mm</div>
                 <div>Sheet size: {panelArrayResult.sheetWidthMm.toFixed(1)} × {panelArrayResult.sheetHeightMm.toFixed(1)}mm</div>
                 <div>Mark arm (effective): {panelArrayResult.effectiveMarkArmLengthMm.toFixed(2)}mm</div>
@@ -630,6 +655,9 @@ export default function GcodePanel() {
                   <Label className={sectionLabelCls}>
                     <CheckCircle2 className="w-3 h-3 text-[#0ea5e9]" />
                     Files
+                    {panelArrayFiles.mirroredX && (
+                      <span className="text-[9px] font-normal text-yellow-400">(drilling mirrored — copper-up)</span>
+                    )}
                   </Label>
                   <div className="mt-2 bg-[#061628]/80 rounded-md p-2 space-y-1 max-h-40 overflow-y-auto">
                     <div className="flex items-center gap-1.5 text-[10px] font-mono text-[#94b8d4]">

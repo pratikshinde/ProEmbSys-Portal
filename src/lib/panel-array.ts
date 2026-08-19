@@ -115,6 +115,21 @@ export interface PanelArrayConfig {
    */
   materialCellWidthMm: number | null
   materialCellHeightMm: number | null
+  /**
+   * Mirror every hole/slot in X before tiling — for a single-sided PCB that
+   * must be drilled with copper facing UP on the CNC (the panel is
+   * physically flipped over first, so every hole's X position mirrors
+   * within its own panel). Drilling-only: the border marks (which the
+   * operator registers the panel's physical corners against) are unchanged
+   * either way, since a rectangle's 4-corner L-mark set maps onto itself
+   * under reflection — see `computePanelArray`'s own docs for why neither
+   * this flag nor `rotatePanel90` needs any change there. Deliberately
+   * doesn't touch the cutting/routing program, which is a separate setup
+   * step; the UI label makes this explicit. Off by default — flipping the
+   * drill program without the operator's explicit intent is a real scrap
+   * risk.
+   */
+  mirrorX: boolean
 }
 
 export const DEFAULT_PANEL_ARRAY_CONFIG: PanelArrayConfig = {
@@ -134,6 +149,7 @@ export const DEFAULT_PANEL_ARRAY_CONFIG: PanelArrayConfig = {
   manualRows: null,
   materialCellWidthMm: null,
   materialCellHeightMm: null,
+  mirrorX: false,
 }
 
 export interface PanelArrayCell {
@@ -388,6 +404,42 @@ export function rotateSlotGroupsForArray(
     slots: g.slots.map(s => ({
       start: rotatePoint90(s.start, origHeightMm),
       end: rotatePoint90(s.end, origHeightMm),
+    })),
+  }))
+}
+
+/**
+ * Mirrors a point's X within a panel of the given (already rotation-
+ * adjusted, if applicable) width — `PanelArrayConfig.mirrorX`'s per-point
+ * primitive, same convention as `rotatePoint90`: takes the panel's own
+ * effective width so it's well-defined per-point without the caller
+ * threading anything else through.
+ */
+function mirrorPointX(p: Pt, effWidthMm: number): Pt {
+  return { x: effWidthMm - p.x, y: p.y }
+}
+
+/** `mirrorPointX` applied to every hole in every diameter group. */
+export function mirrorHoleGroupsForArray(
+  groups: { diameterMm: number; holes: Pt[] }[],
+  effWidthMm: number
+): { diameterMm: number; holes: Pt[] }[] {
+  return groups.map(g => ({
+    diameterMm: g.diameterMm,
+    holes: g.holes.map(h => mirrorPointX(h, effWidthMm)),
+  }))
+}
+
+/** `mirrorPointX` applied to both endpoints of every slot in every diameter group. */
+export function mirrorSlotGroupsForArray(
+  groups: { diameterMm: number; slots: { start: Pt; end: Pt }[] }[],
+  effWidthMm: number
+): { diameterMm: number; slots: { start: Pt; end: Pt }[] }[] {
+  return groups.map(g => ({
+    diameterMm: g.diameterMm,
+    slots: g.slots.map(s => ({
+      start: mirrorPointX(s.start, effWidthMm),
+      end: mirrorPointX(s.end, effWidthMm),
     })),
   }))
 }

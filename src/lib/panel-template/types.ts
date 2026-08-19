@@ -191,6 +191,7 @@ const gcodeSectionSchema = z.object({
   drillFeedMmPerMin: z.number().positive(),
   autoFeedByDiameter: z.boolean(),
   optimizeDrillOrder: z.boolean(),
+  mirrorX: z.boolean(),
 }).partial()
 
 const arraySectionSchema = z.object({
@@ -210,6 +211,7 @@ const arraySectionSchema = z.object({
   manualRows: z.number().int().positive().nullable(),
   materialCellWidthMm: z.number().positive().nullable(),
   materialCellHeightMm: z.number().positive().nullable(),
+  mirrorX: z.boolean(),
 }).partial()
 
 export const panelTemplateSettingsSchema = z.object({

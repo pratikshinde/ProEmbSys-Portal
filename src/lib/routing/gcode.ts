@@ -77,6 +77,19 @@ export interface GcodeContext {
    * travel itself.
    */
   optimizeDrillOrder: boolean
+  /**
+   * Mirror every drilled hole/slot's X within the panel before generating
+   * the drilling programs — for a single-sided PCB that must be drilled
+   * with copper facing UP on the CNC (the panel is physically flipped over
+   * first). Drilling-only, same as the meta-panel array's own `mirrorX`
+   * (`PanelArrayConfig`) — the cutting/routing program (`generateRouteGcode`)
+   * is a separate setup step and is deliberately left untouched. Consumed
+   * entirely in the store's `generateGcodeFilesAction`, which mirrors the
+   * collected hole/slot groups before they ever reach `buildGcodeFiles` —
+   * this field exists here only so the setting persists alongside the rest
+   * of `GcodeContext` (panel templates, CAM job snapshots). Off by default.
+   */
+  mirrorX: boolean
 }
 
 /**
@@ -147,6 +160,7 @@ export const DEFAULT_GCODE_CONTEXT: GcodeContext = {
   drillFeedMmPerMin: 1200,
   autoFeedByDiameter: true,
   optimizeDrillOrder: true,
+  mirrorX: false,
 }
 
 function fmtCoord(v: number): string {

@@ -405,6 +405,7 @@ export async function exportMetaPanelFiles(
     drillFilename: string
     drillContent: string
     gcodeFiles: GcodeFile[]
+    mirroredX?: boolean
   },
   info?: PanelInfo
 ): Promise<void> {
@@ -436,6 +437,12 @@ export async function exportMetaPanelFiles(
   lines.push('step through the normal Routing tab — this batch only covers alignment')
   lines.push('marks and drilling.')
   lines.push('')
+  if (files.mirroredX) {
+    lines.push('*** DRILLING IS MIRRORED (copper-up) ***')
+    lines.push('The border marks below are identical either way — they alone do not tell')
+    lines.push('you this file is mirrored. Drill with the panel copper-side UP.')
+    lines.push('')
+  }
   lines.push('--- Files ---')
   lines.push(files.borderMarksGerberFilename)
   lines.push(files.drillFilename)
