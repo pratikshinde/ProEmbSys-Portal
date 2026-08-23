@@ -1546,7 +1546,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       // the fallback-to-all-files pass only runs when NOTHING in the archive
       // matches this list at all — it never fires when some files match and
       // others don't, so a partial drop like this produces zero warning.
-      const gerberExtensions = /\.(gerber|gtl|gbl|gts|gbs|gto|gbo|gko|gtp|gbp|drl|txt|text|gbr|gt1|gt2|gt3|gt4|gt5|gt6|gb1|gb2|gb3|gb4|gb5|gb6|gm1|gm2|gm3|top|bot|sold|smt|smc|smb|sst|ssb|pts|pli|pho|asc|cmp|sol|bslk|scmp|tslk|drill|drd|cnc|xln|tap|nc|exc|rou|board|outline|silk|mask|paste|fab|mech|dim|drawing|plumbing)$/i
+      // ssm/csm/tsm (EAGLE CAM Processor's Solder/Component Side Mask family
+      // — distinct from smb/smt above) were the same gap for a different
+      // real customer zip (2270.zip, EAGLE 7.6.0 export): its .ssm bottom
+      // mask silently dropped, so the board rendered with copper painting
+      // flat and no soldermask tint or gold-pad reveal at all.
+      const gerberExtensions = /\.(gerber|gtl|gbl|gts|gbs|gto|gbo|gko|gtp|gbp|drl|txt|text|gbr|gt1|gt2|gt3|gt4|gt5|gt6|gb1|gb2|gb3|gb4|gb5|gb6|gm1|gm2|gm3|top|bot|sold|smt|smc|smb|sst|ssb|ssm|csm|tsm|pts|pli|pho|asc|cmp|sol|bslk|scmp|tslk|drill|drd|cnc|xln|tap|nc|exc|rou|board|outline|silk|mask|paste|fab|mech|dim|drawing|plumbing)$/i
 
       // Get all entries, filter to files (not directories) with matching extensions
       const entries: { path: string; file: JSZip.JSZipObject }[] = []
@@ -1781,7 +1786,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       // the fallback-to-all-files pass only runs when NOTHING in the archive
       // matches this list at all — it never fires when some files match and
       // others don't, so a partial drop like this produces zero warning.
-      const gerberExtensions = /\.(gerber|gtl|gbl|gts|gbs|gto|gbo|gko|gtp|gbp|drl|txt|text|gbr|gt1|gt2|gt3|gt4|gt5|gt6|gb1|gb2|gb3|gb4|gb5|gb6|gm1|gm2|gm3|top|bot|sold|smt|smc|smb|sst|ssb|pts|pli|pho|asc|cmp|sol|bslk|scmp|tslk|drill|drd|cnc|xln|tap|nc|exc|rou|board|outline|silk|mask|paste|fab|mech|dim|drawing|plumbing)$/i
+      // ssm/csm/tsm (EAGLE CAM Processor's Solder/Component Side Mask family
+      // — distinct from smb/smt above) were the same gap for a different
+      // real customer zip (2270.zip, EAGLE 7.6.0 export): its .ssm bottom
+      // mask silently dropped, so the board rendered with copper painting
+      // flat and no soldermask tint or gold-pad reveal at all.
+      const gerberExtensions = /\.(gerber|gtl|gbl|gts|gbs|gto|gbo|gko|gtp|gbp|drl|txt|text|gbr|gt1|gt2|gt3|gt4|gt5|gt6|gb1|gb2|gb3|gb4|gb5|gb6|gm1|gm2|gm3|top|bot|sold|smt|smc|smb|sst|ssb|ssm|csm|tsm|pts|pli|pho|asc|cmp|sol|bslk|scmp|tslk|drill|drd|cnc|xln|tap|nc|exc|rou|board|outline|silk|mask|paste|fab|mech|dim|drawing|plumbing)$/i
       const excludeExtensions = /\.(pdf|doc|docx|xls|xlsx|png|jpg|jpeg|gif|bmp|svg|html|htm|csv|md|rtf|odt|zip|rar|7z|tar|gz)$/i
 
       // Filter entries by extension

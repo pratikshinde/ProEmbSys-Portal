@@ -34,6 +34,19 @@ export function detectLayerType(fileName: string): LayerType {
   if (upper.endsWith('.SOL') || upper.endsWith('.SSOL')) return 'copper'
   if (upper.endsWith('.BSLK') || upper.endsWith('.GTS') || upper.endsWith('.STS')) return 'mask'
   if (upper.endsWith('.TSLK') || upper.endsWith('.GBS') || upper.endsWith('.SBS')) return 'mask'
+  // EAGLE CAM Processor's own "Sxx"/"Cxx" (Solder side / Component side)
+  // extension family — .sol/.cmp are already handled above as the copper
+  // pair; .ssm/.csm|.tsm are that same fab's mask counterparts. Confirmed on
+  // a real EAGLE 7.6.0 export (2270.ssm) that fell through every check to
+  // 'other' with no TF.FileFunction attribute to fall back on (EAGLE's CAM
+  // Processor emits none) — the Board view then has no mask layer to pair
+  // with copper at all, so copper paints flat with no soldermask tint or
+  // gold-pad reveal, reading as "solder mask not rendered" rather than as a
+  // missing/misclassified layer. .csm/.tsm (top) are added defensively,
+  // symmetric with this same naming family, though not directly evidenced
+  // by that single-sided file (no top layers were present to confirm).
+  if (upper.endsWith('.SSM')) return 'mask'
+  if (upper.endsWith('.CSM') || upper.endsWith('.TSM')) return 'mask'
   if (upper.endsWith('.TSK') || upper.endsWith('.BSK')) return 'silk'
 
   // PADS-style naming (.pho files)
@@ -97,8 +110,10 @@ export function detectLayerSide(fileName: string, type: LayerType): LayerSide {
   if (baseName === 'BO' || nameNoExt === 'BO') return 'bottom'
 
   // .cmp = component/top, .sol = solder/bottom, .tslk = top mask, .bslk = bottom mask
-  if (upper.endsWith('.CMP') || upper.endsWith('.SCMP') || upper.endsWith('.TSLK') || upper.endsWith('.TSK')) return 'top'
-  if (upper.endsWith('.SOL') || upper.endsWith('.SSOL') || upper.endsWith('.BSLK') || upper.endsWith('.BSK')) return 'bottom'
+  // .ssm/.csm/.tsm = EAGLE's Solder/Component Side Mask family — see the
+  // matching comment in detectLayerType for why this needed adding.
+  if (upper.endsWith('.CMP') || upper.endsWith('.SCMP') || upper.endsWith('.TSLK') || upper.endsWith('.TSK') || upper.endsWith('.CSM') || upper.endsWith('.TSM')) return 'top'
+  if (upper.endsWith('.SOL') || upper.endsWith('.SSOL') || upper.endsWith('.BSLK') || upper.endsWith('.BSK') || upper.endsWith('.SSM')) return 'bottom'
 
   // PADS-style naming
   if (baseName.includes('TOP')) return 'top'
