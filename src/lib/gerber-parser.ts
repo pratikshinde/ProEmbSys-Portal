@@ -1444,6 +1444,42 @@ export function convertLayerUnits(layer: GerberLayer, targetUnit: GerberUnit): v
     if (ap.width !== undefined) ap.width *= factor;
     if (ap.height !== undefined) ap.height *= factor;
     if (ap.holeDiameter !== undefined) ap.holeDiameter *= factor;
+
+    // Macro aperture modifiers ($1, $2, ...) are NOT covered by width/height/
+    // holeDiameter above — those stay undefined for a macro shape, so a
+    // macro's real size lives entirely in `parameters`. Confirmed as a real,
+    // shipped bug on a real EAGLE export: its octagon pad macro (`OC8`,
+    // `5,1,8,0,0,1.08239x$1,22.5*`) declares `%ADD17OC8,0.052000*%` under
+    // `%MOIN*%` (inches) — $1=0.052in is the pad's true width. Import
+    // converts the file to mm for our internal mm-only pipeline but left $1
+    // untouched, so the exported panel re-declared `%MOMM*%` while $1 was
+    // still 0.052 — now read as 0.052mm, a pad 25.4x too small to see. The
+    // original upload (rendered straight from its own pristine raw content,
+    // never through this conversion) and our canvas (same) looked correct;
+    // only the exported Gerber, serialized from this converted layer, broke.
+    if (ap.shape === 'macro' && ap.parameters) {
+      if (/RoundRect/i.test(ap.macroName ?? '')) {
+        // $1 (corner radius) and $2..$9 (4 corner x,y pairs) are lengths and
+        // must scale; a trailing $10 some KiCad versions emit is a rotation
+        // angle (unit-independent) and must NOT scale — same enumeration
+        // rotateGerberLayer/mirrorGerberLayerX already use for this macro.
+        for (const key of ['$1', '$2', '$3', '$4', '$5', '$6', '$7', '$8', '$9']) {
+          if (ap.parameters[key] !== undefined) ap.parameters[key] *= factor;
+        }
+      } else {
+        // An arbitrary macro's modifier layout isn't known without parsing
+        // its %AM body (the same documented gap the rotate/mirror code has),
+        // but every real one seen so far (EAGLE's OC8 above; single- or
+        // multi-modifier size macros generally) uses its modifiers purely as
+        // length dimensions, never as a bare angle/count. Scaling all of
+        // them is the correct fix for the confirmed bug above and the safer
+        // default versus leaving them unconverted, which is guaranteed wrong
+        // for this shape family.
+        for (const key of Object.keys(ap.parameters)) {
+          ap.parameters[key] *= factor;
+        }
+      }
+    }
   }
 
   // Drill slots (Excellon G85) live outside `commands` — see `DrillSlot`'s
