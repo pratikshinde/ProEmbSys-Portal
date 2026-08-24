@@ -405,9 +405,40 @@ function extractMacroDefinitions(rawContent: string): string[] {
   const regex = /%AM[A-Za-z0-9_-]+\*[^%]*\*\s*%/g
   let match
   while ((match = regex.exec(rawContent)) !== null) {
-    macros.push(match[0])
+    macros.push(normalizeMacroArithmeticOperators(match[0]))
   }
   return macros
+}
+
+/**
+ * Lowercases the multiply operator in a macro primitive body — EAGLE (7.x
+ * confirmed, likely earlier too) emits uppercase `X` for macro arithmetic
+ * (`5,1,8,0,0,1.08239X$1,22.5*`, an octagon-pad macro's parametric diameter
+ * expression), but the Gerber Format Specification requires lowercase `x`
+ * and explicitly warns against uppercase X because it's easily confused
+ * with coordinate data. Lenient parsers (tracespace, this codebase's own —
+ * confirmed live: the pad renders fine in this tool's own preview) accept
+ * either case, but a stricter downstream Gerber parser rejects the
+ * malformed expression and drops the primitive entirely — reported live as
+ * "octagonal pads visible in canvas, missing from the exported file" on a
+ * real EAGLE export, since this codebase copies macro bodies through
+ * verbatim (`extractMacroDefinitions`) rather than re-deriving them.
+ *
+ * Scoped to the body ONLY (everything after the `%AM<name>*` declaration,
+ * up to the closing bare `%`) — never the macro's own NAME, which could in
+ * principle contain a literal capital X with no arithmetic meaning. Safe to
+ * blanket-replace within the body: macro primitive parameters are always
+ * comma-separated (never `X`-separated, unlike `%ADD` aperture bodies,
+ * where X *is* legitimately the width/height separator — a different
+ * grammar this function never touches), so every `X` inside a primitive
+ * body is unambiguously the multiply operator.
+ */
+function normalizeMacroArithmeticOperators(macroBlock: string): string {
+  const firstStar = macroBlock.indexOf('*')
+  if (firstStar === -1) return macroBlock
+  const declaration = macroBlock.slice(0, firstStar + 1)
+  const body = macroBlock.slice(firstStar + 1)
+  return declaration + body.replace(/X/g, 'x')
 }
 
 /**
