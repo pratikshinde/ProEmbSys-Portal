@@ -4,7 +4,7 @@
 
 import { create } from 'zustand'
 import JSZip from 'jszip'
-import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode, DrillMeta, expandBoundsForSlots } from './gerber-parser'
+import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode, DrillMeta, expandBoundsForSlots, actionableParseWarnings } from './gerber-parser'
 import { gerberToSvg, gerberRenderBoardView, checkCopperSpacing, extractStencilApertures, BoardView, GerberSvgResult } from './gerber-svg'
 import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
 import { runDfm } from './dfm/run-dfm'
@@ -170,6 +170,13 @@ export interface ZipImportResult {
   imported: number
   skipped: number
   errors: string[]
+  /** Non-fatal parser warnings from successfully-imported files (an
+   *  undefined aperture selected, an unclosed region, un-expanded step-and-
+   *  repeat, ...) — the "new construct from unfamiliar CAD software" signal
+   *  that would have flagged the octagon-macro unit-conversion bug at import
+   *  time instead of only surfacing later as a missing pad on export. One
+   *  string per warning, prefixed with the source file name. */
+  warnings: string[]
 }
 
 /** Per-layer metadata saved alongside a CamJob — everything about a
@@ -230,10 +237,12 @@ export interface CamJobSnapshot {
 interface AppState {
   // Layers
   layers: LayerEntry[]
-  addLayer: (file: File) => Promise<void>
+  /** Resolves with any non-fatal parser warnings (see actionableParseWarnings)
+   *  from the imported file — empty for the overwhelming majority of files. */
+  addLayer: (file: File) => Promise<{ warnings: string[] }>
   /** Like addLayer, but joins an explicit design instead of the active one —
    *  needed by loadCamJobSnapshot to restore a multi-design job faithfully. */
-  addLayerToDesign: (file: File, designId: string) => Promise<void>
+  addLayerToDesign: (file: File, designId: string) => Promise<{ warnings: string[] }>
   addLayersFromZip: (zipFile: File) => Promise<ZipImportResult>
   addLayersFromRar: (rarFile: File) => Promise<ZipImportResult>
   alignDrillLayersToBoard: () => Promise<void>
@@ -991,7 +1000,7 @@ function buildPackedPanelResult(
  * the normal upload path). No other behavior change from the original
  * inline `addLayer` body.
  */
-async function importLayerFile(get: () => AppState, set: (fn: (s: AppState) => Partial<AppState>) => void, file: File, designId: string): Promise<void> {
+async function importLayerFile(get: () => AppState, set: (fn: (s: AppState) => Partial<AppState>) => void, file: File, designId: string): Promise<{ warnings: string[] }> {
   const content = await file.text()
   const fileName = file.name
   try {
@@ -1106,6 +1115,7 @@ async function importLayerFile(get: () => AppState, set: (fn: (s: AppState) => P
     void get().rebuildBoardView()
     // NOTE: Panel computation is now only triggered when user clicks "Panel Config" button
     // Not automatically when layers are added
+    return { warnings: actionableParseWarnings(finalParsed) }
   } catch (e) {
     console.error('Failed to parse Gerber file:', e)
     throw e
@@ -1221,7 +1231,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   addLayer: async (file: File) => {
-    await importLayerFile(get, set, file, ensureActiveDesignId(get, set))
+    return importLayerFile(get, set, file, ensureActiveDesignId(get, set))
   },
 
   // Explicit target design — the one thing addLayer's own internal
@@ -1230,7 +1240,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   // reconstructed file must land back on the design it was saved from
   // rather than joining whatever the active design happens to be.
   addLayerToDesign: async (file: File, designId: string) => {
-    await importLayerFile(get, set, file, designId)
+    return importLayerFile(get, set, file, designId)
   },
 
   removeLayer: (id: string) => {
@@ -1528,7 +1538,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   addLayersFromZip: async (zipFile: File): Promise<ZipImportResult> => {
-    const result: ZipImportResult = { total: 0, imported: 0, skipped: 0, errors: [] }
+    const result: ZipImportResult = { total: 0, imported: 0, skipped: 0, errors: [], warnings: [] }
 
     try {
       const buffer = await zipFile.arrayBuffer()
@@ -1665,6 +1675,11 @@ export const useAppStore = create<AppState>((set, get) => ({
             variantRotationDeg: 0,
           }
 
+          const fileWarnings = actionableParseWarnings(parsedLayer)
+          if (fileWarnings.length > 0) {
+            result.warnings.push(`${fileName}: ${fileWarnings.join('; ')}`)
+          }
+
           newLayers.push(layerEntry)
           result.imported++
         } catch (err) {
@@ -1756,7 +1771,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   addLayersFromRar: async (rarFile: File): Promise<ZipImportResult> => {
-    const result: ZipImportResult = { total: 0, imported: 0, skipped: 0, errors: [] }
+    const result: ZipImportResult = { total: 0, imported: 0, skipped: 0, errors: [], warnings: [] }
 
     try {
       const { createExtractorFromData } = await import('node-unrar-js')
@@ -1890,6 +1905,11 @@ export const useAppStore = create<AppState>((set, get) => ({
             side,
             designId,
             variantRotationDeg: 0,
+          }
+
+          const fileWarnings = actionableParseWarnings(parsedLayer)
+          if (fileWarnings.length > 0) {
+            result.warnings.push(`${fileName}: ${fileWarnings.join('; ')}`)
           }
 
           newLayers.push(layerEntry)

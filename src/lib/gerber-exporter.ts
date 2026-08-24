@@ -132,7 +132,13 @@ export async function exportPanelizedGerbers(
    *  caller is unaffected. Written into their own `Meta-Panelization/`
    *  subfolder rather than mixed in with the single panel's own layers. */
   metaPanel?: { borderMarksGerberFilename: string; borderMarksGerber: string; drillFilename: string; drillContent: string } | null
-): Promise<void> {
+): Promise<{ dcodeWarnings: string[] }> {
+  // Aperture/D-code export warnings (undefined macro references, zero-size
+  // apertures — see collectApertureExportWarnings) collected across every
+  // merged output file, so the caller can surface "did any pad silently fail
+  // to export" without the user having to dig through the console. Empty for
+  // the overwhelming majority of real exports.
+  const dcodeWarnings: string[] = []
   // Clone: the auto-upgrade below writes fmt.integerDigits, and callers pass
   // the store's outputFormat object straight in — mutating it would compound
   // across exports.
@@ -319,7 +325,9 @@ export async function exportPanelizedGerbers(
     }
 
     try {
-      const panelized = generateMergedPanelizedGerber(contributors, panel, config, fmt, group.layerType, group.layerSide)
+      const groupWarnings: string[] = []
+      const panelized = generateMergedPanelizedGerber(contributors, panel, config, fmt, group.layerType, group.layerSide, groupWarnings)
+      for (const w of groupWarnings) dcodeWarnings.push(`${group.descriptiveName}: ${w}`)
       const outName = `${partNumber}_${group.descriptiveName}.gerber`
       folder.file(outName, panelized)
     } catch (e) {
@@ -334,6 +342,8 @@ export async function exportPanelizedGerbers(
   // Generate and download ZIP
   const blob = await zip.generateAsync({ type: 'blob' })
   saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_Panel.zip`)
+
+  return { dcodeWarnings }
 }
 
 /**

@@ -219,7 +219,25 @@ export default function ExportPanel() {
             drillContent: panelArrayFiles.drillContent,
           }
         : null
-      await exportPanelizedGerbers(layerFiles, panelResult, panelConfig, panelInfo, outputFormat, routingResult, metaPanel)
+      const { dcodeWarnings } = await exportPanelizedGerbers(layerFiles, panelResult, panelConfig, panelInfo, outputFormat, routingResult, metaPanel)
+
+      // Surface aperture/D-code export problems (undefined macro references,
+      // zero-size apertures) directly — these are exactly the class of bug
+      // that shipped invisible pads in a real customer export (see the
+      // octagon-macro unit-conversion fix) before anyone noticed in a
+      // third-party viewer. mirrorWarnings share the same toast when both
+      // fire, since TOAST_LIMIT=1 would otherwise silently drop one.
+      const allWarnings = [...mirrorWarnings, ...dcodeWarnings]
+      if (allWarnings.length > 0) {
+        console.warn('[Export] D-code/aperture warnings:', dcodeWarnings)
+        toast({
+          title: `Exported with ${allWarnings.length} warning${allWarnings.length !== 1 ? 's' : ''}`,
+          description: allWarnings.slice(0, 3).join(' · ') + (allWarnings.length > 3 ? ` · +${allWarnings.length - 3} more — see console` : ''),
+          variant: 'destructive',
+        })
+      } else {
+        toast({ title: 'Export complete', description: 'Panel exported — no aperture/D-code issues detected.' })
+      }
     } catch (err) {
       console.error('Export failed:', err)
       alert('Export failed. Check console for details.')

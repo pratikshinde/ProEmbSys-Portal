@@ -538,6 +538,50 @@ function generateApertureDefinitions(apertures: Map<number, GerberAperture>): st
   return adds
 }
 
+/**
+ * Cross-checks apertures about to be exported against the macro blocks that
+ * will actually be emitted alongside them, and flags any aperture with no
+ * discernible size. Catches the two real failure classes this codebase has
+ * hit in production: a macro aperture referencing an %AM block that never
+ * made it into the output (confirmed on a real CAM350/DFMSTREAM re-export —
+ * see the parser's own macro-name regex comment), and an aperture whose size
+ * field is undefined, which `generateApertureDefinitions` silently emits as
+ * `0.000000` (an invisible pad) rather than erroring — the same *shape* of
+ * bug as the octagon-macro unit-conversion fix (D-code renders, but at the
+ * wrong/zero size), just a different root cause. Deliberately does NOT flag
+ * a macro aperture with zero modifiers — CAM350/DFMSTREAM legitimately emits
+ * exactly that (`%ADD12RoundRect-D12*%`, no comma) for a macro whose
+ * geometry is fully baked into its own %AM block; see the sibling comment in
+ * generateApertureDefinitions.
+ */
+function collectApertureExportWarnings(
+  apertures: Map<number, GerberAperture>,
+  macroNames: Set<string>,
+  contextLabel: string,
+  warnings: string[]
+): void {
+  for (const [code, ap] of apertures.entries()) {
+    if (ap.shape === 'macro') {
+      if (!ap.macroName) {
+        warnings.push(`${contextLabel}: D${code} is a macro aperture with no macro name — will export as an empty shape.`)
+      } else if (!macroNames.has(ap.macroName)) {
+        warnings.push(`${contextLabel}: D${code} references macro "${ap.macroName}", but no matching %AM definition is being exported — this pad will not render.`)
+      }
+    } else if (ap.width === undefined) {
+      warnings.push(`${contextLabel}: D${code} (${ap.shape}) has no width/diameter — will export as a 0mm (invisible) aperture.`)
+    }
+  }
+}
+
+/** Parses the macro name out of one `%AM<name>*...*%` block, matching the
+ *  same name-charset (letters/digits/underscore/hyphen) used everywhere else
+ *  a macro name is extracted from raw text — see the parser's own regex
+ *  comment for why hyphens matter (CAM350/DFMSTREAM per-pad macro names). */
+function macroBlockName(macroBlock: string): string | null {
+  const m = macroBlock.match(/^%AM([A-Za-z0-9_-]+)\*/)
+  return m ? m[1] : null
+}
+
 // ============================================================================
 // Panel Configuration Types
 // ============================================================================
@@ -2865,7 +2909,12 @@ export function generatePanelizedGerber(
    *  not every design's. Defaults to `panel.placements` (all of them), which
    *  is every existing call site's behavior — this parameter is purely
    *  additive. */
-  placementsOverride?: PanelPlacement[]
+  placementsOverride?: PanelPlacement[],
+  /** Optional collector for aperture/D-code export warnings (undefined macro
+   *  references, zero-size apertures — see `collectApertureExportWarnings`).
+   *  Purely additive: every existing call site that omits this gets no
+   *  warnings collected, same output as before. */
+  warnings?: string[]
 ): string {
   const fmt: OutputFormat = outputFormat || DEFAULT_OUTPUT_FORMAT
   const lines: string[] = []
@@ -2907,6 +2956,14 @@ export function generatePanelizedGerber(
   const addCmds = generateApertureDefinitions(parsedLayer.apertures)
   for (const add of addCmds) {
     lines.push(add)
+  }
+
+  if (warnings) {
+    const macroNames = new Set(macros.map(macroBlockName).filter((n): n is string => n !== null))
+    const contextLabel = layerType
+      ? `${layerType}${layerSide && layerSide !== 'none' ? ` (${layerSide})` : ''}`
+      : 'layer'
+    collectApertureExportWarnings(parsedLayer.apertures, macroNames, contextLabel, warnings)
   }
 
   // ---- 4. G-code initialization ----
@@ -3175,7 +3232,10 @@ export function generateMergedPanelizedGerber(
   panelConfig: PanelConfig,
   outputFormat?: OutputFormat,
   layerType?: string,
-  layerSide?: 'top' | 'bottom' | 'none'
+  layerSide?: 'top' | 'bottom' | 'none',
+  /** Optional collector for aperture/D-code export warnings — see
+   *  `generatePanelizedGerber`'s own param of the same name. */
+  warnings?: string[]
 ): string {
   if (contributors.length === 0) return ''
 
@@ -3183,9 +3243,13 @@ export function generateMergedPanelizedGerber(
     const c = contributors[0]
     return generatePanelizedGerber(
       c.parsedLayer, c.rawContent, panel, c.effectiveConfig, outputFormat,
-      c.baseOffset, layerType, layerSide, c.placements
+      c.baseOffset, layerType, layerSide, c.placements, warnings
     )
   }
+
+  const contextLabel = layerType
+    ? `${layerType}${layerSide && layerSide !== 'none' ? ` (${layerSide})` : ''}`
+    : 'layer'
 
   const fmt: OutputFormat = outputFormat || DEFAULT_OUTPUT_FORMAT
   const lines: string[] = []
@@ -3226,6 +3290,9 @@ export function generateMergedPanelizedGerber(
         macroLines.push(macro)
       }
       addLines.push(...generateApertureDefinitions(c.parsedLayer.apertures))
+      if (warnings) {
+        collectApertureExportWarnings(c.parsedLayer.apertures, usedMacroNames, `${contextLabel}, contributor 1`, warnings)
+      }
       remapped.push({
         commands: c.parsedLayer.commands,
         baseOffset: c.baseOffset,
@@ -3269,6 +3336,9 @@ export function generateMergedPanelizedGerber(
       remappedApertures.set(newCode, ap2)
     }
     addLines.push(...generateApertureDefinitions(remappedApertures))
+    if (warnings) {
+      collectApertureExportWarnings(remappedApertures, usedMacroNames, `${contextLabel}, contributor ${k + 1}`, warnings)
+    }
 
     const remappedCommands: GerberDrawCommand[] = c.parsedLayer.commands.map(cmd => {
       if (cmd.apertureCode === null) return cmd

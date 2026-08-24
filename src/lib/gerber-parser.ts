@@ -1503,6 +1503,37 @@ export function convertLayerUnits(layer: GerberLayer, targetUnit: GerberUnit): v
   layer.units = targetUnit;
 }
 
+// A parsed layer accumulates a `warnings` entry for every genuinely unusual
+// construct the state-machine parser hits (undefined aperture selected,
+// unknown zero-suppression mode, unclosed region, un-expanded step-and-
+// repeat, etc.) — exactly the "new dcode/construct from unfamiliar CAD
+// software" signal a real customer file surfaces before it becomes a
+// rendering bug (see the D17/D26/D27 octagon-macro unit-conversion fix this
+// mechanism would have flagged early, had it been surfaced). One entry,
+// `Aperture macro "<name>" defined. Macro content stored for reference.`, is
+// pushed on every normal macro-aperture use and isn't actionable — filtering
+// it out keeps this list from being noisy on ordinary KiCad/EAGLE files.
+const NON_ACTIONABLE_WARNING = /^Aperture macro ".*" defined\. Macro content stored for reference\.$/;
+
+/**
+ * Returns a layer's parser warnings with the routine "macro defined" note
+ * filtered out and duplicates collapsed (the same construct can otherwise
+ * repeat once per occurrence, e.g. one "D17 selected but not defined" per
+ * flash). Empty for the overwhelming majority of real files — a non-empty
+ * result is worth surfacing to the user, not just the console.
+ */
+export function actionableParseWarnings(layer: GerberLayer): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const w of layer.warnings ?? []) {
+    if (NON_ACTIONABLE_WARNING.test(w)) continue;
+    if (seen.has(w)) continue;
+    seen.add(w);
+    out.push(w);
+  }
+  return out;
+}
+
 // ============================================================================
 // Excellon Drill Parser
 // ============================================================================

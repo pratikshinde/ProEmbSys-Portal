@@ -239,14 +239,36 @@ export default function LayerPanel() {
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
     if (!files) return
-    for (const file of Array.from(files)) {
-      try {
-        await addLayer(file)
-      } catch (err) {
-        console.error(`Failed to load ${file.name}:`, err)
-      }
+    const result = await importFilesWithResult(Array.from(files))
+    if (result.errors.length > 0 || result.warnings.length > 0) {
+      setImportResult(result)
+      setShowResult(true)
     }
     if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  // Shared by the "Files" button and the plain-file branch of drag-and-drop —
+  // both import one or more loose Gerber/drill files directly (as opposed to
+  // a ZIP/RAR archive), and both want the same "did any file produce a
+  // parser warning" visibility the archive path already has via
+  // addLayersFromZip's own ZipImportResult. Only shown when there's actually
+  // something to say (an error or a warning) — a clean multi-file drop stays
+  // silent, matching this handler's pre-existing no-feedback-on-success
+  // behavior for the common case.
+  const importFilesWithResult = async (files: File[]): Promise<ZipImportResult> => {
+    const result: ZipImportResult = { total: files.length, imported: 0, skipped: 0, errors: [], warnings: [] }
+    for (const file of files) {
+      try {
+        const { warnings } = await addLayer(file)
+        result.imported++
+        if (warnings.length > 0) result.warnings.push(`${file.name}: ${warnings.join('; ')}`)
+      } catch (err) {
+        result.skipped++
+        console.error(`Failed to load ${file.name}:`, err)
+        result.errors.push(`Failed: ${file.name} — ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    return result
   }
 
   const handleArchiveSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -270,6 +292,7 @@ export default function LayerPanel() {
       setImportResult({
         total: 0, imported: 0, skipped: 0,
         errors: [err instanceof Error ? err.message : String(err)],
+        warnings: [],
       })
     } finally {
       setImporting(false)
@@ -291,6 +314,7 @@ export default function LayerPanel() {
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault()
     const files = e.dataTransfer.files
+    const looseGerberFiles: File[] = []
     for (const file of Array.from(files)) {
       const isZip = file.name.toLowerCase().endsWith('.zip')
       const isRar = file.name.toLowerCase().endsWith('.rar')
@@ -298,7 +322,7 @@ export default function LayerPanel() {
         setImporting(true)
         setShowResult(true)
         try {
-          const result = isZip 
+          const result = isZip
             ? await addLayersFromZip(file)
             : await addLayersFromRar(file)
           setImportResult(result)
@@ -307,6 +331,7 @@ export default function LayerPanel() {
           setImportResult({
             total: 0, imported: 0, skipped: 0,
             errors: [err instanceof Error ? err.message : String(err)],
+            warnings: [],
           })
         } finally {
           setImporting(false)
@@ -314,11 +339,14 @@ export default function LayerPanel() {
         continue
       }
       if (file.name.match(/\.(gerber|gtl|gbl|gts|gbs|gto|gbo|gko|gtp|gbp|drl|txt|text|gbr|pho|asc)$/i)) {
-        try {
-          await addLayer(file)
-        } catch (err) {
-          console.error(`Failed to load ${file.name}:`, err)
-        }
+        looseGerberFiles.push(file)
+      }
+    }
+    if (looseGerberFiles.length > 0) {
+      const result = await importFilesWithResult(looseGerberFiles)
+      if (result.errors.length > 0 || result.warnings.length > 0) {
+        setImportResult(result)
+        setShowResult(true)
       }
     }
   }
@@ -424,7 +452,7 @@ export default function LayerPanel() {
           <div className={`rounded-lg border p-3 mb-3 text-xs space-y-2 transition-all duration-300 ${
             importResult.errors.length > 0 && importResult.imported === 0
               ? 'bg-red-950/50 border-red-800/50'
-              : importResult.errors.length > 0
+              : importResult.errors.length > 0 || importResult.warnings.length > 0
                 ? 'bg-yellow-950/50 border-yellow-800/50 border-yellow-900'
                 : 'bg-[#0ea5e9]/10 border-[#0ea5e9]/30'
           }`}>
@@ -434,7 +462,7 @@ export default function LayerPanel() {
                   <Loader2 className="w-3.5 h-3.5 animate-spin text-[#4a6f94]" />
                 ) : importResult.errors.length > 0 && importResult.imported === 0 ? (
                   <XCircle className="w-3.5 h-3.5 text-red-400" />
-                ) : importResult.errors.length > 0 ? (
+                ) : importResult.errors.length > 0 || importResult.warnings.length > 0 ? (
                   <AlertTriangle className="w-3.5 h-3.5 text-yellow-400" />
                 ) : (
                   <CheckCircle2 className="w-3.5 h-3.5 text-[#0ea5e9]" />
@@ -459,9 +487,22 @@ export default function LayerPanel() {
                 ))}
               </div>
             )}
-            {!importing && importResult.imported > 0 && importResult.errors.length === 0 && (
+            {/* Parser warnings — layers that DID import, but where the parser
+                flagged something unusual (an undefined aperture selected, an
+                unclosed region, un-expanded step-and-repeat, ...). This is
+                the "new construct from unfamiliar CAD software" signal —
+                worth a look before exporting, but not a failed import. */}
+            {!importing && importResult.warnings.length > 0 && (
+              <div className="space-y-1 max-h-24 overflow-y-auto border-t border-yellow-900/40 pt-1.5">
+                <div className="text-[10px] text-yellow-400/90 font-medium">Parser warnings — review before exporting:</div>
+                {importResult.warnings.map((w, idx) => (
+                  <div key={idx} className="text-[10px] text-yellow-300/80 font-mono break-all">{w}</div>
+                ))}
+              </div>
+            )}
+            {!importing && importResult.imported > 0 && importResult.errors.length === 0 && importResult.warnings.length === 0 && (
               <div className="text-[10px] text-[#0ea5e9]/70">
-                All Gerber files from the zip archive were parsed successfully.
+                All files were parsed successfully with no warnings.
               </div>
             )}
           </div>
