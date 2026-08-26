@@ -36,6 +36,9 @@ import { generateVScoreGerber } from './vscore/emit-gerber'
 import { generateRoutFile, generateMouseBiteDrill } from './routing/emit-excellon'
 import type { GcodeFile } from './routing/gcode'
 import type { PanelArrayResult } from './panel-array'
+import type { FilmConfig, FilmPolarity } from './film-types'
+import { zipArtifacts, type CamArtifact } from './share/artifacts'
+import { buildFilmManifest, renderFilmReadme, type FilmManifest } from './share/manifest'
 
 export interface LayerFile {
   name: string
@@ -51,40 +54,25 @@ export interface LayerFile {
   designId?: string
 }
 
-/**
- * Sanitize a user-entered PanelInfo field (part number, customer name, etc.)
- * for safe use inside a filename — strips characters invalid on Windows/macOS
- * filesystems and collapses whitespace/repeated separators to a single "_".
- * Exported so the store's own generation-time filename stamping
- * (generateGcodeFilesAction/generateStencilFilesAction/
- * generatePanelArrayFilesAction) uses the exact same rules as export —
- * those three used to reimplement only the first `.replace()` (no trim, no
- * `_+`→`_` collapse, no fallback for a whitespace-only name), so a
- * whitespace-only part number could produce `_` inside the ZIP but `PCB` on
- * the ZIP's own name for the same panel.
- */
-export function sanitizeForFilename(value: string | undefined, fallback: string): string {
-  const cleaned = (value || '').trim().replace(/[<>:"/\\|?*\s]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '')
-  return cleaned || fallback
-}
-
-/**
- * Same as `sanitizeForFilename`, plus replaces dots with "V" (e.g. "1.0" ->
- * "1V0"). A revision string is the one field that routinely contains a raw
- * version number — a dot mid-filename reads to Windows Explorer as another
- * extension boundary, which can misdetect/hide the real `.zip`/`.gerber`
- * extension on some configurations. Only applied to `revision`, not the
- * other sanitized fields (customer/PCB name), which don't carry this risk.
- */
-function sanitizeVersionForFilename(value: string | undefined, fallback: string): string {
-  return sanitizeForFilename(value, fallback).replace(/\./g, 'V')
-}
+// Moved to sanitize-filename.ts so src/lib/share/manifest.ts (which builds
+// filenames for the film/drill/test bundles) can use the exact same rules
+// without an import cycle back through this file. Re-exported here so every
+// existing import site (store.ts, and this file's own internal use below)
+// is unaffected — store.ts's own doc comment on why filename rules must
+// match across generateGcodeFilesAction/generateStencilFilesAction/
+// generatePanelArrayFilesAction still applies unchanged.
+export { sanitizeForFilename, sanitizeVersionForFilename } from './sanitize-filename'
+import { sanitizeForFilename, sanitizeVersionForFilename } from './sanitize-filename'
 
 /**
  * Generate a descriptive layer name based on type and side.
  * This ensures exported Gerber files have readable names instead of standard abbreviations.
+ *
+ * Exported so the film-export UI (film-export-card.tsx) can build its
+ * per-layer row list using the exact same names this file will use for the
+ * actual output — a locally-reimplemented naming scheme would drift.
  */
-function generateDescriptiveLayerName(layerFile: LayerFile): string {
+export function generateDescriptiveLayerName(layerFile: LayerFile): string {
   const { type, side, name } = layerFile
 
   if (type === 'copper') {
@@ -115,10 +103,50 @@ function generateDescriptiveLayerName(layerFile: LayerFile): string {
   return name
 }
 
+/** One layer's already-panelized Gerber text, ready for film rendering. */
+export interface FilmRenderRequest {
+  descriptiveName: string
+  content: string
+  polarity: FilmPolarity
+}
+
+export interface FilmRenderedFile {
+  descriptiveName: string
+  bytes: Uint8Array | null
+  warnings: string[]
+}
+
+/**
+ * Renders a batch of film PDFs. Deliberately an injected callback rather
+ * than an import of the worker module: this file is a pure lib (no
+ * worker/DOM dependency anywhere else in it — a client component supplies
+ * this, typically `renderFilmPdfs` from gerber-svg.ts, whose real signature
+ * structurally matches this exactly so no adapter wrapper is needed at the
+ * call site.
+ */
+export interface FilmRenderer {
+  (input: {
+    layers: FilmRenderRequest[]
+    panelWidthMm: number
+    panelHeightMm: number
+    marginMm: number
+  }): Promise<{ files: FilmRenderedFile[] }>
+}
+
 /**
  * Export all panelized Gerber files as a ZIP download.
  */
-export async function exportPanelizedGerbers(
+/**
+ * Builds the full role-tagged artifact list for a panel — every Gerber,
+ * drill, route, film, and README file this panel can produce — WITHOUT
+ * zipping or downloading anything. This is the actual generation logic;
+ * exportPanelizedGerbers below is a thin wrapper that zips+saves its output
+ * for the "download the whole panel" flow, and the sharing feature
+ * (POST-side of the CAM job library) calls this directly so a film/drill/
+ * test bundle is built from the exact same generation pass instead of a
+ * second, potentially-drifting implementation.
+ */
+export async function buildPanelArtifacts(
   layers: LayerFile[],
   panel: PanelResult,
   config: PanelConfig,
@@ -131,14 +159,40 @@ export async function exportPanelizedGerbers(
    *  tab's array section has generated them. Optional so every existing
    *  caller is unaffected. Written into their own `Meta-Panelization/`
    *  subfolder rather than mixed in with the single panel's own layers. */
-  metaPanel?: { borderMarksGerberFilename: string; borderMarksGerber: string; drillFilename: string; drillContent: string } | null
-): Promise<{ dcodeWarnings: string[] }> {
+  metaPanel?: { borderMarksGerberFilename: string; borderMarksGerber: string; drillFilename: string; drillContent: string } | null,
+  /** Photo-plot film (PDF) generation, when the Info & Export tab's Film
+   *  Plot card has at least one included+polarity-set layer. Optional so
+   *  every existing caller is unaffected. Rides in its own `Film/`
+   *  subfolder, same idiom as `metaPanel`'s `Meta-Panelization/`. */
+  film?: { config: FilmConfig; render: FilmRenderer } | null
+): Promise<{
+  artifacts: CamArtifact[]
+  dcodeWarnings: string[]
+  filmWarnings: string[]
+  partNumber: string
+  customerName: string
+  version: string
+  dateStr: string
+  /** The structured FilmManifest, when film generation actually ran — the
+   *  same object whose renderFilmReadme() text became Film/README.txt in
+   *  `artifacts`. Only the sharing feature needs the structured form (to
+   *  store on ShareBundle.manifest and re-render the email body from);
+   *  exportPanelizedGerbers's wrapper ignores it, so this is purely
+   *  additive. Null when no film config was passed or nothing rendered. */
+  filmManifest: FilmManifest | null
+}> {
   // Aperture/D-code export warnings (undefined macro references, zero-size
   // apertures — see collectApertureExportWarnings) collected across every
   // merged output file, so the caller can surface "did any pad silently fail
   // to export" without the user having to dig through the console. Empty for
   // the overwhelming majority of real exports.
   const dcodeWarnings: string[] = []
+  // Film (PDF) generation warnings — a rejected bounds check, a skipped
+  // zero-width stroke, a layer whose polarity was never set. Collected
+  // alongside dcodeWarnings rather than thrown, matching this function's
+  // existing "report problems, never abort the whole export over one
+  // layer" discipline.
+  const filmWarnings: string[] = []
   // Clone: the auto-upgrade below writes fmt.integerDigits, and callers pass
   // the store's outputFormat object straight in — mutating it would compound
   // across exports.
@@ -197,9 +251,15 @@ export async function exportPanelizedGerbers(
   // Kept for the drill export below and as the single-design fallback.
   const globalBaseOffset: BaseOffset | undefined = baseOffsetByDesign.get(designIds[0])
 
-  const zip = new JSZip()
-  const folder = zip.folder('panelized_gerbers')
-  if (!folder) throw new Error('Failed to create ZIP folder')
+  // Every file this export produces, tagged with the bundle(s) it belongs
+  // to (see share/artifacts.ts's own header for why this exists) — the flat
+  // list this whole function builds is zipped once at the very end via
+  // zipArtifacts, instead of writing into a JSZip folder as each file is
+  // produced. Verified byte-identical to the old inline folder.file(...)
+  // calls via a golden-ZIP diff (path-string filenames like 'Film/x.pdf'
+  // produce the exact same bytes as the old explicit folder.folder('Film')
+  // calls, including the auto-created directory entries).
+  const artifacts: CamArtifact[] = []
 
   // File-naming fields: PartNumber_CustomerName_Version_Date_Panel.zip for the
   // archive, PartNumber_LayerName.gerber for each file inside it.
@@ -210,28 +270,29 @@ export async function exportPanelizedGerbers(
 
   // Generate panel outline with 0.1mm width
   const outlineGerber = generatePanelOutlineGerber(panel, { ...config, panelBorderWidth: 0.1 }, fmt)
-  folder.file(`${partNumber}_Panel_Border.gerber`, outlineGerber)
+  artifacts.push({ path: `${partNumber}_Panel_Border.gerber`, content: outlineGerber, roles: ['panel', 'test'] })
 
   // V-score documentation layer (full-length score lines + rib marks), when
   // enabled and the panel actually has computed score lines.
   if (config.enableVScoreLayer && panel.vScoreLines.length > 0) {
     const vScoreGerber = generateVScoreGerber(panel, config, fmt)
-    folder.file(`${partNumber}_VScore.gerber`, vScoreGerber)
+    artifacts.push({ path: `${partNumber}_VScore.gerber`, content: vScoreGerber, roles: ['panel', 'test'] })
   }
 
   // Routing (router tool paths + mouse bites), when a plan has been generated
-  writeRouteFiles(folder, partNumber, routing, config, panel, fmt)
+  artifacts.push(...buildRoutingArtifacts(partNumber, routing, config, panel, fmt))
 
   // Meta-panelization (multi-panel-array CNC batch drilling), when the
   // G-Code tab's array section has generated it. Own subfolder — these files
   // describe the WHOLE SHEET of tiled panel copies, a different coordinate
   // space than every other file in this ZIP (which are all single-panel).
+  // Role 'meta' only — never part of the film/drill/test share bundles,
+  // which describe a single panel, not a tiled sheet.
   if (metaPanel) {
-    const metaFolder = folder.folder('Meta-Panelization')
-    if (metaFolder) {
-      metaFolder.file(metaPanel.borderMarksGerberFilename, metaPanel.borderMarksGerber)
-      metaFolder.file(metaPanel.drillFilename, metaPanel.drillContent)
-    }
+    artifacts.push(
+      { path: `Meta-Panelization/${metaPanel.borderMarksGerberFilename}`, content: metaPanel.borderMarksGerber, roles: ['meta'] },
+      { path: `Meta-Panelization/${metaPanel.drillFilename}`, content: metaPanel.drillContent, roles: ['meta'] }
+    )
   }
 
   // Generate panelized drill file with user-selected drill format
@@ -255,13 +316,16 @@ export async function exportPanelizedGerbers(
     const extraHoles =
       routing && routing.config.mouseBiteInMainDrill ? collectMouseBiteHoles(routing) : undefined
     const drillContent = generatePanelizedDrill(drillLayers, panel, config, globalBaseOffset, extraHoles, baseOffsetByDesign)
-    folder.file(`${partNumber}_Drill.drl`, drillContent)
+    // 'test' (a bare-board test house needs the customer's real holes) but
+    // deliberately NOT part of PINN.drl's roles below — tooling/reference
+    // holes are a fab-fixture concern, not a test one.
+    artifacts.push({ path: `${partNumber}_Drill.drl`, content: drillContent, roles: ['panel', 'test', 'drill'] })
   }
 
   // Generate PINN.drl file with only tooling and reference holes
   if (config.enableToolingHoles) {
     const pinnContent = generatePINNDrill(panel, config)
-    folder.file(`${partNumber}_PINN.drl`, pinnContent)
+    artifacts.push({ path: `${partNumber}_PINN.drl`, content: pinnContent, roles: ['panel', 'drill'] })
   }
 
   // ---- Merge + export each Gerber layer type/side across every design ----
@@ -307,6 +371,20 @@ export async function exportPanelizedGerbers(
   const designOrder = panel.designs.length > 0 ? panel.designs.map(d => d.designId) : designIds
   for (const id of designIds) if (!designOrder.includes(id)) designOrder.push(id)
 
+  // Film sources: the exact panelized Gerber string for every merge group
+  // that's both included and polarity-set in the film config — collected
+  // alongside the normal Gerber write so film is provably generated from
+  // the SAME bytes the fab receives, never a re-derivation. Empty (and the
+  // whole film-generation block below a no-op) when `film` wasn't passed.
+  const filmSources: FilmRenderRequest[] = []
+  // descriptiveNames included for film but never given a Positive/Negative
+  // choice — never reach film.render() at all, so buildFilmManifest needs
+  // this list passed separately from `files` to report them as skipped.
+  const unresolvedFilmLayerNames: string[] = []
+  // See this function's own return-type doc — populated below, only when
+  // film generation actually runs.
+  let filmManifestResult: FilmManifest | null = null
+
   for (const group of mergeGroups.values()) {
     const contributors: GerberExportContributor[] = []
     for (const designId of designOrder) {
@@ -329,47 +407,137 @@ export async function exportPanelizedGerbers(
       const panelized = generateMergedPanelizedGerber(contributors, panel, config, fmt, group.layerType, group.layerSide, groupWarnings)
       for (const w of groupWarnings) dcodeWarnings.push(`${group.descriptiveName}: ${w}`)
       const outName = `${partNumber}_${group.descriptiveName}.gerber`
-      folder.file(outName, panelized)
+      artifacts.push({ path: outName, content: panelized, roles: ['panel', 'test'] })
+
+      const filmSetting = film?.config.layers[group.descriptiveName]
+      if (film && filmSetting?.include) {
+        if (filmSetting.polarity) {
+          filmSources.push({ descriptiveName: group.descriptiveName, content: panelized, polarity: filmSetting.polarity })
+        } else {
+          unresolvedFilmLayerNames.push(group.descriptiveName)
+          filmWarnings.push(`${group.descriptiveName}: included for film but no Positive/Negative choice was made — film skipped.`)
+        }
+      }
     } catch (e) {
       console.warn(`Failed to panelize merge group ${group.descriptiveName}:`, e)
     }
   }
 
+  // Film (PDF) generation — rides in its own Film/ subfolder, same idiom as
+  // Meta-Panelization/ above. A film failure (rejected by the pipeline's own
+  // bounds guard, a worker error) never blocks the Gerber export itself;
+  // every problem surfaces as a warning instead. The manifest (built once,
+  // here) drives BOTH this README and — in the sharing feature — the film
+  // bundle's email body, so the two can't drift the way a second
+  // hand-written copy of this text eventually would.
+  if (film && filmSources.length > 0) {
+    try {
+      const { files } = await film.render({
+        layers: filmSources,
+        panelWidthMm: panel.panelWidth,
+        panelHeightMm: panel.panelHeight,
+        marginMm: film.config.marginMm,
+      })
+      for (const f of files) for (const w of f.warnings) filmWarnings.push(w)
+
+      const filmManifest = buildFilmManifest({
+        partNumber,
+        customerRef: info?.customerRef ?? '',
+        revision: info?.revision ?? '',
+        date: dateStr,
+        panelWidthMm: panel.panelWidth,
+        panelHeightMm: panel.panelHeight,
+        marginMm: film.config.marginMm,
+        files,
+        layerSettings: film.config.layers,
+        unresolvedLayerNames: unresolvedFilmLayerNames,
+      })
+      for (const f of filmManifest.films) {
+        const rendered = files.find((x) => x.descriptiveName === f.layerName)
+        if (rendered?.bytes) artifacts.push({ path: `Film/${f.fileName}`, content: rendered.bytes, roles: ['panel', 'film'] })
+      }
+      artifacts.push({ path: 'Film/README.txt', content: renderFilmReadme(filmManifest), roles: ['panel', 'film'] })
+      filmManifestResult = filmManifest
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      console.warn('[Export] Film generation failed:', e)
+      filmWarnings.push(`Film generation failed: ${message}`)
+    }
+  }
+
   // Add README
   const readme = generateReadme(panel, config, info, layers, fmt, routing)
-  folder.file('README.txt', readme)
+  artifacts.push({ path: 'README.txt', content: readme, roles: ['panel'] })
 
-  // Generate and download ZIP
-  const blob = await zip.generateAsync({ type: 'blob' })
-  saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_Panel.zip`)
-
-  return { dcodeWarnings }
+  return { artifacts, dcodeWarnings, filmWarnings, partNumber, customerName, version, dateStr, filmManifest: filmManifestResult }
 }
 
 /**
- * Write the routing outputs into an existing ZIP folder.
- *
- * Shared by the full panel export and the route-only export so the two can
- * never produce different route files for the same plan.
+ * The existing "download the whole panel" flow, unchanged in behavior —
+ * every pre-existing call site keeps its exact signature and output.
+ * Zips the RAW artifact list with no role filtering (unlike the sharing
+ * feature's bundles): the full panel ZIP has always included everything
+ * buildPanelArtifacts produces, including Meta-Panelization/ files whose
+ * roles are ['meta'] only — filtering to role 'panel' here would silently
+ * drop those and break byte-identical output for any export that has them.
  */
-function writeRouteFiles(
-  folder: JSZip,
+export async function exportPanelizedGerbers(
+  layers: LayerFile[],
+  panel: PanelResult,
+  config: PanelConfig,
+  info?: PanelInfo,
+  outputFormat?: OutputFormat,
+  routing?: RoutingResult | null,
+  metaPanel?: { borderMarksGerberFilename: string; borderMarksGerber: string; drillFilename: string; drillContent: string } | null,
+  film?: { config: FilmConfig; render: FilmRenderer } | null
+): Promise<{ dcodeWarnings: string[]; filmWarnings: string[] }> {
+  const { artifacts, dcodeWarnings, filmWarnings, partNumber, customerName, version, dateStr } = await buildPanelArtifacts(
+    layers,
+    panel,
+    config,
+    info,
+    outputFormat,
+    routing,
+    metaPanel,
+    film
+  )
+  const blob = await zipArtifacts(artifacts, 'panelized_gerbers')
+  saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_Panel.zip`)
+  return { dcodeWarnings, filmWarnings }
+}
+
+/**
+ * The routing output files, as role-tagged artifacts — shared by the full
+ * panel export and the route-only export so the two can never produce
+ * different route files for the same plan. Pure (no JSZip/folder
+ * dependency): the caller decides where these land (inline in the panel
+ * ZIP's root, or their own 'routing' ZIP).
+ *
+ * `_Route.gerber` is documentation/CAM-interchange only (not something a
+ * drilling shop cuts from), so it's tagged 'route' but not 'drill'.
+ * `_Route.rou`/`_MouseBites.drl` are the real toolpaths a drilling/routing
+ * shop needs, so both get 'drill' too.
+ */
+function buildRoutingArtifacts(
   partNumber: string,
   routing: RoutingResult | null | undefined,
   config: PanelConfig,
   panel: PanelResult,
   fmt: OutputFormat
-): void {
-  if (!routing || routing.paths.length === 0) return
+): CamArtifact[] {
+  if (!routing || routing.paths.length === 0) return []
 
-  folder.file(`${partNumber}_Route.gerber`, generateRouteGerber(routing, fmt))
-  folder.file(`${partNumber}_Route.rou`, generateRoutFile(routing, config.drillFormat, panel))
+  const artifacts: CamArtifact[] = [
+    { path: `${partNumber}_Route.gerber`, content: generateRouteGerber(routing, fmt), roles: ['panel', 'route'] },
+    { path: `${partNumber}_Route.rou`, content: generateRoutFile(routing, config.drillFormat, panel), roles: ['panel', 'route', 'drill'] },
+  ]
 
   // Own file unless the user folded the bites into the main drill program.
   if (!routing.config.mouseBiteInMainDrill) {
     const bites = generateMouseBiteDrill(routing, config.drillFormat, panel)
-    if (bites) folder.file(`${partNumber}_MouseBites.drl`, bites)
+    if (bites) artifacts.push({ path: `${partNumber}_MouseBites.drl`, content: bites, roles: ['panel', 'route', 'drill'] })
   }
+  return artifacts
 }
 
 /**
@@ -393,14 +561,10 @@ export async function exportRoutingFiles(
   const version = sanitizeVersionForFilename(info?.revision, 'v1')
   const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
 
-  const zip = new JSZip()
-  const folder = zip.folder('routing')
-  if (!folder) throw new Error('Failed to create ZIP folder')
+  const artifacts = buildRoutingArtifacts(partNumber, routing, config, panel, fmt)
+  artifacts.push({ path: 'README.txt', content: generateRoutingReadme(routing, fmt), roles: ['route'] })
 
-  writeRouteFiles(folder, partNumber, routing, config, panel, fmt)
-  folder.file('README.txt', generateRoutingReadme(routing, fmt))
-
-  const blob = await zip.generateAsync({ type: 'blob' })
+  const blob = await zipArtifacts(artifacts, 'routing')
   saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_Route.zip`)
 }
 
@@ -471,6 +635,26 @@ export async function exportMetaPanelFiles(
 }
 
 /**
+ * The G-code output files, as role-tagged artifacts. Every ordinary G-code
+ * file (cutting AND drilling programs alike) gets BOTH 'gcode' and 'drill'
+ * — a real shop's "drilling department" commonly runs the same CNC machine
+ * for both depaneling and drilling, so a drill share bundle including the
+ * cutting programs too is intentional, not an oversight. Meta-panelization
+ * files are tagged 'meta' only, same as the panel export's own
+ * Meta-Panelization/ files — a different, whole-sheet-batch concept that
+ * doesn't belong in a single-panel share bundle.
+ */
+export function buildGcodeArtifacts(gcodeFiles: GcodeFile[], metaPanelGcodeFiles?: GcodeFile[] | null): CamArtifact[] {
+  const artifacts: CamArtifact[] = gcodeFiles.map((f) => ({ path: f.filename, content: f.content, roles: ['gcode', 'drill'] }))
+  if (metaPanelGcodeFiles) {
+    for (const f of metaPanelGcodeFiles) {
+      artifacts.push({ path: `Meta-Panelization/${f.filename}`, content: f.content, roles: ['meta'] })
+    }
+  }
+  return artifacts
+}
+
+/**
  * G-code-only ZIP, for downloading the generated LinuxCNC programs without
  * re-zipping the Gerber/route files each time.
  */
@@ -487,18 +671,7 @@ export async function exportGcodeFiles(
   const version = sanitizeVersionForFilename(info?.revision, 'v1')
   const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
 
-  const zip = new JSZip()
-  const folder = zip.folder('gcode')
-  if (!folder) throw new Error('Failed to create ZIP folder')
-
-  for (const f of gcodeFiles) folder.file(f.filename, f.content)
-
-  if (metaPanelGcodeFiles && metaPanelGcodeFiles.length > 0) {
-    const metaFolder = folder.folder('Meta-Panelization')
-    if (metaFolder) {
-      for (const f of metaPanelGcodeFiles) metaFolder.file(f.filename, f.content)
-    }
-  }
+  const artifacts = buildGcodeArtifacts(gcodeFiles, metaPanelGcodeFiles)
 
   const lines: string[] = []
   lines.push('=== G-Code Files ===')
@@ -518,9 +691,9 @@ export async function exportGcodeFiles(
     lines.push('--- Meta-Panelization/ (multi-panel-array CNC batch) ---')
     for (const f of metaPanelGcodeFiles) lines.push(f.filename)
   }
-  folder.file('README.txt', lines.join('\n'))
+  artifacts.push({ path: 'README.txt', content: lines.join('\n'), roles: ['gcode'] })
 
-  const blob = await zip.generateAsync({ type: 'blob' })
+  const blob = await zipArtifacts(artifacts, 'gcode')
   saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_GCode.zip`)
 }
 

@@ -11,7 +11,7 @@ import * as Comlink from 'comlink'
 import type { GerberWorkerApi } from '@/workers/gerber-worker'
 import { normalizeGerberMacroPrimitives, scalePlotTreeToMm, scaleBoardShapeToMm } from './gerber-preprocess'
 import type { CopperSpacingResult } from './dfm/types'
-import type { StencilApertureOutput } from '@/workers/gerber-worker'
+import type { StencilApertureOutput, FilmRenderInput, FilmRenderOutput } from '@/workers/gerber-worker'
 import { boardShapeCoversContent, boardShapeToContour } from './board-contour'
 import type { BoardContour } from './routing/types'
 
@@ -170,6 +170,39 @@ export async function extractStencilApertures(input: {
     const message = err instanceof Error ? err.message : String(err)
     console.warn('extractStencilApertures worker call failed:', message)
     return { ...fallback, error: message }
+  }
+}
+
+/**
+ * Renders every requested layer's film PDF in one worker call. Same
+ * failure-degrades-never-throws contract as checkCopperSpacing/
+ * extractStencilApertures — a film failure must never take down the
+ * surrounding Gerber export. A worker-unavailable or Comlink-call failure
+ * degrades to an empty file list, each with an explanatory warning, rather
+ * than throwing past the caller.
+ */
+export async function renderFilmPdfs(input: FilmRenderInput): Promise<FilmRenderOutput> {
+  const fallback: FilmRenderOutput = {
+    files: input.layers.map((layer) => ({
+      descriptiveName: layer.descriptiveName,
+      bytes: null,
+      warnings: [`${layer.descriptiveName}: film rendering unavailable (worker failed to start).`],
+    })),
+  }
+  const worker = getWorker()
+  if (!worker) return fallback
+  try {
+    return (await worker.renderFilmPdf(input)) as FilmRenderOutput
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.warn('renderFilmPdfs worker call failed:', message)
+    return {
+      files: input.layers.map((layer) => ({
+        descriptiveName: layer.descriptiveName,
+        bytes: null,
+        warnings: [`${layer.descriptiveName}: film rendering failed (${message}).`],
+      })),
+    }
   }
 }
 

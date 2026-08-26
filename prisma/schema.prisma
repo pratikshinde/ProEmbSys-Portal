@@ -34,13 +34,15 @@ model User {
   orders              Order[]
   passwordResetTokens PasswordResetToken[]
   messages            Message[]
-  pricingRateEdits    PricingRate[] @relation("PricingRateEditedBy")
+  pricingRateEdits    PricingRate[]        @relation("PricingRateEditedBy")
   addresses           Address[]
   blogPosts           BlogPost[]
   shopOrders          ShopOrder[]
   dfmTemplates        DfmTemplate[]
   panelTemplates      PanelTemplate[]
   camJobs             CamJob[]
+  contacts            Contact[]
+  shareBundles        ShareBundle[]
 
   @@map("users")
 }
@@ -73,6 +75,179 @@ model Address {
 
   @@index([userId])
   @@map("addresses")
+}
+
+enum ContactScope {
+  PRIVATE
+  SHARED
+}
+
+// Saved recipients for the CAM Sharing feature (film plotter / drill shop /
+// test house contacts) — an address-book clone, same PRIVATE/SHARED split
+// as DfmTemplate/PanelTemplate, but with ONE deliberate divergence: SHARED
+// here is staff-visible only, never public. A DfmTemplate's SHARED row is
+// meant for every customer to use (so the CAM tool works logged-out); a
+// SHARED Contact is an org-wide address book entry (e.g. "Drill Dept,
+// ProEmbSys") that only staff should be able to pick when sending fab work
+// out — a customer emailing their own board should never see, or be able
+// to email, another customer's shop contact. See visibleContactsWhere in
+// src/lib/contacts.ts, which is its own helper (not a reuse of
+// visibleTemplatesWhere) for exactly this reason.
+model Contact {
+  id      String       @id @default(cuid())
+  scope   ContactScope @default(PRIVATE)
+  userId  String? // owner of a PRIVATE contact; null for org-wide SHARED
+  name    String
+  email   String
+  company String?
+  role    String? // free text: "Film plotter", "Drill shop", "Test house", ...
+  notes   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user            User?            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shareRecipients ShareRecipient[]
+
+  // Postgres treats NULLs as distinct in a unique index, so this dedupes
+  // PRIVATE contacts (userId set — the case that matters, since users
+  // re-add the same plotter/drill-shop email repeatedly) but NOT SHARED
+  // ones (userId null — those are admin-curated, not auto-deduped).
+  @@unique([userId, email])
+  @@index([userId])
+  @@index([scope])
+  @@map("contacts")
+}
+
+enum ShareBundleKind {
+  FILM
+  DRILL
+  TEST
+}
+
+// One emailed bundle of CAM output files, sent to N recipients. Separate
+// from CamJob (not a field on it) because outputs are NOT a function of the
+// job alone — the same job exported twice with a different filmConfig or
+// routing plan produces different bytes, and a bundle is immutable once
+// sent while a CamJob is mutable work-in-progress. camJobId is REQUIRED
+// (not optional): a share with no job behind it is unreproducible — you
+// could never answer "which job did this film go out from" or regenerate
+// it — and it gives retention/cleanup a natural owner (deleting a job
+// cascades its bundles). orderId is optional, same "not every job is
+// commercial work" reasoning as CamJob.orderId.
+//
+// One bundle = one kind = one ZIP = N recipients. "Send film + drill"
+// creates TWO bundles, never one bundle with a mixed manifest — kind
+// selects both the file filter and the email template, so it belongs on
+// the bundle, not folded into a list.
+model ShareBundle {
+  id       String          @id @default(cuid())
+  userId   String
+  camJobId String
+  orderId  String?
+  kind     ShareBundleKind
+
+  fileName String
+  fileSize Int
+  // FilmManifest | DrillManifest | TestManifest (src/lib/share/manifest.ts)
+  // — the SAME structured object that rendered the in-ZIP README also
+  // drives the email body, so the two can never say different things.
+  manifest Json
+  message  String?
+
+  // 30 days default, extendable/revocable from the job's share history —
+  // never "forever" (unbounded disk growth) and never "delivery receipt
+  // proof" (see ShareRecipient.firstAccessedAt's own comment on why a
+  // corporate link scanner can fire that before any human sees the link).
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  camJob     CamJob           @relation(fields: [camJobId], references: [id], onDelete: Cascade)
+  order      Order?           @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  recipients ShareRecipient[]
+
+  @@index([userId])
+  @@index([camJobId])
+  // Drives the lazy expiry sweep (share/sweep.ts) — a range scan, not a
+  // point lookup, so this index matters even though nothing else queries
+  // by expiresAt alone.
+  @@index([expiresAt])
+  @@map("share_bundles")
+}
+
+// One recipient of one ShareBundle, with their own token — per-recipient
+// (not one token per bundle) so a single leaked/compromised link can be
+// revoked without breaking delivery to everyone else, and so a forward is
+// attributable to whoever it was actually sent to.
+model ShareRecipient {
+  id        String  @id @default(cuid())
+  bundleId  String
+  contactId String?
+
+  // Snapshotted, not read live through contactId — same reasoning as
+  // Order.deliveryAddress/billingAddress: editing or deleting a Contact
+  // later must never change what a past send says it went to.
+  email String
+  name  String?
+
+  // 32 random bytes, hex — plaintext, a deliberate decision (not a silent
+  // inheritance from PasswordResetToken): a share link must be
+  // re-displayable ("copy link") and resend must reuse the SAME link, so
+  // there's nothing to hash against. Unlike PasswordResetToken this token
+  // is also NOT single-use (see revokedAt below) — a 30-day link a plotter
+  // opens on their phone and then again at the shop PC must keep working.
+  token String @unique
+
+  sentAt    DateTime?
+  // null = delivered to Resend OK. Set = exactly why this ONE recipient's
+  // send failed — the bundle and every OTHER recipient's link still
+  // persist regardless (see the "per-recipient partial success" policy in
+  // src/lib/email.ts), so a retry only needs to resend to this recipient.
+  sendError String?
+  // Whether the ZIP was attached to this recipient's email (small enough)
+  // or the recipient must use the link — both cases keep the link in the
+  // email either way, this is purely informational for the UI.
+  attached  Boolean   @default(false)
+
+  // NOT proof a human opened the link — corporate link-scanners (Defender
+  // SafeLinks, Proofpoint, etc.) fetch a URL before any person sees it, so
+  // this can fire seconds after send for mail nobody read. Useful for
+  // "was this link ever accessed at all", not "did they see it". The UI
+  // must say "link accessed", never "so-and-so opened it".
+  firstAccessedAt DateTime?
+  lastAccessedAt  DateTime?
+  accessCount     Int       @default(0)
+
+  // Deliberately NOT `usedAt` — see `token`'s own comment: this link is
+  // multi-use, so revocation is the only way to kill it early.
+  revokedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  bundle  ShareBundle @relation(fields: [bundleId], references: [id], onDelete: Cascade)
+  contact Contact?    @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@index([bundleId])
+  @@map("share_recipients")
+}
+
+// DB-backed rate limiter for POST /api/share — the app's first
+// abuse-sensitive endpoint (email + disk write, triggerable by any signed-in
+// user). Deliberately not generic middleware: middleware.ts only matches
+// /admin/:path*, and pulling /api/** into the Edge matcher risks the
+// documented auth.config/Prisma split (middleware must stay Edge-safe, this
+// counter needs a real DB round trip). Keys are "user:<id>:<yyyymmddhh>" and
+// "global:<yyyymmddhh>" — incremented via an atomic upsert inside a
+// transaction, the same rule CLAUDE.md already codifies for OrderSequence
+// ("never derive the count by reading then writing — concurrent requests
+// would race and collide").
+model ShareRateCounter {
+  key         String   @id
+  windowStart DateTime
+  count       Int      @default(0)
+
+  @@map("share_rate_counters")
 }
 
 model Account {
@@ -205,15 +380,15 @@ model Order {
   gerberFilePath String? // storage path relative to uploads/orders/, e.g. "<uuid>.<ext>" — see src/lib/order-files.ts
   gerberFileType String? // best-effort MIME type
   gerberFileSize Int? // bytes
-  widthMm      Decimal     @db.Decimal(10, 2)
-  heightMm     Decimal     @db.Decimal(10, 2)
-  layers       String
-  qty          Int
-  finish       String
-  color        String
-  copperWeight String
-  thickness    String
-  express      Boolean     @default(false)
+  widthMm        Decimal @db.Decimal(10, 2)
+  heightMm       Decimal @db.Decimal(10, 2)
+  layers         String
+  qty            Int
+  finish         String
+  color          String
+  copperWeight   String
+  thickness      String
+  express        Boolean @default(false)
 
   // Snapshot of the resolved price breakdown at order time — historical
   // orders must NOT silently reprice when an admin edits a PricingRate later.
@@ -241,6 +416,12 @@ model Order {
 
   user          User           @relation(fields: [userId], references: [id], onDelete: Restrict)
   messageThread MessageThread?
+  // Optional — a CamJob may be linked to the order it was worked for
+  // (set by the user from the CAM tool), but most CamJobs are scratch/
+  // internal work with no order at all. onDelete: SetNull on CamJob's side
+  // — deleting an order must not delete someone's saved CAM work.
+  camJobs       CamJob[]
+  shareBundles  ShareBundle[]
 
   @@index([userId])
   @@index([status])
@@ -347,10 +528,10 @@ enum ShopOrderStatus {
 // (no DRC-equivalent review step for off-the-shelf modules), unlike PCB
 // orders which only reach a payable state after staff review.
 model ShopOrder {
-  id     String          @id @default(cuid())
-  reference String       @unique // SHOP-YYYYMMDD-NNNN, see src/lib/order-reference.ts
-  userId String
-  status ShopOrderStatus @default(PENDING_PAYMENT)
+  id        String          @id @default(cuid())
+  reference String          @unique // SHOP-YYYYMMDD-NNNN, see src/lib/order-reference.ts
+  userId    String
+  status    ShopOrderStatus @default(PENDING_PAYMENT)
 
   // Denormalized total for cheap sort/filter, same reasoning as Order.total.
   total Decimal @db.Decimal(10, 2)
@@ -381,9 +562,9 @@ model ShopOrderItem {
   productId   String?
   // Snapshot at purchase time — a Product can be edited/deactivated/deleted
   // later without changing what a past order says the customer bought.
-  name  String
-  price Decimal @db.Decimal(10, 2) // unit price snapshot
-  qty   Int
+  name        String
+  price       Decimal @db.Decimal(10, 2) // unit price snapshot
+  qty         Int
 
   shopOrder ShopOrder @relation(fields: [shopOrderId], references: [id], onDelete: Cascade)
   product   Product?  @relation(fields: [productId], references: [id], onDelete: SetNull)
@@ -494,6 +675,16 @@ model PanelTemplate {
   @@map("panel_templates")
 }
 
+// DRAFT -> READY -> SENT_TO_FAB is the common path, but a job can jump to
+// ARCHIVED from any state (abandoning a scratch job) — see the deliberate
+// absence of a pipeline/timeline concept in src/lib/cam-job-status.ts.
+enum CamJobStatus {
+  DRAFT
+  READY
+  SENT_TO_FAB
+  ARCHIVED
+}
+
 // A saved snapshot of the CAM Panelization tool's working state, so a
 // logged-in user can pick up a job later instead of losing it on refresh.
 // No scope/isSystem concept (unlike DfmTemplate/PanelTemplate) — this is
@@ -512,6 +703,43 @@ model CamJob {
   // `config` at write time; never read back into the snapshot on load.
   revision String @default("")
 
+  // User-controlled workflow state — independent of the `dfm*`/`export*`
+  // health columns below. Status is "where is this job in MY process";
+  // health is "did the last save look OK" — see src/lib/cam-job-health.ts's
+  // own header for why these must never be merged into one field.
+  status  CamJobStatus @default(DRAFT)
+  // Optional link to the order this job was worked for — set by the user
+  // from the CAM tool, most jobs have none. onDelete: SetNull, not Cascade:
+  // deleting an order must never delete someone's saved CAM work.
+  orderId String?
+
+  // Health snapshot, captured ONCE at save time from live store state
+  // (handleSaveJob in export-panel.tsx) — see src/lib/cam-job-health.ts for
+  // the full derivation. Columns, not JSON, because the job library filters
+  // and sorts on these (the Order.total precedent — a denormalized column
+  // for what's queried — not Order.priceBreakdown, which is JSON because
+  // it's open-ended and never queried into).
+  //
+  // dfmRanAt/exportRanAt are nullable DateTimes, not booleans or zero
+  // counts: null means "never ran", which is NOT the same fact as "ran and
+  // found nothing" — deriveCamJobHealth's #1 rule depends on being able to
+  // tell those apart, or an unchecked job would show a false-clean badge.
+  dfmRanAt       DateTime?
+  dfmErrors      Int?
+  dfmWarnings    Int?
+  dfmInfos       Int?
+  // The layer count DFM ran against, compared at read time to
+  // config.files.length to detect a report that predates the current layer
+  // set — dfmReport is NOT cleared by addLayer/removeLayer (only by
+  // clearLayers/loadCamJobSnapshot), so this can legitimately drift.
+  dfmLayerCount  Int?
+  exportRanAt    DateTime?
+  exportWarnings Int?
+  // Import warnings have no "ranAt" — an import either happened (this job
+  // has files) or didn't, so a bare count is enough; @default(0) rather
+  // than nullable, unlike the DFM/export fields above.
+  importWarnings Int       @default(0)
+
   // CamJobSnapshot (src/lib/store.ts) — flat CAM config slices (panelConfig,
   // routingConfig, gcodeContext, panelArrayConfig, stencilConfig, designs,
   // panelInfo, etc.) plus a `files[]` metadata array (fileName, designId,
@@ -521,15 +749,22 @@ model CamJob {
   // (panelResult, routingResult, gcodeFiles, dfmReport, ...) — those are
   // recomputed by the user re-clicking Create Panel/Generate Routing/etc.
   // after a load, matching the tool's existing "nothing auto-computes"
-  // convention.
+  // convention. The status/health fields above are ALSO deliberately kept
+  // out of this blob for the same reason as priceBreakdown vs total on
+  // Order: what's queried needs to be a column, not buried in JSON.
   config Json
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order        Order?        @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  shareBundles ShareBundle[]
 
   @@unique([userId, name, revision])
-  @@index([userId])
+  // Superset of the old bare @@index([userId]) — every list view sorts by
+  // updatedAt desc, so this covers both the old lookup and that sort.
+  @@index([userId, updatedAt])
+  @@index([orderId])
   @@map("cam_jobs")
 }

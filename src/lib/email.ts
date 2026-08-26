@@ -5,8 +5,29 @@ import { Resend } from "resend"
 // route module gets imported to collect page data, even if it's never
 // called). Constructing it inside the function means a missing key only
 // fails when an email is actually sent, not at build time.
+//
+// Memoized after first construction (added for the sharing feature, which is
+// the first caller to send several emails within one request — one per
+// recipient, sequentially) so a multi-recipient share doesn't re-parse
+// RESEND_API_KEY and rebuild the SDK's internal HTTP client N times.
+let resendClient: Resend | null = null
 function getResendClient() {
-  return new Resend(process.env.RESEND_API_KEY)
+  if (!resendClient) resendClient = new Resend(process.env.RESEND_API_KEY)
+  return resendClient
+}
+
+/** Minimal HTML-entity escaping for user-supplied text landing in an email
+ *  body. Every template below this point interpolates only enum/server-built
+ *  values (role, a token-based URL) which are safe without it — the sharing
+ *  feature is the first to put free-text (a job name, a sender's own message)
+ *  into a template, so this becomes mandatory there. */
+export function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
 }
 
 const FROM = process.env.EMAIL_FROM ?? "ProPCB <noreply@propcb.local>"
@@ -45,4 +66,88 @@ export async function sendStaffWelcomeEmail(to: string, role: string, setPasswor
     `,
   })
   throwIfFailed(result)
+}
+
+const SHARE_KIND_LABEL: Record<"FILM" | "DRILL" | "TEST", string> = {
+  FILM: "Film Plot Files",
+  DRILL: "Drilling Files",
+  TEST: "Bare-Board Test Files",
+}
+
+export interface ShareBundleEmailInput {
+  to: string
+  /** The sending user's own address — replies must reach them, not a
+   *  noreply void, since a plotter/driller genuinely will reply with a
+   *  clarifying question. */
+  replyTo: string
+  senderName?: string | null
+  kind: "FILM" | "DRILL" | "TEST"
+  jobName: string
+  /** Optional free-text note from the sender — escaped before use. */
+  message?: string | null
+  downloadUrl: string
+  expiresAt: Date
+  /** The rendered README text (renderFilmReadme/renderDrillReadme/
+   *  renderTestReadme from share/manifest.ts) — reused verbatim as the
+   *  email body's detail section so the in-ZIP README and the email can
+   *  never say something different. */
+  manifestText: string
+  attachment?: { filename: string; content: Buffer } | null
+}
+
+/**
+ * Per-recipient send for the sharing feature — the caller (POST /api/share)
+ * invokes this once per recipient, sequentially, never Promise.all, so a
+ * mid-list failure is attributable to one recipient and doesn't cancel the
+ * rest. Unlike every other email in this file, failure here is NOT thrown
+ * back to a caller that aborts the whole request — POST /api/share catches
+ * per-call and records `sendError` on that one ShareRecipient row, which is
+ * why this still throws (via throwIfFailed) rather than swallowing: the
+ * caller's per-recipient try/catch is the actual policy, this function just
+ * reports honestly.
+ */
+export async function sendShareBundleEmail(input: ShareBundleEmailInput): Promise<{ id: string | null }> {
+  const kindLabel = SHARE_KIND_LABEL[input.kind]
+  const expiresLabel = input.expiresAt.toLocaleDateString("en-IN", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  })
+  const intro = input.senderName
+    ? `${input.senderName} shared ${kindLabel.toLowerCase()} for "${input.jobName}" with you via ProPCB.`
+    : `${kindLabel} for "${input.jobName}" were shared with you via ProPCB.`
+
+  const text = [
+    intro,
+    input.message ? `\nMessage:\n${input.message}` : "",
+    `\nDownload: ${input.downloadUrl}`,
+    `This link expires on ${expiresLabel}.`,
+    input.attachment ? "The files are also attached to this email." : "",
+    "",
+    input.manifestText,
+  ]
+    .filter((line) => line !== "")
+    .join("\n")
+
+  const html = `
+    <p>${escapeHtml(intro)}</p>
+    ${input.message ? `<p>${escapeHtml(input.message).replace(/\n/g, "<br/>")}</p>` : ""}
+    <p><a href="${input.downloadUrl}">Download files</a> — this link expires on ${expiresLabel}.</p>
+    ${input.attachment ? "<p>The files are also attached to this email.</p>" : ""}
+    <pre style="white-space:pre-wrap;font-family:monospace;font-size:12px;background:#f5f5f5;padding:12px;border-radius:4px;">${escapeHtml(input.manifestText)}</pre>
+  `
+
+  const result = await getResendClient().emails.send({
+    from: FROM,
+    to: input.to,
+    replyTo: input.replyTo,
+    subject: `${kindLabel} — ${input.jobName}`,
+    text,
+    html,
+    attachments: input.attachment
+      ? [{ filename: input.attachment.filename, content: input.attachment.content }]
+      : undefined,
+  })
+  throwIfFailed(result)
+  return { id: result.data?.id ?? null }
 }

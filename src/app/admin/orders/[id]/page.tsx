@@ -1,9 +1,14 @@
+import Link from "next/link"
 import { notFound } from "next/navigation"
 import { db } from "@/lib/db"
 import MessageThread from "@/components/messaging/message-thread"
 import OrderStatusControl from "@/components/admin/order-status-control"
 import { asAddressSnapshot, formatAddressSnapshot } from "@/lib/format-address"
 import { SOLDER_MASK_SWATCH } from "@/lib/solder-mask-colors"
+import { CAM_JOB_SUMMARY_SELECT, toCamJobSummary } from "@/lib/cam-job-summary"
+import { CAM_JOB_STATUS_META, type CamJobStatusKey } from "@/lib/cam-job-status"
+import { CAM_JOB_HEALTH_META } from "@/lib/cam-job-health"
+import { StatusBadge } from "@/components/status-badge"
 
 export default async function AdminOrderDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -13,6 +18,17 @@ export default async function AdminOrderDetailPage({ params }: { params: Promise
     include: { messageThread: true, user: { select: { name: true, email: true } } },
   })
   if (!order) notFound()
+
+  // Every CamJob linked to this order — orderId-linked jobs are visible to
+  // staff unconditionally (see cam-job-access.ts's camJobVisibleWhere), and
+  // we're already scoped to one specific order here, so this queries
+  // directly rather than going through listStaffVisibleCamJobs.
+  const linkedJobRows = await db.camJob.findMany({
+    where: { orderId: order.id },
+    select: { ...CAM_JOB_SUMMARY_SELECT, user: { select: { name: true, email: true } } },
+    orderBy: { updatedAt: "desc" },
+  })
+  const linkedJobs = linkedJobRows.map((r) => ({ ...toCamJobSummary(r), ownerName: r.user.name, ownerEmail: r.user.email }))
 
   const deliveryAddress = asAddressSnapshot(order.deliveryAddress)
   const billingAddress = asAddressSnapshot(order.billingAddress)
@@ -128,11 +144,39 @@ export default async function AdminOrderDetailPage({ params }: { params: Promise
         </div>
       )}
 
-      {order.deliveryFormat === "PANEL_BY_PROPCB" && (
-        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-600 dark:text-amber-400">
-          This order needs to be panelized by our team before production — use the Panelization tool on the
-          uploaded Gerber files.
+      {linkedJobs.length > 0 ? (
+        <div className="rounded-lg border border-border bg-card p-5 text-sm">
+          <span className="text-muted-foreground">CAM jobs linked to this order</span>
+          <div className="mt-3 flex flex-col gap-2">
+            {linkedJobs.map((job) => {
+              const statusMeta = CAM_JOB_STATUS_META[job.status as CamJobStatusKey] ?? { label: job.status, bg: "rgba(148,163,184,0.15)", text: "#94a3b8" }
+              return (
+                <Link
+                  key={job.id}
+                  href={`/panelization?load=${job.id}`}
+                  className="flex flex-wrap items-center gap-2 rounded-md border border-border p-3 hover:border-primary"
+                >
+                  <span className="font-medium text-foreground">
+                    {job.name}
+                    {job.revision && <span className="font-normal text-muted-foreground"> · Rev {job.revision}</span>}
+                  </span>
+                  <StatusBadge label={statusMeta.label} bg={statusMeta.bg} text={statusMeta.text} />
+                  <span title={job.health.reasons.join(" ")}>
+                    <StatusBadge label={job.health.label} bg={CAM_JOB_HEALTH_META[job.health.level].bg} text={CAM_JOB_HEALTH_META[job.health.level].text} />
+                  </span>
+                  <span className="text-xs text-muted-foreground">by {job.ownerName || job.ownerEmail}</span>
+                </Link>
+              )
+            })}
+          </div>
         </div>
+      ) : (
+        order.deliveryFormat === "PANEL_BY_PROPCB" && (
+          <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-600 dark:text-amber-400">
+            This order needs to be panelized by our team before production — use the Panelization tool on the
+            uploaded Gerber files, then link the saved CAM job to this order.
+          </div>
+        )
       )}
 
       {order.messageThread && <MessageThread threadId={order.messageThread.id} />}

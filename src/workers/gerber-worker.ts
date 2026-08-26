@@ -28,6 +28,8 @@ import { toHtml } from 'hast-util-to-html'
 import { normalizeGerberMacroPrimitives, scalePlotTreeToMm } from '../lib/gerber-preprocess'
 import { flattenPlotTree, computeSpacing } from '../lib/dfm/capsules'
 import { extractPasteApertures } from '../lib/stencil-geometry'
+import { gerberToFilmPdf } from '../lib/film/gerber-to-film'
+import type { FilmPolarity } from '../lib/film/plot-to-pdf'
 
 export interface GerberWorkerResult {
   svgFragment: string
@@ -431,7 +433,59 @@ function extractStencilApertures(input: StencilApertureInput): StencilApertureOu
   }
 }
 
-const api = { parseGerber, renderBoardView, checkCopperSpacing, extractStencilApertures }
+export interface FilmLayerSource {
+  descriptiveName: string
+  /** The already-panelized Gerber text for this layer — NOT the raw
+   *  customer upload (see gerber-to-film.ts's own docs for why). */
+  content: string
+  polarity: FilmPolarity
+}
+
+export interface FilmRenderInput {
+  layers: FilmLayerSource[]
+  panelWidthMm: number
+  panelHeightMm: number
+  marginMm: number
+}
+
+export interface FilmRenderedFile {
+  descriptiveName: string
+  /** null when this specific film could not be safely generated — see
+   *  `warnings` for why. A per-layer failure never blocks the rest of the
+   *  batch. */
+  bytes: Uint8Array | null
+  warnings: string[]
+}
+
+export interface FilmRenderOutput {
+  files: FilmRenderedFile[]
+}
+
+/**
+ * Renders every requested layer's film PDF in one Comlink call, run
+ * SEQUENTIALLY inside the worker rather than as N concurrent calls —
+ * Comlink already serializes onto this single worker regardless, so
+ * batching avoids N round-trip overheads and keeps a natural point to add
+ * progress reporting later. Parse+plot of a panel-level copper Gerber is
+ * the heaviest computation in this app (the same reason checkCopperSpacing
+ * and extractStencilApertures live here rather than on the main thread).
+ */
+function renderFilmPdf(input: FilmRenderInput): FilmRenderOutput {
+  const files: FilmRenderedFile[] = input.layers.map((layer) => {
+    const result = gerberToFilmPdf({
+      content: layer.content,
+      polarity: layer.polarity,
+      panelWidthMm: input.panelWidthMm,
+      panelHeightMm: input.panelHeightMm,
+      marginMm: input.marginMm,
+      layerLabel: layer.descriptiveName,
+    })
+    return { descriptiveName: layer.descriptiveName, bytes: result.bytes, warnings: result.warnings }
+  })
+  return { files }
+}
+
+const api = { parseGerber, renderBoardView, checkCopperSpacing, extractStencilApertures, renderFilmPdf }
 export type GerberWorkerApi = typeof api
 
 Comlink.expose(api)

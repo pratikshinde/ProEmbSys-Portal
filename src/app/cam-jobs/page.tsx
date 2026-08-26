@@ -1,33 +1,45 @@
 import { redirect } from "next/navigation"
 import { auth } from "@/lib/auth"
-import { db } from "@/lib/db"
 import { Navbar } from "@/components/portal-main"
-import CamJobsList, { type CamJobRow } from "@/components/cam-jobs-list"
-import type { CamJobSnapshot } from "@/lib/store"
+import CamJobsLibrary from "@/components/cam-jobs-library"
+import { listCamJobSummaries } from "@/lib/cam-job-summary"
+import type { CamJobHealthLevel } from "@/lib/cam-job-health"
 
-export default async function CamJobsListPage() {
+const PAGE_SIZE = 20
+
+export default async function CamJobsListPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ status?: string; health?: string; q?: string }>
+}) {
   const session = await auth()
   if (!session?.user) redirect("/login?callbackUrl=/cam-jobs")
 
-  const jobs = await db.camJob.findMany({
-    where: { userId: session.user.id },
-    orderBy: { updatedAt: "desc" },
+  const { status, health, q } = await searchParams
+  const { jobs, total } = await listCamJobSummaries({
+    userId: session.user.id,
+    status,
+    health: health as CamJobHealthLevel | undefined,
+    q,
+    take: PAGE_SIZE,
   })
-
-  const rows: CamJobRow[] = jobs.map((job) => ({
-    id: job.id,
-    name: job.name,
-    revision: job.revision,
-    updatedAt: job.updatedAt.toISOString(),
-    config: job.config as unknown as CamJobSnapshot,
-  }))
+  // Dates -> ISO strings before crossing the server/client boundary, same
+  // convention every other list surface in this app uses (e.g. the old
+  // CamJobRow.updatedAt: string) rather than relying on RSC's Date
+  // passthrough.
+  const clientJobs = jobs.map((j) => ({ ...j, createdAt: j.createdAt.toISOString(), updatedAt: j.updatedAt.toISOString() }))
 
   return (
     <div className="min-h-screen bg-background">
       <Navbar />
-      <div className="mx-auto max-w-3xl px-6 py-12">
+      <div className="mx-auto max-w-4xl px-6 py-12">
         <h1 className="mb-6 text-2xl font-bold text-foreground">My CAM Jobs</h1>
-        <CamJobsList initialJobs={rows} />
+        <CamJobsLibrary
+          initialJobs={clientJobs}
+          initialTotal={total}
+          initialFilters={{ status: status ?? "", health: health ?? "", q: q ?? "" }}
+          pageSize={PAGE_SIZE}
+        />
       </div>
     </div>
   )

@@ -35,6 +35,7 @@ import {
 } from './panel-array'
 import type { PanelTemplateSection, ResolvedPanelTemplateSettings } from './panel-template/types'
 import { DEFAULT_STENCIL_CONFIG, type StencilConfig, type StencilFile, type StencilPreviewData } from './stencil-types'
+import { DEFAULT_FILM_CONFIG, defaultFilmLayerSetting, type FilmConfig, type FilmLayerSetting } from './film-types'
 import { tileAperturesAcrossPlacements, translateRings, type Point as StencilPoint } from './stencil-geometry'
 import { serializeStencilDxf, type DxfStencilLayer } from './stencil-dxf'
 import { getMirroredLayers, mirrorRingsX, mirrorBoardContourX } from './design-mirror'
@@ -44,14 +45,17 @@ export type { LayerType, LayerSide }
 /** The CAM tool's sidebar tabs. Previously this union was spelled out inline on
  *  both `activeTab` and `setActiveTab`, which meant adding a tab required
  *  editing two places that could silently drift apart. */
-export type CamTab = 'layers' | 'designs' | 'dfm' | 'panel' | 'routing' | 'gcode' | 'stencil' | 'export'
+export type CamTab = 'layers' | 'designs' | 'dfm' | 'panel' | 'routing' | 'gcode' | 'stencil' | 'export' | 'sharing'
 
 /** Tabs whose canvas shows the whole *panel* rather than the single imported
  *  PCB. `gerber-viewer.tsx` gates SIX separate things on this (bounds, the
  *  panel-overlay memo, the route-overlay memo, the two `<use>`-repeat render
  *  paths, and the status readout) — they must all agree, so the membership
- *  test lives here rather than being re-spelled as an `||` chain at each site. */
-export const PANEL_VIEW_TABS: ReadonlySet<CamTab> = new Set<CamTab>(['panel', 'routing', 'gcode', 'stencil', 'export'])
+ *  test lives here rather than being re-spelled as an `||` chain at each site.
+ *  'sharing' is included because every bundle it composes (film/drill/test)
+ *  describes the WHOLE panel, not the single active-design PCB — matching
+ *  'export', the tab it sits next to in the sidebar. */
+export const PANEL_VIEW_TABS: ReadonlySet<CamTab> = new Set<CamTab>(['panel', 'routing', 'gcode', 'stencil', 'export', 'sharing'])
 
 export function isPanelViewTab(tab: CamTab): boolean {
   return PANEL_VIEW_TABS.has(tab)
@@ -228,6 +232,7 @@ export interface CamJobSnapshot {
   gcodeContext: GcodeContext
   panelArrayConfig: PanelArrayConfig
   stencilConfig: StencilConfig
+  filmConfig: FilmConfig
   panelTemplateId: string | null
   showGrid: boolean
   showCrosshair: boolean
@@ -237,6 +242,32 @@ export interface CamJobSnapshot {
 interface AppState {
   // Layers
   layers: LayerEntry[]
+  /** Accumulated actionableParseWarnings text across every import this
+   *  session (ZIP/RAR entries prefixed with their filename, same as
+   *  ZipImportResult.warnings) — previously shown once in a toast/import
+   *  panel and then discarded. Captured here purely so a CamJob save can
+   *  record a real count for cam-job-health.ts; cleared in clearLayers and
+   *  loadCamJobSnapshot, same as every other per-session derived field. Not
+   *  part of CamJobSnapshot itself — see the health columns' own comment on
+   *  the CamJob model for why. */
+  importWarnings: string[]
+  /** Snapshot of the last export's warning counts, for the same reason —
+   *  dcodeWarnings/filmWarnings are otherwise shown in one toast
+   *  (TOAST_LIMIT=1) and gone. `at` is set by recordExport, not the caller,
+   *  so every call site stamps the same clock. */
+  lastExport: { dcode: string[]; film: string[]; at: string } | null
+  recordExport: (dcodeWarnings: string[], filmWarnings: string[]) => void
+  /** The id of the most recently saved-or-loaded CamJob this session, or
+   *  null if nothing has been saved/loaded yet. Sharing (POST /api/share)
+   *  requires a saved job — this is the one place that requirement can be
+   *  checked without threading a job id through every call site. Not part
+   *  of CamJobSnapshot (it's derived session state, same reasoning as
+   *  importWarnings/lastExport) — set by handleSaveJob on a successful save
+   *  and by loadCamJobById on a successful load, cleared by clearLayers and
+   *  loadCamJobSnapshot's own reset (loadCamJobById then sets the real id
+   *  right after, so there's no gap the user could act during). */
+  lastSavedJobId: string | null
+  setLastSavedJobId: (id: string | null) => void
   /** Resolves with any non-fatal parser warnings (see actionableParseWarnings)
    *  from the imported file — empty for the overwhelming majority of files. */
   addLayer: (file: File) => Promise<{ warnings: string[] }>
@@ -306,7 +337,11 @@ interface AppState {
    *  sequential addLayerToDesign calls to rebuild `layers[]` with fresh,
    *  freshly-computed parsedLayer/svgData. `contentByLayerFileId` supplies
    *  each file's text content, keyed by `CamJobFileMeta.layerFileId`. */
-  loadCamJobSnapshot: (snapshot: CamJobSnapshot, contentByLayerFileId: Record<string, string>) => Promise<void>
+  /** Resolves with the fileName of every layer whose content wasn't
+   *  available to hydrate (missing from `contentByLayerFileId`) — a
+   *  restored job that's missing layers used to load "successfully" with
+   *  no indication anything was wrong; this lets the caller say so. */
+  loadCamJobSnapshot: (snapshot: CamJobSnapshot, contentByLayerFileId: Record<string, string>) => Promise<{ missingFiles: string[] }>
 
   // Panel config
   panelConfig: PanelConfig
@@ -357,6 +392,16 @@ interface AppState {
 
   // DFM
   dfmReport: DfmReport | null
+  /** The (active-design-scoped) layer count DFM last ran against — DfmReport
+   *  itself carries no such field, and dfmReport is NOT cleared by
+   *  addLayer/removeLayer, so a report can legitimately predate the current
+   *  layer set. Used by cam-job-health.ts's staleness check at save time.
+   *  Only populated in single-design mode (null in multi) — DFM always
+   *  scopes to just the active design, so comparing it against a
+   *  multi-design job's total saved file count would produce false
+   *  staleness positives for every multi-design job that's ever run a
+   *  check, which is worse than not detecting staleness there at all. */
+  dfmReportLayerCount: number | null
   dfmRunning: boolean
   dfmTemplateId: string | null
   setDfmTemplateId: (id: string | null) => void
@@ -443,6 +488,33 @@ interface AppState {
   stencilGenerating: boolean
   generateStencilFilesAction: () => Promise<void>
   clearStencilFiles: () => void
+
+  // Film Plot (PDF) export config (see src/lib/film-types.ts,
+  // src/lib/film/). Unlike stencilFiles, films are generated at EXPORT
+  // TIME (inside exportPanelizedGerbers itself) and never stored on the
+  // panel — so there is no filmFiles/filmGenerating slice here and, unlike
+  // every other generated-artifact config in this store, NO invalidation
+  // sites to touch when panel/layers/pcbName change: a stale film can never
+  // sit downloadable, because there's nothing to go stale — each export
+  // regenerates from that export's own live Gerber strings. Do not "fix"
+  // this by adding invalidation; it would be a no-op at best.
+  filmConfig: FilmConfig
+  /** Shallow merge over the scalar fields (enabled/marginMm) — `layers` is
+   *  the one nested field and must go through `setFilmLayerSetting`
+   *  instead, same FLAT-config discipline as StencilConfig. */
+  updateFilmConfig: (updates: Partial<Omit<FilmConfig, 'layers'>>) => void
+  /** Patches ONE layer's include/polarity setting, keyed by its
+   *  descriptiveName (e.g. "Bottom_Copper") — a shallow merge over the
+   *  whole `layers` map would replace every other layer's setting.
+   *  `layerType` seeds the entry from `defaultFilmLayerSetting` on first
+   *  touch (not a blank `{include:false,polarity:null}`) — without this, a
+   *  polarity-only edit on a layer that's never had its OWN include toggle
+   *  clicked (copper/mask/silk default to include:true, displayed that way
+   *  by the UI's own defaultFilmLayerSetting fallback) would silently flip
+   *  that layer's include to false the moment a partial `{polarity}` patch
+   *  merged against a blank seed instead of the real default. */
+  setFilmLayerSetting: (descriptiveName: string, layerType: string, patch: Partial<FilmLayerSetting>) => void
+  resetFilmConfig: () => void
 
   // Panelization templates (src/lib/panel-template/) — reusable "shop policy
   // and machine facts" bundles across panelConfig/outputFormat/routingConfig/
@@ -1115,7 +1187,11 @@ async function importLayerFile(get: () => AppState, set: (fn: (s: AppState) => P
     void get().rebuildBoardView()
     // NOTE: Panel computation is now only triggered when user clicks "Panel Config" button
     // Not automatically when layers are added
-    return { warnings: actionableParseWarnings(finalParsed) }
+    const fileWarnings = actionableParseWarnings(finalParsed)
+    if (fileWarnings.length > 0) {
+      set(state => ({ importWarnings: [...state.importWarnings, `${fileName}: ${fileWarnings.join('; ')}`] }))
+    }
+    return { warnings: fileWarnings }
   } catch (e) {
     console.error('Failed to parse Gerber file:', e)
     throw e
@@ -1125,6 +1201,12 @@ async function importLayerFile(get: () => AppState, set: (fn: (s: AppState) => P
 export const useAppStore = create<AppState>((set, get) => ({
   // Layers
   layers: [],
+  importWarnings: [],
+  lastExport: null,
+  recordExport: (dcodeWarnings, filmWarnings) =>
+    set({ lastExport: { dcode: dcodeWarnings, film: filmWarnings, at: new Date().toISOString() } }),
+  lastSavedJobId: null,
+  setLastSavedJobId: (id) => set({ lastSavedJobId: id }),
 
   designs: [],
   activeDesignId: null,
@@ -1344,7 +1426,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     // longer loaded would be misleading, and a stale route would still export.
     set({
       layers: [], designs: [], activeDesignId: null, panelResult: null, boardView: null, boardViewsByDesign: {},
-      dfmReport: null, dfmFocus: null,
+      importWarnings: [], lastExport: null, lastSavedJobId: null,
+      dfmReport: null, dfmReportLayerCount: null, dfmFocus: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
       stencilFiles: null, stencilPreview: null,
@@ -1376,11 +1459,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       gcodeContext: snapshot.gcodeContext,
       panelArrayConfig: snapshot.panelArrayConfig,
       stencilConfig: snapshot.stencilConfig,
+      // Brand-new field — every already-saved CamJob predates it, so fall
+      // back to the default rather than restoring `undefined` into state.
+      filmConfig: snapshot.filmConfig ?? { ...DEFAULT_FILM_CONFIG, layers: {} },
       panelTemplateId: snapshot.panelTemplateId,
       showGrid: snapshot.showGrid,
       showCrosshair: snapshot.showCrosshair,
       layers: [], panelResult: null, boardView: null, boardViewsByDesign: {},
-      dfmReport: null, dfmFocus: null,
+      importWarnings: [], lastExport: null, lastSavedJobId: null,
+      dfmReport: null, dfmReportLayerCount: null, dfmFocus: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
       stencilFiles: null, stencilPreview: null,
@@ -1393,9 +1480,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     // saved color/visible/opacity back on (addLayerToDesign always assigns
     // fresh defaults, which would otherwise silently discard the user's
     // manual per-layer edits from save time).
+    const missingFiles: string[] = []
     for (const meta of snapshot.files) {
       const content = contentByLayerFileId[meta.layerFileId]
-      if (content === undefined) continue
+      if (content === undefined) {
+        missingFiles.push(meta.fileName)
+        continue
+      }
       const file = new File([content], meta.fileName)
       await get().addLayerToDesign(file, meta.designId)
       const current = get().layers
@@ -1408,6 +1499,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         }))
       }
     }
+    return { missingFiles }
   },
 
   rotateAllLayers: async (direction: 'left' | 'right') => {
@@ -1767,6 +1859,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       result.errors.push(`Failed to read zip file: ${errMsg}`)
     }
 
+    if (result.warnings.length > 0) {
+      set(state => ({ importWarnings: [...state.importWarnings, ...result.warnings] }))
+    }
     return result
   },
 
@@ -2005,6 +2100,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       result.errors.push(`Failed to read RAR file: ${errMsg}`)
     }
 
+    if (result.warnings.length > 0) {
+      set(state => ({ importWarnings: [...state.importWarnings, ...result.warnings] }))
+    }
     return result
   },
 
@@ -2523,6 +2621,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   // never automatically on layer/config change, matching how panel computation
   // is only triggered by "Create Panel".
   dfmReport: null,
+  dfmReportLayerCount: null,
   dfmRunning: false,
   dfmTemplateId: null,
   setDfmTemplateId: (id) => set({ dfmTemplateId: id }),
@@ -2532,7 +2631,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setDfmFocus: (p) => set({ dfmFocus: p }),
 
   runDfmCheck: async (rules) => {
-    const { layers, panelResult, dfmContext, activeDesignId } = get()
+    const { layers, panelResult, dfmContext, activeDesignId, camMode } = get()
     // Scoped to the active design — DFM checks one board at a time, never an
     // aggregate across every design loaded into the tool.
     const designLayers = activeDesignId ? layers.filter(l => l.designId === activeDesignId) : layers
@@ -2569,12 +2668,19 @@ export const useAppStore = create<AppState>((set, get) => ({
           })
         )
       )
-      set({ dfmReport: runDfm(input, context, rules, { spacing }), dfmFocus: null })
+      // See dfmReportLayerCount's own doc comment: only meaningful in single
+      // mode, where DFM's active-design scope and a saved job's full file
+      // list are the same set.
+      set({
+        dfmReport: runDfm(input, context, rules, { spacing }),
+        dfmReportLayerCount: camMode === 'single' ? designLayers.length : null,
+        dfmFocus: null,
+      })
     } finally {
       set({ dfmRunning: false })
     }
   },
-  clearDfmReport: () => set({ dfmReport: null, dfmFocus: null }),
+  clearDfmReport: () => set({ dfmReport: null, dfmReportLayerCount: null, dfmFocus: null }),
 
   // Routing
   routingConfig: { ...DEFAULT_ROUTING_CONFIG },
@@ -3088,6 +3194,23 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   clearStencilFiles: () => set({ stencilFiles: null, stencilPreview: null }),
+
+  // Film Plot (PDF) export config — see the interface field's own comment
+  // for why there is no filmFiles slice / invalidation list here.
+  filmConfig: { ...DEFAULT_FILM_CONFIG, layers: {} },
+  updateFilmConfig: (updates) =>
+    set(state => ({ filmConfig: { ...state.filmConfig, ...updates } })),
+  setFilmLayerSetting: (descriptiveName, layerType, patch) =>
+    set(state => {
+      const current = state.filmConfig.layers[descriptiveName] ?? defaultFilmLayerSetting(layerType)
+      return {
+        filmConfig: {
+          ...state.filmConfig,
+          layers: { ...state.filmConfig.layers, [descriptiveName]: { ...current, ...patch } },
+        },
+      }
+    }),
+  resetFilmConfig: () => set({ filmConfig: { ...DEFAULT_FILM_CONFIG, layers: {} } }),
 
   // Panelization templates
   panelTemplateId: null,

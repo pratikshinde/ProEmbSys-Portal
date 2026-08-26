@@ -6,6 +6,8 @@ import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import { toast } from "@/hooks/use-toast"
 import AddressList from "./address-list"
+import ContactList from "../contact-list"
+import type { ContactRecord } from "../contact-list"
 
 export interface AddressRecord {
   id: string
@@ -25,15 +27,20 @@ export default function AccountClient({
   initialName,
   email,
   initialAddresses,
+  initialContacts,
+  isStaff,
 }: {
   initialName: string
   email: string
   initialAddresses: AddressRecord[]
+  initialContacts: ContactRecord[]
+  isStaff: boolean
 }) {
   const [name, setName] = useState(initialName)
   const [savedName, setSavedName] = useState(initialName)
   const [savingName, setSavingName] = useState(false)
   const [addresses, setAddresses] = useState(initialAddresses)
+  const [contacts, setContacts] = useState(initialContacts)
 
   async function saveName() {
     if (!name.trim() || name === savedName) return
@@ -81,6 +88,8 @@ export default function AccountClient({
       <AddressList type="BILLING" title="Billing Addresses" addresses={billing} onChange={(next) => updateType("BILLING", next)} />
 
       <AddressList type="DELIVERY" title="Delivery Addresses" addresses={delivery} onChange={(next) => updateType("DELIVERY", next)} />
+
+      <ContactList contacts={contacts} isStaff={isStaff} onChange={setContacts} />
     </div>
   )
 }

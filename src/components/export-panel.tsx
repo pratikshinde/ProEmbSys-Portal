@@ -20,13 +20,16 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { FileText, Download, Package, Settings2, RotateCcw, AlertTriangle, Wrench, Save, FolderOpen, Trash2 } from 'lucide-react'
-import { exportPanelizedGerbers } from '@/lib/gerber-exporter'
+import { exportPanelizedGerbers, generateDescriptiveLayerName } from '@/lib/gerber-exporter'
 import { LayerFile } from '@/lib/gerber-exporter'
 import { DrillFormatPreset, DRILL_FORMAT_PRESETS, DrillCamCompatibility } from '@/lib/panelization-engine'
 import { getMirroredLayers } from '@/lib/design-mirror'
 import { toast } from '@/hooks/use-toast'
 import type { CamJobFileMeta, CamJobSnapshot } from '@/lib/store'
 import { loadCamJobById } from '@/lib/load-cam-job'
+import { renderFilmPdfs } from '@/lib/gerber-svg'
+import { defaultFilmLayerSetting } from '@/lib/film-types'
+import FilmExportCard from './film-export-card'
 
 interface CamJobListItem {
   id: string
@@ -38,6 +41,12 @@ interface CamJobListItem {
 export default function ExportPanel() {
   const panelInfo = useAppStore(s => s.panelInfo)
   const updatePanelInfo = useAppStore(s => s.updatePanelInfo)
+  const recordExport = useAppStore(s => s.recordExport)
+  const setLastSavedJobId = useAppStore(s => s.setLastSavedJobId)
+  const dfmReport = useAppStore(s => s.dfmReport)
+  const dfmReportLayerCount = useAppStore(s => s.dfmReportLayerCount)
+  const importWarnings = useAppStore(s => s.importWarnings)
+  const lastExport = useAppStore(s => s.lastExport)
   const panelResult = useAppStore(s => s.panelResult)
   const panelConfig = useAppStore(s => s.panelConfig)
   const updatePanelConfig = useAppStore(s => s.updatePanelConfig)
@@ -84,6 +93,7 @@ export default function ExportPanel() {
   const gcodeContext = useAppStore(s => s.gcodeContext)
   const panelArrayConfig = useAppStore(s => s.panelArrayConfig)
   const stencilConfig = useAppStore(s => s.stencilConfig)
+  const filmConfig = useAppStore(s => s.filmConfig)
   const panelTemplateId = useAppStore(s => s.panelTemplateId)
   const showGrid = useAppStore(s => s.showGrid)
   const showCrosshair = useAppStore(s => s.showCrosshair)
@@ -102,7 +112,13 @@ export default function ExportPanel() {
     setJobList(null)
     try {
       const res = await fetch('/api/cam-jobs')
-      setJobList(res.ok ? await res.json() : [])
+      // GET /api/cam-jobs now returns { jobs, total } (see the perf-fix
+      // rewrite in src/app/api/cam-jobs/route.ts — the old bare-array
+      // response shipped every job's full config JSON with no select/
+      // pagination). Unwrap here rather than changing this dialog's own
+      // CamJobListItem shape, which only needs id/name/revision/updatedAt.
+      const data = res.ok ? await res.json() : { jobs: [] }
+      setJobList(data.jobs ?? [])
     } catch {
       setJobList([])
     }
@@ -114,7 +130,15 @@ export default function ExportPanel() {
     try {
       const result = await loadCamJobById(jobId)
       if (result.ok) {
-        toast({ title: 'Job loaded', description: result.name })
+        if (result.missingFiles.length > 0) {
+          toast({
+            title: 'Job loaded with missing layers',
+            description: `${result.name} — could not restore: ${result.missingFiles.join(', ')}`,
+            variant: 'destructive',
+          })
+        } else {
+          toast({ title: 'Job loaded', description: result.name })
+        }
         setLoadDialogOpen(false)
       } else {
         toast({ title: 'Could not load job', description: result.error })
@@ -159,12 +183,30 @@ export default function ExportPanel() {
         camMode, activeTab, designs, activeDesignId: activeDesignId2, materialSizeMm,
         panelConfig, panelInfo, outputFormat, targetUnit, boardViewSide, viewMode, boardColor,
         dfmTemplateId, dfmContext, routingConfig, gcodeContext, panelArrayConfig, stencilConfig,
-        panelTemplateId, showGrid, showCrosshair, files,
+        filmConfig, panelTemplateId, showGrid, showCrosshair, files,
+      }
+
+      // Health, captured once here from live store state at the moment of
+      // save — deliberately NOT part of `snapshot`/`config` (see the
+      // CamJob model's own comment on why status/health are columns, not
+      // JSON). dfmRanAt/exportRanAt stay null when that step never ran
+      // this session — see cam-job-health.ts's "never checked != clean"
+      // rule, which depends on this distinction surviving to the DB.
+      const health = {
+        dfmRanAt: dfmReport?.ranAt ?? null,
+        dfmErrors: dfmReport?.summary.errors ?? null,
+        dfmWarnings: dfmReport?.summary.warnings ?? null,
+        dfmInfos: dfmReport?.summary.infos ?? null,
+        dfmLayerCount: dfmReport ? dfmReportLayerCount : null,
+        exportRanAt: lastExport?.at ?? null,
+        exportWarnings: lastExport ? lastExport.dcode.length + lastExport.film.length : null,
+        importWarnings: importWarnings.length,
       }
 
       const formData = new FormData()
       formData.set('name', jobName.trim())
       formData.set('config', JSON.stringify(snapshot))
+      formData.set('health', JSON.stringify(health))
       for (const l of allLayers) {
         formData.set(`file_${l.id}`, new File([l.originalContent], l.fileName))
       }
@@ -180,6 +222,7 @@ export default function ExportPanel() {
       }
       toast({ title: 'Job saved', description: jobName.trim() })
       setSaveDialogOpen(false)
+      setLastSavedJobId(data.id)
     } catch (err) {
       toast({ title: 'Could not save job', description: err instanceof Error ? err.message : 'Please try again.' })
     } finally {
@@ -219,17 +262,48 @@ export default function ExportPanel() {
             drillContent: panelArrayFiles.drillContent,
           }
         : null
-      const { dcodeWarnings } = await exportPanelizedGerbers(layerFiles, panelResult, panelConfig, panelInfo, outputFormat, routingResult, metaPanel)
+
+      // Resolve filmConfig.layers into a FULLY populated map (every real
+      // layer -> its stored setting, or defaultFilmLayerSetting for one
+      // never touched) right before export — the store's own map stays
+      // sparse (only explicitly-touched layers), same "resolve at the
+      // point of use" pattern getMirroredLayers already established, and
+      // it means FilmExportCard's row list (built the identical way) can
+      // never silently disagree with what actually gets rendered.
+      const filmLayers = filmConfig.enabled
+        ? (() => {
+            const resolved: typeof filmConfig.layers = {}
+            for (const l of mirroredLayers) {
+              if (l.type === 'drill') continue
+              const descriptiveName = generateDescriptiveLayerName({
+                name: l.name, fileName: '', content: '', parsedLayer: null, type: l.type, side: l.side,
+              })
+              if (resolved[descriptiveName]) continue
+              resolved[descriptiveName] = filmConfig.layers[descriptiveName] ?? defaultFilmLayerSetting(l.type)
+            }
+            return resolved
+          })()
+        : {}
+      const film = filmConfig.enabled
+        ? { config: { ...filmConfig, layers: filmLayers }, render: renderFilmPdfs }
+        : null
+
+      const { dcodeWarnings, filmWarnings } = await exportPanelizedGerbers(
+        layerFiles, panelResult, panelConfig, panelInfo, outputFormat, routingResult, metaPanel, film
+      )
+      // Captured for cam-job-health.ts — see recordExport's own doc comment.
+      recordExport(dcodeWarnings, filmWarnings)
 
       // Surface aperture/D-code export problems (undefined macro references,
       // zero-size apertures) directly — these are exactly the class of bug
       // that shipped invisible pads in a real customer export (see the
       // octagon-macro unit-conversion fix) before anyone noticed in a
-      // third-party viewer. mirrorWarnings share the same toast when both
-      // fire, since TOAST_LIMIT=1 would otherwise silently drop one.
-      const allWarnings = [...mirrorWarnings, ...dcodeWarnings]
+      // third-party viewer. mirrorWarnings/filmWarnings share the same
+      // toast when several fire, since TOAST_LIMIT=1 would otherwise
+      // silently drop all but the last.
+      const allWarnings = [...mirrorWarnings, ...dcodeWarnings, ...filmWarnings]
       if (allWarnings.length > 0) {
-        console.warn('[Export] D-code/aperture warnings:', dcodeWarnings)
+        console.warn('[Export] warnings:', { dcodeWarnings, filmWarnings })
         toast({
           title: `Exported with ${allWarnings.length} warning${allWarnings.length !== 1 ? 's' : ''}`,
           description: allWarnings.slice(0, 3).join(' · ') + (allWarnings.length > 3 ? ` · +${allWarnings.length - 3} more — see console` : ''),
@@ -751,6 +825,10 @@ export default function ExportPanel() {
 
         <Separator className="bg-[#1a3a5c]" />
 
+        <FilmExportCard layers={exportLayers} />
+
+        <Separator className="bg-[#1a3a5c]" />
+
         {/* Export buttons */}
         <div className="space-y-2">
           <Button
@@ -764,6 +842,7 @@ export default function ExportPanel() {
           <p className="text-[10px] text-[#4a6f94] text-center">
             {formatLabel}, {outputFormat.unit}, {outputFormat.zeroOmission} zero omit, {outputFormat.notation} · includes outline, fiducials & README
             {panelArrayFiles && ' · includes Meta-Panelization/ (multi-panel-array Gerber + Excellon)'}
+            {filmConfig.enabled && ' · includes Film/ (photo-plot film PDFs)'}
           </p>
           <div className="grid grid-cols-2 gap-2">
             <Button

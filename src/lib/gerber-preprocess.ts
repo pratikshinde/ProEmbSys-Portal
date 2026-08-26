@@ -146,3 +146,32 @@ export function scaleBoardShapeToMm(boardShape: any): void {
   for (const path of boardShape.openPaths ?? []) scaleImageGraphic(path, MM_PER_INCH)
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
+
+/**
+ * `generateFSCommand` (panelization-engine.ts) emits `%FS<zero><notation>...`
+ * where `<zero>` is `L`/`T` for leading/trailing zero omission, but is the
+ * EMPTY STRING when the user's export config picks `zeroOmission: 'none'` —
+ * producing e.g. `%FSAX46Y46*%` with no zero-suppression character at all.
+ * `formatCoordinate` (same file) has no `'none'` branch, though: its `else`
+ * arm unconditionally strips TRAILING zeros for anything that isn't
+ * `'leading'`. So the coordinate VALUES in the body are trailing-suppressed
+ * while the header declares no suppression — self-contradictory Gerber.
+ *
+ * tracespace's own zero-suppression sniffer (`getPlotOptions` in
+ * @tracespace/plotter) falls back to guessing from the first body
+ * coordinate when the header doesn't declare one, and frequently guesses
+ * LEADING — the wrong one — which decodes every coordinate in the file by
+ * roughly 10^(digit count) too small or too large. A film generated from
+ * that misparse would be scrap at the wrong scale, not just wrong-looking.
+ *
+ * This is a real non-conformance in the exported Gerber itself (out of
+ * scope to fix here — a fab-facing task on its own), but the film pipeline
+ * can and must route around it deterministically, since it knows exactly
+ * what the emitter actually did: rewrite a zero-suppression-less `%FS` to
+ * declare `T` (trailing), matching `formatCoordinate`'s real behavior. A
+ * no-op for the overwhelming majority of exports, which already declare
+ * `L` or `T` explicitly.
+ */
+export function normalizeFilmGerberZeroSuppression(content: string): string {
+  return content.replace(/%FS([AI])(X\d\dY\d\d)\*%/, '%FST$1$2*%')
+}

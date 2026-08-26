@@ -12,8 +12,9 @@ import DfmPanel from './dfm-panel';
 import RoutingPanel from './routing-panel';
 import GcodePanel from './gcode-panel';
 import StencilPanel from './stencil-panel';
+import SharingPanel from './sharing-panel';
 import { Button } from './ui/button';
-import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck, Scissors, Terminal, Boxes, Square, Stamp } from 'lucide-react';
+import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck, Scissors, Terminal, Boxes, Square, Stamp, Share2 } from 'lucide-react';
 import { useAppStore } from '../lib/store';
 import { loadCamJobById } from '../lib/load-cam-job';
 import JSZip from 'jszip';
@@ -1869,8 +1870,19 @@ export function PanelizationPage() {
     if (layers.length > 0 && !confirm('Load this saved job? Your current unsaved work will be replaced.')) return;
     (async () => {
       const result = await loadCamJobById(loadId);
-      if (result.ok) toast({ title: 'Job loaded', description: result.name });
-      else toast({ title: 'Could not load job', description: result.error });
+      if (result.ok) {
+        if (result.missingFiles.length > 0) {
+          toast({
+            title: 'Job loaded with missing layers',
+            description: `${result.name} — could not restore: ${result.missingFiles.join(', ')}`,
+            variant: 'destructive',
+          });
+        } else {
+          toast({ title: 'Job loaded', description: result.name });
+        }
+      } else {
+        toast({ title: 'Could not load job', description: result.error });
+      }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1905,6 +1917,7 @@ export function PanelizationPage() {
             { key: 'routing' as const, icon: Scissors, label: 'Routing' },
             { key: 'gcode' as const, icon: Terminal, label: 'G-Code' },
             { key: 'stencil' as const, icon: Stamp, label: 'Stencil' },
+            { key: 'sharing' as const, icon: Share2, label: 'Sharing' },
           ].filter(t => camMode === 'multi' || t.key !== 'designs').map(({ key, icon: Icon, label }) => (
             <button
               key={key}
@@ -1982,6 +1995,7 @@ export function PanelizationPage() {
                 {activeTab === 'gcode' && <GcodePanel />}
                 {activeTab === 'stencil' && <StencilPanel />}
                 {activeTab === 'export' && <ExportPanel />}
+                {activeTab === 'sharing' && <SharingPanel />}
               </div>
             </div>
             {/* Drag handle */}

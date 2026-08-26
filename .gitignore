@@ -14,3 +14,4 @@ node_modules/
 .playwright-mcp
 *.tsbuildinfo
 /uploads/
+graphify-out/

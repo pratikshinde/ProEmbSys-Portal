@@ -1,19 +1,26 @@
 import { NextResponse } from "next/server"
-import { Prisma } from "@prisma/client"
+import { Prisma, CamJobStatus } from "@prisma/client"
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import { saveCamJobFile, deleteCamJobDir, MAX_TOTAL_SIZE_BYTES } from "@/lib/cam-job-files"
+import { listCamJobSummaries } from "@/lib/cam-job-summary"
+import type { CamJobHealthLevel } from "@/lib/cam-job-health"
 import type { CamJobSnapshot } from "@/lib/store"
 
-export async function GET() {
+export async function GET(req: Request) {
   const session = await auth()
   if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
-  const jobs = await db.camJob.findMany({
-    where: { userId: session.user.id },
-    orderBy: { updatedAt: "desc" },
+  const url = new URL(req.url)
+  const result = await listCamJobSummaries({
+    userId: session.user.id,
+    status: url.searchParams.get("status"),
+    health: url.searchParams.get("health") as CamJobHealthLevel | null,
+    q: url.searchParams.get("q"),
+    skip: parseInt(url.searchParams.get("skip") ?? "0", 10) || 0,
+    take: parseInt(url.searchParams.get("take") ?? "20", 10) || 20,
   })
-  return NextResponse.json(jobs)
+  return NextResponse.json(result)
 }
 
 export async function POST(req: Request) {
@@ -42,6 +49,38 @@ export async function POST(req: Request) {
   }
   const revision = typeof config.panelInfo?.revision === "string" ? config.panelInfo.revision.trim() : ""
 
+  // Health counts — sent as ONE JSON field, deliberately separate from
+  // `config` (see cam-job-health.ts / the CamJob model's own comments: what
+  // gets queried needs to be a real column, not buried in the snapshot
+  // blob). Malformed/absent is never a save-blocking error — worst case the
+  // job just saves as "not checked", which is the honest default anyway.
+  let health: Partial<{
+    dfmRanAt: string | null; dfmErrors: number | null; dfmWarnings: number | null; dfmInfos: number | null
+    dfmLayerCount: number | null; exportRanAt: string | null; exportWarnings: number | null; importWarnings: number
+  }> = {}
+  const healthRaw = formData.get("health")
+  if (typeof healthRaw === "string") {
+    try {
+      health = JSON.parse(healthRaw)
+    } catch {
+      health = {}
+    }
+  }
+
+  // Optional order link — validated against ownership so a job can never
+  // claim to belong to someone else's order.
+  const orderIdRaw = formData.get("orderId")
+  const orderId = typeof orderIdRaw === "string" && orderIdRaw.trim() ? orderIdRaw.trim() : null
+  if (orderId) {
+    const order = await db.order.findUnique({ where: { id: orderId }, select: { userId: true } })
+    if (!order || order.userId !== userId) {
+      return NextResponse.json({ error: "That order could not be found." }, { status: 400 })
+    }
+  }
+
+  const statusRaw = formData.get("status")
+  const status = typeof statusRaw === "string" && statusRaw in CamJobStatus ? (statusRaw as CamJobStatus) : undefined
+
   // Collect the file parts (keyed "file_<layerFileId>", matching config.files
   // entries by layerFileId) and enforce the total-size cap before writing
   // anything to disk.
@@ -67,6 +106,16 @@ export async function POST(req: Request) {
         name: name.trim(),
         revision,
         config: config as unknown as Prisma.InputJsonValue,
+        ...(status ? { status } : {}),
+        orderId,
+        dfmRanAt: health.dfmRanAt ? new Date(health.dfmRanAt) : null,
+        dfmErrors: health.dfmErrors ?? null,
+        dfmWarnings: health.dfmWarnings ?? null,
+        dfmInfos: health.dfmInfos ?? null,
+        dfmLayerCount: health.dfmLayerCount ?? null,
+        exportRanAt: health.exportRanAt ? new Date(health.exportRanAt) : null,
+        exportWarnings: health.exportWarnings ?? null,
+        importWarnings: health.importWarnings ?? 0,
       },
     })
   } catch (err) {
