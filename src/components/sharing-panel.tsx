@@ -175,11 +175,17 @@ export default function SharingPanel() {
         return
       }
 
-      const sentCount = (data.recipients ?? []).filter((r: { sent: boolean }) => r.sent).length
-      const failedCount = (data.recipients ?? []).length - sentCount
+      const recipientResults: { sent: boolean; dryRun?: boolean }[] = data.recipients ?? []
+      const sentCount = recipientResults.filter((r) => r.sent).length
+      const failedCount = recipientResults.length - sentCount
+      const anyDryRun = recipientResults.some((r) => r.dryRun)
       toast({
         title: 'Share sent',
-        description: failedCount > 0 ? `${sentCount} sent, ${failedCount} failed to email (links still work).` : `Sent to ${sentCount} recipient${sentCount === 1 ? '' : 's'}.`,
+        description: failedCount > 0
+          ? `${sentCount} sent, ${failedCount} failed to email (links still work).`
+          : anyDryRun
+          ? `Bundle saved — SHARE_EMAIL_DRY_RUN is set, so nothing was actually emailed to ${sentCount} recipient${sentCount === 1 ? '' : 's'}. Check server logs for the rendered file.`
+          : `Sent to ${sentCount} recipient${sentCount === 1 ? '' : 's'}.`,
       })
       setMessage('')
       setSelectedIds([])
@@ -205,7 +211,10 @@ export default function SharingPanel() {
         toast({ title: 'Resend failed', description: data.error ?? 'Please try again.' })
         return
       }
-      toast({ title: 'Resent' })
+      toast({
+        title: 'Resent',
+        description: data.dryRun ? 'SHARE_EMAIL_DRY_RUN is set — nothing was actually emailed; check server logs for the rendered file.' : undefined,
+      })
       refreshHistory()
     } finally {
       setBusyRecipientId(null)

@@ -39,6 +39,14 @@ export interface FilmManifest {
    *  rather than a toast the sender may never read and the recipient never
    *  sees at all. */
   skipped: { layerName: string; reason: string }[]
+  /** The panelized Gerber/drill files riding alongside the PDFs in a SHARE
+   *  bundle (build-bundle.ts) — a film house typically still wants the raw
+   *  Gerbers for reference/calibration, not just the already-rendered
+   *  proofs. Empty for the plain full-panel export's own Film/README.txt
+   *  (that ZIP already lists every file in its own top-level README, so
+   *  repeating the list here would be redundant) — only build-bundle.ts
+   *  populates this. */
+  gerberFiles: string[]
 }
 
 export function buildFilmManifest(opts: {
@@ -86,6 +94,7 @@ export function buildFilmManifest(opts: {
     mirrored: false,
     films,
     skipped,
+    gerberFiles: [],
   }
 }
 
@@ -113,6 +122,11 @@ export function renderFilmReadme(m: FilmManifest): string {
     lines.push('')
     lines.push('--- Requested but NOT included ---')
     for (const s of m.skipped) lines.push(`${s.layerName} — ${s.reason}`)
+  }
+  if (m.gerberFiles.length > 0) {
+    lines.push('')
+    lines.push('--- Panelized Gerbers (included for reference) ---')
+    for (const f of m.gerberFiles) lines.push(f)
   }
   return lines.join('\n') + '\n'
 }
@@ -262,6 +276,7 @@ export const filmManifestSchema = z.object({
     })
   ),
   skipped: z.array(z.object({ layerName: z.string(), reason: z.string() })),
+  gerberFiles: z.array(z.string()),
 }) satisfies z.ZodType<FilmManifest>
 
 export const drillManifestSchema = z.object({

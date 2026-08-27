@@ -19,6 +19,7 @@ import { filterByRole, zipArtifacts, type CamArtifact } from './artifacts'
 import {
   buildDrillManifest,
   buildTestManifest,
+  renderFilmReadme,
   renderDrillReadme,
   renderTestReadme,
   type FilmManifest,
@@ -34,6 +35,23 @@ import type { RoutingResult } from '../routing/types'
 import type { GcodeFile } from '../routing/gcode'
 
 export type ShareBundleKindLiteral = 'FILM' | 'DRILL' | 'TEST'
+
+/** Every share bundle (printing/film, drilling, and bare-board test) ships
+ *  the full panelized Gerber set as its base — a film house wants the raw
+ *  Gerbers for reference/calibration, not just rendered PDFs, and a drill
+ *  shop wants to see the board's own copper/outline for setup/registration,
+ *  not just isolated hole data. Kind-specific extras (film PDFs, route/
+ *  G-code files) are layered on top of this same base rather than each
+ *  kind shipping its own narrow, disjoint slice. */
+function mergeArtifactsByPath(...groups: CamArtifact[][]): CamArtifact[] {
+  const byPath = new Map<string, CamArtifact>()
+  for (const group of groups) {
+    for (const a of group) {
+      if (!byPath.has(a.path)) byPath.set(a.path, a)
+    }
+  }
+  return Array.from(byPath.values())
+}
 
 export interface BuildShareBundleInput {
   kind: ShareBundleKindLiteral
@@ -106,25 +124,43 @@ export async function buildShareBundle(input: BuildShareBundleInput): Promise<Bu
   const warnings = [...mirrorWarnings, ...built.dcodeWarnings, ...built.filmWarnings]
   const baseFileName = `${built.partNumber}_${built.customerName}_${built.version}_${built.dateStr}`
 
+  // The full panelized Gerber set (outline, merged copper/mask/silk,
+  // _Drill.drl) — the 'test' role already means exactly this ("the panel
+  // ZIP minus Film/, Meta-Panelization/, and route"), and it's now the
+  // shared base for every bundle kind, not just TEST. Deliberately excludes
+  // _PINN.drl (tooling/pinning holes are a fab-fixture concern, not
+  // something a printer/driller/test house needs) and route/meta files.
+  const panelizedGerberArtifacts = filterByRole(built.artifacts, 'test')
+
   if (kind === 'FILM') {
     if (!built.filmManifest || built.filmManifest.films.length === 0) {
       return { ok: false, error: 'Film generation produced no files — check the warnings on the Info & Export tab.' }
     }
-    // Already includes Film/README.txt (built.filmManifest's own rendered
-    // text, tagged role 'film' alongside the PDFs) — no separate README
-    // needed here, unlike DRILL/TEST below.
-    const filmArtifacts = filterByRole(built.artifacts, 'film')
+    // Film/README.txt (built.filmManifest's own rendered text) is already
+    // tagged role 'film' alongside the PDFs — no separate README needed
+    // here, unlike DRILL/TEST below.
+    const filmArtifacts = mergeArtifactsByPath(panelizedGerberArtifacts, filterByRole(built.artifacts, 'film'))
+    const manifest = { ...built.filmManifest, gerberFiles: panelizedGerberArtifacts.map((a) => a.path) }
+    // Film/README.txt's own text is rendered from built.filmManifest
+    // (without gerberFiles) up in buildPanelArtifacts — replace it with one
+    // rendered from the enriched manifest so the in-ZIP copy and the email
+    // agree on what's actually in this bundle.
+    const readmeIndex = filmArtifacts.findIndex((a) => a.path === 'Film/README.txt')
+    const enrichedReadme: CamArtifact = { path: 'Film/README.txt', content: renderFilmReadme(manifest), roles: ['panel', 'film'] }
+    if (readmeIndex >= 0) filmArtifacts[readmeIndex] = enrichedReadme
+    else filmArtifacts.push(enrichedReadme)
     const blob = await zipArtifacts(filmArtifacts, 'film_plot')
-    return { ok: true, blob, manifest: built.filmManifest, fileName: `${baseFileName}_Film.zip`, warnings }
+    return { ok: true, blob, manifest, fileName: `${baseFileName}_Film.zip`, warnings }
   }
 
   if (kind === 'DRILL') {
-    // Spans TWO of buildPanelArtifacts's outputs: the panel's own
-    // drill/route files (role 'drill') AND the G-Code tab's .ngc programs
-    // (also tagged 'drill') — see share/artifacts.ts's own header for why
-    // no single existing export ZIP already equals this bundle.
+    // Spans THREE of buildPanelArtifacts's outputs: the panelized Gerber
+    // base, the panel's own drill/route files (role 'drill'), and the
+    // G-Code tab's .ngc programs (also tagged 'drill') — see
+    // share/artifacts.ts's own header for why no single existing export
+    // ZIP already equals this bundle.
     const gcodeArtifacts = filterByRole(buildGcodeArtifacts(gcodeFiles ?? []), 'drill')
-    const drillArtifacts = [...filterByRole(built.artifacts, 'drill'), ...gcodeArtifacts]
+    const drillArtifacts = mergeArtifactsByPath(panelizedGerberArtifacts, filterByRole(built.artifacts, 'drill'), gcodeArtifacts)
     if (drillArtifacts.length === 0) {
       return { ok: false, error: 'This panel has no drill, route, or G-code files to share.' }
     }
@@ -141,10 +177,10 @@ export async function buildShareBundle(input: BuildShareBundleInput): Promise<Bu
     return { ok: true, blob, manifest: drillManifest, fileName: `${baseFileName}_Drill.zip`, warnings }
   }
 
-  // TEST — the panel ZIP minus Film/, Meta-Panelization/, and route files;
+  // TEST (bare-board test / BBT) — the panelized Gerber base as-is;
   // deliberately includes _Drill.drl (a test house needs real holes) but
   // not _PINN.drl (tooling/pinning holes are a fab-fixture concern).
-  const testArtifacts = filterByRole(built.artifacts, 'test')
+  const testArtifacts = panelizedGerberArtifacts
   if (testArtifacts.length === 0) {
     return { ok: false, error: 'This panel has no test-bundle files to share.' }
   }

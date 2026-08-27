@@ -1,4 +1,6 @@
 import { Resend } from "resend"
+import { mkdir, writeFile } from "fs/promises"
+import path from "path"
 
 // Lazily constructed — the Resend SDK throws in its constructor if the key is
 // missing/empty, which breaks Next.js's build-time route analysis (every
@@ -106,7 +108,30 @@ export interface ShareBundleEmailInput {
  * caller's per-recipient try/catch is the actual policy, this function just
  * reports honestly.
  */
-export async function sendShareBundleEmail(input: ShareBundleEmailInput): Promise<{ id: string | null }> {
+/**
+ * Set SHARE_EMAIL_DRY_RUN to skip calling Resend entirely for share emails
+ * — writes the rendered HTML/text to disk instead, so the whole
+ * POST /api/share flow (bundle creation, disk write, DB rows marked sent)
+ * completes successfully without a real Resend account. Exists specifically
+ * because RESEND_API_KEY is a placeholder in most dev setups, and
+ * "API key is invalid" (Resend's own error text, surfaced verbatim via
+ * throwIfFailed) is otherwise the ONLY way to exercise sharing end-to-end
+ * locally. Scoped to share emails only — password reset / staff welcome
+ * keep their existing behavior, since dry-running an auth flow isn't useful
+ * the same way.
+ */
+async function writeDryRunEmail(input: { to: string; subject: string; html: string; text: string }): Promise<string> {
+  const dir = path.join(process.env.UPLOADS_DIR ?? path.join(process.cwd(), "uploads"), "share-dry-run")
+  await mkdir(dir, { recursive: true })
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-")
+  const safeTo = input.to.replace(/[^a-z0-9@._-]/gi, "_")
+  const base = `${stamp}-${safeTo}`
+  await writeFile(path.join(dir, `${base}.html`), `<title>${input.subject}</title>\n${input.html}`, "utf8")
+  await writeFile(path.join(dir, `${base}.txt`), input.text, "utf8")
+  return path.join(dir, `${base}.html`)
+}
+
+export async function sendShareBundleEmail(input: ShareBundleEmailInput): Promise<{ id: string | null; dryRun: boolean }> {
   const kindLabel = SHARE_KIND_LABEL[input.kind]
   const expiresLabel = input.expiresAt.toLocaleDateString("en-IN", {
     year: "numeric",
@@ -137,11 +162,19 @@ export async function sendShareBundleEmail(input: ShareBundleEmailInput): Promis
     <pre style="white-space:pre-wrap;font-family:monospace;font-size:12px;background:#f5f5f5;padding:12px;border-radius:4px;">${escapeHtml(input.manifestText)}</pre>
   `
 
+  const subject = `${kindLabel} — ${input.jobName}`
+
+  if (process.env.SHARE_EMAIL_DRY_RUN) {
+    const filePath = await writeDryRunEmail({ to: input.to, subject, html, text })
+    console.log(`[share] DRY RUN — email to ${input.to} not sent (SHARE_EMAIL_DRY_RUN is set). Rendered to ${filePath}`)
+    return { id: null, dryRun: true }
+  }
+
   const result = await getResendClient().emails.send({
     from: FROM,
     to: input.to,
     replyTo: input.replyTo,
-    subject: `${kindLabel} — ${input.jobName}`,
+    subject,
     text,
     html,
     attachments: input.attachment
@@ -149,5 +182,5 @@ export async function sendShareBundleEmail(input: ShareBundleEmailInput): Promis
       : undefined,
   })
   throwIfFailed(result)
-  return { id: result.data?.id ?? null }
+  return { id: result.data?.id ?? null, dryRun: false }
 }

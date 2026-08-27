@@ -703,6 +703,25 @@ model CamJob {
   // `config` at write time; never read back into the snapshot on load.
   revision String @default("")
 
+  // Denormalized out of `config.panelInfo.customerRef` (trimmed) for the
+  // same reason as `revision` above and the dfm*/export* columns below: the
+  // job library filters AND SORTS on customer, and what's queried has to be
+  // a column, never a path into the `config` blob. Kept in sync at write
+  // time; never read back into the snapshot on load.
+  //
+  // Trimmed is not cosmetic — real production data had " Radius" and
+  // "Radius" as two separate rows for the same customer (leading-space
+  // typo), which is exactly the kind of invisible split a filter dropdown
+  // makes worse, not better. Stored VERBATIM otherwise, including the
+  // untouched store default "Customer Name" — that string is physically
+  // silkscreened onto the panel and baked into export filenames
+  // (gerber-exporter.ts's sanitizeForFilename), so treating it as "no
+  // customer" would misreport a real fabricated artifact. "Never touched
+  // the field" and "deliberately typed Customer Name" are indistinguishable
+  // in stored data, the same class of non-conflation dfmRanAt's own comment
+  // below already establishes for this model.
+  customerRef String @default("")
+
   // User-controlled workflow state — independent of the `dfm*`/`export*`
   // health columns below. Status is "where is this job in MY process";
   // health is "did the last save look OK" — see src/lib/cam-job-health.ts's
@@ -765,6 +784,7 @@ model CamJob {
   // Superset of the old bare @@index([userId]) — every list view sorts by
   // updatedAt desc, so this covers both the old lookup and that sort.
   @@index([userId, updatedAt])
+  @@index([userId, customerRef])
   @@index([orderId])
   @@map("cam_jobs")
 }

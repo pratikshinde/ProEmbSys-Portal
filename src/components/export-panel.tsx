@@ -38,6 +38,30 @@ interface CamJobListItem {
   updatedAt: string
 }
 
+/**
+ * A plausible NEXT revision string, for the Save dialog's one-click fix on
+ * a 409 (name+revision collision) — the common case being "loaded a job,
+ * edited it, clicked Save again without touching Name or Revision", which
+ * always collides with the loaded job's own row since neither field is
+ * auto-bumped on load. Never applied automatically — only offered as a
+ * suggestion the user clicks, matching this tool's "nothing auto-computes"
+ * convention elsewhere.
+ *
+ * Bumps the last numeric segment: "1.0" -> "1.1", "2.9" -> "2.10",
+ * "Rev3" -> "Rev4". Blank starts at "1.0" (the store's own default first
+ * revision). Anything with no trailing digits at all gets ".1" appended
+ * rather than guessing at a numbering scheme it can't infer.
+ */
+function suggestNextRevision(current: string): string {
+  const trimmed = current.trim()
+  if (!trimmed) return '1.0'
+  const dotMatch = trimmed.match(/^(.*\.)(\d+)$/)
+  if (dotMatch) return `${dotMatch[1]}${parseInt(dotMatch[2], 10) + 1}`
+  const trailingIntMatch = trimmed.match(/^(.*?)(\d+)$/)
+  if (trailingIntMatch) return `${trailingIntMatch[1]}${parseInt(trailingIntMatch[2], 10) + 1}`
+  return `${trimmed}.1`
+}
+
 export default function ExportPanel() {
   const panelInfo = useAppStore(s => s.panelInfo)
   const updatePanelInfo = useAppStore(s => s.updatePanelInfo)
@@ -101,6 +125,14 @@ export default function ExportPanel() {
   const [saveDialogOpen, setSaveDialogOpen] = React.useState(false)
   const [jobName, setJobName] = React.useState('')
   const [savingJob, setSavingJob] = React.useState(false)
+  // Persisted in the dialog itself, not just a toast — a user re-clicking
+  // Save after a 409 (the common "loaded a job, edited it, saved again
+  // without touching Name/Revision" case) can fire several failures in a
+  // row, and TOAST_LIMIT=1 means only the LAST one stays visible; a repeat
+  // of the exact same message is easy to read as "nothing happened" rather
+  // than "still colliding". This stays visible until the next save attempt
+  // succeeds or the dialog is reopened.
+  const [saveError, setSaveError] = React.useState<{ description: string; isDuplicate: boolean } | null>(null)
 
   const [loadDialogOpen, setLoadDialogOpen] = React.useState(false)
   const [jobList, setJobList] = React.useState<CamJobListItem[] | null>(null)
@@ -161,13 +193,38 @@ export default function ExportPanel() {
 
   const openSaveDialog = () => {
     setJobName(panelInfo.pcbName || 'Untitled Job')
+    setSaveError(null)
     setSaveDialogOpen(true)
   }
 
-  const handleSaveJob = async () => {
+  // `revisionOverride`, when passed, wins over `panelInfo.revision` for
+  // THIS save only — used by the "Bump revision & retry" button below,
+  // which needs the just-computed suggested revision to actually reach the
+  // server on the very next call. Reading `panelInfo` here instead would
+  // use the value from THIS render's closure, not the store's latest state
+  // — updatePanelInfo() has just run but React hasn't re-rendered yet, so
+  // handleSaveJob would silently re-send the stale, still-colliding
+  // revision and 409 again. This also keeps the store update (which the
+  // caller still makes, so the Revision field / future exports agree)
+  // decoupled from what this particular save actually submits.
+  const handleSaveJob = async (revisionOverride?: string) => {
     if (!jobName.trim() || allLayers.length === 0) return
     setSavingJob(true)
     try {
+      // rawContent, NOT originalContent — originalContent is deliberately
+      // the PRISTINE upload (see gerber-parser.ts/store.ts's own docs:
+      // drill-format reapply, "Align Drill to Board Center", and Rotate
+      // Left/Right all re-derive from originalContent specifically so a
+      // second format guess never compounds on top of a first one) —
+      // but that means originalContent never reflects any of those
+      // in-session edits. rawContent does: every one of those actions
+      // writes its result back into rawContent (and parsedLayer/svgData),
+      // and it's already what handleExport (below) and the live viewer
+      // both treat as this layer's current, authoritative content. Saving
+      // originalContent here silently discarded every such edit — a
+      // reported bug: reapply a drill format, Save Job, reload, and the
+      // format change was gone because the file on disk was still the
+      // untouched original.
       const files: CamJobFileMeta[] = allLayers.map(l => ({
         layerFileId: l.id,
         designId: l.designId,
@@ -177,11 +234,12 @@ export default function ExportPanel() {
         color: l.color,
         visible: l.visible,
         opacity: l.opacity,
-        fileSize: l.originalContent.length,
+        fileSize: l.rawContent.length,
       }))
+      const effectivePanelInfo = revisionOverride !== undefined ? { ...panelInfo, revision: revisionOverride } : panelInfo
       const snapshot: CamJobSnapshot = {
         camMode, activeTab, designs, activeDesignId: activeDesignId2, materialSizeMm,
-        panelConfig, panelInfo, outputFormat, targetUnit, boardViewSide, viewMode, boardColor,
+        panelConfig, panelInfo: effectivePanelInfo, outputFormat, targetUnit, boardViewSide, viewMode, boardColor,
         dfmTemplateId, dfmContext, routingConfig, gcodeContext, panelArrayConfig, stencilConfig,
         filmConfig, panelTemplateId, showGrid, showCrosshair, files,
       }
@@ -208,22 +266,26 @@ export default function ExportPanel() {
       formData.set('config', JSON.stringify(snapshot))
       formData.set('health', JSON.stringify(health))
       for (const l of allLayers) {
-        formData.set(`file_${l.id}`, new File([l.originalContent], l.fileName))
+        formData.set(`file_${l.id}`, new File([l.rawContent], l.fileName))
       }
 
       const res = await fetch('/api/cam-jobs', { method: 'POST', body: formData })
       const data = await res.json()
       if (!res.ok) {
+        const isDuplicate = res.status === 409
+        setSaveError({ description: data.error ?? 'Please try again.', isDuplicate })
         toast({
-          title: res.status === 409 ? 'Duplicate job name + revision' : 'Could not save job',
+          title: isDuplicate ? 'Duplicate job name + revision' : 'Could not save job',
           description: data.error ?? 'Please try again.',
         })
         return
       }
+      setSaveError(null)
       toast({ title: 'Job saved', description: jobName.trim() })
       setSaveDialogOpen(false)
       setLastSavedJobId(data.id)
     } catch (err) {
+      setSaveError({ description: err instanceof Error ? err.message : 'Please try again.', isDuplicate: false })
       toast({ title: 'Could not save job', description: err instanceof Error ? err.message : 'Please try again.' })
     } finally {
       setSavingJob(false)
@@ -887,10 +949,37 @@ export default function ExportPanel() {
               Saved as &ldquo;{jobName.trim() || '…'}&rdquo; · Revision &ldquo;{panelInfo.revision || '(none)'}&rdquo;
               {' — '}must be unique together. Change the job name or the Revision field (Panel Information, below) to save a new version.
             </p>
+            {saveError && (
+              <div className="rounded-md p-2 border bg-red-950/40 border-red-800/40 space-y-1.5">
+                <p className="text-[11px] text-red-300">{saveError.description}</p>
+                {saveError.isDuplicate && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={savingJob}
+                    className="h-6 px-2 text-[10px] border-[#1a3a5c] text-[#94b8d4] hover:text-white hover:bg-[#0f2848]"
+                    onClick={() => {
+                      const next = suggestNextRevision(panelInfo.revision)
+                      // Keeps the store (and thus the Revision field on the
+                      // Info & Export tab, plus export filenames) in sync —
+                      // but handleSaveJob still gets `next` directly, since
+                      // this update won't be visible through the `panelInfo`
+                      // closure until React re-renders (see handleSaveJob's
+                      // own comment on why the override param exists).
+                      updatePanelInfo({ revision: next })
+                      setSaveError(null)
+                      handleSaveJob(next)
+                    }}
+                  >
+                    Bump revision to &ldquo;{suggestNextRevision(panelInfo.revision)}&rdquo; and retry
+                  </Button>
+                )}
+              </div>
+            )}
           </div>
           <DialogFooter>
             <Button
-              onClick={handleSaveJob}
+              onClick={() => handleSaveJob()}
               disabled={!jobName.trim() || savingJob}
               className="bg-[#0ea5e9] hover:bg-[#0ea5e9]/80 text-white"
             >

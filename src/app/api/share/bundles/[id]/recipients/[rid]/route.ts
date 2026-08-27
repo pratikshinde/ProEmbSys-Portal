@@ -74,7 +74,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     )
 
     try {
-      await sendShareBundleEmail({
+      const sendResult = await sendShareBundleEmail({
         to: recipient.email,
         replyTo: senderEmail,
         senderName: session.user.name,
@@ -90,7 +90,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         where: { id: rid },
         data: { sentAt: new Date(), sendError: null, attached: !!attachmentBuffer },
       })
-      return NextResponse.json({ id: updated.id, sentAt: updated.sentAt, sendError: updated.sendError })
+      return NextResponse.json({ id: updated.id, sentAt: updated.sentAt, sendError: updated.sendError, dryRun: sendResult.dryRun })
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : "Send failed."
       await db.shareRecipient.update({ where: { id: rid }, data: { sendError: errorMessage } })

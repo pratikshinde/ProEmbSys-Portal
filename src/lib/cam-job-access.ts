@@ -83,7 +83,10 @@ export interface StaffCamJobRow extends CamJobSummary {
 export async function listStaffVisibleCamJobs(viewerUserId: string, status?: string | null): Promise<StaffCamJobRow[]> {
   const where: Prisma.CamJobWhereInput = {
     ...camJobVisibleWhere(viewerUserId, true),
-    ...(status && status in CamJobStatus ? { status: status as CamJobStatus } : {}),
+    // Object.hasOwn, NOT `in` — see cam-job-summary.ts's identical fix for
+    // why `in` lets the string "constructor" (a real property via the
+    // prototype chain) through into Prisma's enum validation, 500ing.
+    ...(status && Object.hasOwn(CamJobStatus, status) ? { status: status as CamJobStatus } : {}),
   }
   const rows = await db.camJob.findMany({
     where,

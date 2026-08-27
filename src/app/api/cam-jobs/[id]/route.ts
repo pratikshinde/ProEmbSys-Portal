@@ -87,7 +87,12 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
   }
 
   const status = typeof body?.status === "string" ? body.status : undefined
-  if (status !== undefined && !(status in CamJobStatus)) {
+  // Object.hasOwn, NOT `in` — `"constructor" in CamJobStatus` is true (it's
+  // a plain object literal with a real prototype chain), so this guard
+  // previously let `status: "constructor"` through as "valid", which then
+  // threw an unhandled PrismaClientValidationError (a 500) at the update()
+  // call below instead of the intended 400 here.
+  if (status !== undefined && !Object.hasOwn(CamJobStatus, status)) {
     return NextResponse.json({ error: "Invalid status." }, { status: 400 })
   }
 

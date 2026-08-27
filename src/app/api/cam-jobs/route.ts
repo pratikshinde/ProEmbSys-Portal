@@ -4,6 +4,7 @@ import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import { saveCamJobFile, deleteCamJobDir, MAX_TOTAL_SIZE_BYTES } from "@/lib/cam-job-files"
 import { listCamJobSummaries } from "@/lib/cam-job-summary"
+import { parseCamJobFilters, resolveDateWindow } from "@/lib/cam-job-filters"
 import type { CamJobHealthLevel } from "@/lib/cam-job-health"
 import type { CamJobSnapshot } from "@/lib/store"
 
@@ -12,11 +13,18 @@ export async function GET(req: Request) {
   if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
 
   const url = new URL(req.url)
+  const filters = parseCamJobFilters(url.searchParams)
+  const dateWindow = resolveDateWindow(filters)
   const result = await listCamJobSummaries({
     userId: session.user.id,
-    status: url.searchParams.get("status"),
-    health: url.searchParams.get("health") as CamJobHealthLevel | null,
-    q: url.searchParams.get("q"),
+    status: filters.status || undefined,
+    health: (filters.health || undefined) as CamJobHealthLevel | undefined,
+    q: filters.q || undefined,
+    customer: filters.customer || undefined,
+    updatedFrom: dateWindow.gte,
+    updatedBefore: dateWindow.lt,
+    sort: filters.sort,
+    dir: filters.dir,
     skip: parseInt(url.searchParams.get("skip") ?? "0", 10) || 0,
     take: parseInt(url.searchParams.get("take") ?? "20", 10) || 20,
   })
@@ -48,6 +56,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Invalid config: missing files list." }, { status: 400 })
   }
   const revision = typeof config.panelInfo?.revision === "string" ? config.panelInfo.revision.trim() : ""
+  const customerRef = typeof config.panelInfo?.customerRef === "string" ? config.panelInfo.customerRef.trim() : ""
 
   // Health counts — sent as ONE JSON field, deliberately separate from
   // `config` (see cam-job-health.ts / the CamJob model's own comments: what
@@ -79,7 +88,12 @@ export async function POST(req: Request) {
   }
 
   const statusRaw = formData.get("status")
-  const status = typeof statusRaw === "string" && statusRaw in CamJobStatus ? (statusRaw as CamJobStatus) : undefined
+  // Object.hasOwn, NOT `in` — CamJobStatus is a plain object literal with a
+  // real prototype chain, so `"constructor" in CamJobStatus` is true and
+  // would pass a status of "constructor" straight into db.camJob.create(),
+  // throwing an unhandled PrismaClientValidationError (a 500) rather than
+  // silently falling back to the default status as intended.
+  const status = typeof statusRaw === "string" && Object.hasOwn(CamJobStatus, statusRaw) ? (statusRaw as CamJobStatus) : undefined
 
   // Collect the file parts (keyed "file_<layerFileId>", matching config.files
   // entries by layerFileId) and enforce the total-size cap before writing
@@ -105,6 +119,7 @@ export async function POST(req: Request) {
         userId,
         name: name.trim(),
         revision,
+        customerRef,
         config: config as unknown as Prisma.InputJsonValue,
         ...(status ? { status } : {}),
         orderId,

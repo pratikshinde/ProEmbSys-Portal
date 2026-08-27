@@ -1,18 +1,12 @@
 import type { Prisma, PrismaClient } from "@prisma/client"
-
-const IST_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", {
-  timeZone: "Asia/Kolkata",
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-})
+import { istDateString } from "./ist-date"
 
 /** "YYYYMMDD" for the given instant, in India Standard Time — the business
  *  operates out of Bangalore, so "today" for order numbering should follow
- *  IST, not the server's (likely UTC) local time or the client's timezone. */
+ *  IST, not the server's (likely UTC) local time or the client's timezone.
+ *  Built on istDateString (ist-date.ts) — the one shared IST definition. */
 export function istPeriod(date: Date): string {
-  // en-CA locale formats as YYYY-MM-DD; strip the dashes.
-  return IST_DATE_FORMATTER.format(date).replaceAll("-", "")
+  return istDateString(date).replaceAll("-", "")
 }
 
 type PrismaClientOrTx = PrismaClient | Prisma.TransactionClient

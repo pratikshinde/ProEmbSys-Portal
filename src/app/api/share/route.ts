@@ -186,7 +186,7 @@ export async function POST(req: Request) {
   const attachmentBuffer = shouldAttach ? await readShareBundleFile(bundle.id) : null
   const manifestText = renderShareReadme(kind, manifest)
 
-  const results: { recipientId: string; email: string; sent: boolean; error?: string; downloadUrl: string }[] = []
+  const results: { recipientId: string; email: string; sent: boolean; error?: string; downloadUrl: string; dryRun?: boolean }[] = []
 
   // Sequential, never Promise.all — Resend rate-limits sends, and a
   // mid-list failure must be attributable to exactly one recipient rather
@@ -195,7 +195,7 @@ export async function POST(req: Request) {
   for (const r of recipients) {
     const downloadUrl = shareUrl(r.token)
     try {
-      await sendShareBundleEmail({
+      const sendResult = await sendShareBundleEmail({
         to: r.email,
         replyTo: senderEmail,
         senderName: session.user.name,
@@ -211,7 +211,7 @@ export async function POST(req: Request) {
         where: { id: r.id },
         data: { sentAt: new Date(), sendError: null, attached: shouldAttach },
       })
-      results.push({ recipientId: r.id, email: r.email, sent: true, downloadUrl })
+      results.push({ recipientId: r.id, email: r.email, sent: true, downloadUrl, dryRun: sendResult.dryRun })
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : "Send failed."
       await db.shareRecipient.update({ where: { id: r.id }, data: { sendError: errorMessage } })

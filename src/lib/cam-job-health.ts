@@ -51,6 +51,17 @@ export const CAM_JOB_HEALTH_META: Record<CamJobHealthLevel, { label: string; bg:
   errors: { label: "Errors", bg: "rgba(239,68,68,0.15)", text: "#f87171" },
 }
 
+/** Sort rank for the job library's Health column — by SEVERITY, never
+ *  alphabetically (an alphabetical sort would put "Clean" before "Errors").
+ *  Domain fact, not a query-layer one, so it lives beside the meta map
+ *  rather than in cam-job-summary.ts's SORT_SPECS registry. */
+export const HEALTH_SORT_RANK: Record<CamJobHealthLevel, number> = {
+  errors: 0,
+  warnings: 1,
+  unknown: 2,
+  clean: 3,
+}
+
 /**
  * Derive a CamJob's health from its stored counts, in strict precedence
  * order (first match wins — never combine branches):
