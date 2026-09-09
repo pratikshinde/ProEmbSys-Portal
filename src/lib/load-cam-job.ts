@@ -18,6 +18,8 @@ export async function loadCamJobById(jobId: string): Promise<
     name: string
     missingFiles?: string[]
     config: CamJobSnapshot & { files: (CamJobSnapshot['files'][number] & { content: string | null })[] }
+    hadRouting?: boolean
+    hadGcode?: boolean
   } = await res.json()
 
   const contentByLayerFileId: Record<string, string> = {}
@@ -37,5 +39,37 @@ export async function loadCamJobById(jobId: string): Promise<
   // requires a saved job) becomes available immediately after loading one,
   // not only after a fresh Save.
   useAppStore.getState().setLastSavedJobId(jobId)
+
+  // Restore the computed view the job was actually SAVED in, rather than
+  // leaving the tool back at "click Create Panel" — loadCamJobSnapshot
+  // deliberately nulls panelResult/routingResult/gcodeFiles for a fresh
+  // import (nothing to recompute yet), but a reload has everything it needs
+  // already sitting in the just-restored config, so there's no reason to
+  // make the user re-click three buttons to see what they explicitly saved.
+  //
+  // computePanelResult() always runs — it's synchronous, cheap (the same
+  // call "Create Panel" makes on click), and handles both camMode branches.
+  // Routing/G-code are recomputed only when this job actually had them
+  // generated as of its last save (hadRouting/hadGcode, from
+  // CamJob.routingGeneratedAt/gcodeGeneratedAt) — most jobs never touch
+  // those tabs, and routing (contour tracing especially) isn't free enough
+  // to run blindly on every load. Both recomputations are deterministic —
+  // the exact same saved config/layers that produced the original result —
+  // so this is a recompute, not a guess; only the TRIGGER moved, from "user
+  // click" to "successful load of a job that had this before".
+  if (allMissing.length === 0) {
+    useAppStore.getState().computePanelResult()
+    if (data.hadRouting && useAppStore.getState().panelResult) {
+      try {
+        await useAppStore.getState().generateRouting()
+      } catch (err) {
+        console.warn('[loadCamJobById] routing regeneration failed on load:', err)
+      }
+      if (data.hadGcode && useAppStore.getState().routingResult) {
+        useAppStore.getState().generateGcodeFilesAction()
+      }
+    }
+  }
+
   return { ok: true, name: data.name, missingFiles: allMissing }
 }

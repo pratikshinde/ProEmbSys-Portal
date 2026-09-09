@@ -42,8 +42,20 @@ export interface CamJobLibraryRow {
   designCount: number
   layerCount: number
   health: { level: CamJobHealthLevel; label: string; reasons: string[] }
+  panelWidthMm: number | null
+  panelHeightMm: number | null
+  pcbWidthMm: number | null
+  pcbHeightMm: number | null
   createdAt: string
   updatedAt: string
+}
+
+/** "110×160mm", or null if either dimension is missing (never panelized as
+ *  of the last save). One decimal place — these are millimeters, not the
+ *  4-6 digit Gerber coordinate precision. */
+function formatDimensions(widthMm: number | null, heightMm: number | null): string | null {
+  if (widthMm == null || heightMm == null) return null
+  return `${widthMm.toFixed(1)}×${heightMm.toFixed(1)}mm`
 }
 
 const STATUS_FILTERS: { key: string; label: string }[] = [
@@ -346,6 +358,20 @@ export default function CamJobsLibrary({
                         <div className="text-xs text-muted-foreground">
                           {job.camMode === "multi" ? "Multi-Design" : "Single Design"} · {job.designCount} design
                           {job.designCount === 1 ? "" : "s"} · {job.layerCount} layer{job.layerCount === 1 ? "" : "s"}
+                          {(() => {
+                            const panelDim = formatDimensions(job.panelWidthMm, job.panelHeightMm)
+                            if (!panelDim) return null
+                            // A multi-design panel has no single "the PCB" size — its
+                            // design count above already says how many boards share it,
+                            // so only single-design jobs also get a PCB dimension.
+                            const pcbDim = job.designCount === 1 ? formatDimensions(job.pcbWidthMm, job.pcbHeightMm) : null
+                            return (
+                              <>
+                                {" · Panel "}{panelDim}
+                                {pcbDim && <> · PCB {pcbDim}</>}
+                              </>
+                            )
+                          })()}
                         </div>
                       </td>
                       <td className="px-4 py-3 text-foreground">{job.customerRef || <span className="text-muted-foreground">—</span>}</td>

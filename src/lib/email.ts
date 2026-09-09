@@ -1,4 +1,5 @@
 import { Resend } from "resend"
+import nodemailer, { type Transporter } from "nodemailer"
 import { mkdir, writeFile } from "fs/promises"
 import path from "path"
 
@@ -16,6 +17,80 @@ let resendClient: Resend | null = null
 function getResendClient() {
   if (!resendClient) resendClient = new Resend(process.env.RESEND_API_KEY)
   return resendClient
+}
+
+// Gmail SMTP transport — the default provider (see EMAIL_PROVIDER below).
+// Adopted because Resend requires a verified sending domain to reach
+// arbitrary recipients, and this project's domain (propcb.in, on Bigrock/
+// cPanel) hit SPF/verification friction; Gmail SMTP with an App Password
+// works immediately against any real inbox. Same lazy+memoized construction
+// as getResendClient, same reason (build-time route collection must not
+// throw on a missing credential). nodemailer's `service: 'gmail'` shorthand
+// resolves the right SMTP host/port/TLS settings — no need to hardcode
+// smtp.gmail.com here.
+let gmailTransport: Transporter | null = null
+function getGmailTransport(): Transporter {
+  if (!gmailTransport) {
+    gmailTransport = nodemailer.createTransport({
+      service: "gmail",
+      auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
+    })
+  }
+  return gmailTransport
+}
+
+interface OutgoingEmail {
+  to: string
+  /** Gmail SMTP rewrites/rejects a From that doesn't match the
+   *  authenticated account, so this is only actually honored on the Resend
+   *  path — see EMAIL_FROM's own docs in .env.example. */
+  from: string
+  replyTo?: string
+  subject: string
+  html: string
+  text: string
+  attachments?: { filename: string; content: Buffer }[]
+}
+
+/**
+ * The one place either provider is actually called — every exported
+ * function below builds an OutgoingEmail and hands it here, so callers never
+ * need to know which provider is live. Branches on EMAIL_PROVIDER
+ * ("resend" | anything else, including unset, which defaults to Gmail —
+ * see .env.example). Both branches throw on a real failure (mirroring the
+ * pre-existing throwIfFailed contract) so every caller's existing
+ * success/failure branching (e.g. the staff-creation emailSent flag, or
+ * forgot-password's try/catch) keeps working unchanged regardless of
+ * provider.
+ */
+async function sendEmail(email: OutgoingEmail): Promise<{ id: string | null }> {
+  if (process.env.EMAIL_PROVIDER === "resend") {
+    const result = await getResendClient().emails.send({
+      from: email.from,
+      to: email.to,
+      replyTo: email.replyTo,
+      subject: email.subject,
+      text: email.text,
+      html: email.html,
+      attachments: email.attachments,
+    })
+    throwIfFailed(result)
+    return { id: result.data?.id ?? null }
+  }
+
+  const info = await getGmailTransport().sendMail({
+    from: email.from,
+    to: email.to,
+    replyTo: email.replyTo,
+    subject: email.subject,
+    text: email.text,
+    html: email.html,
+    attachments: email.attachments,
+  })
+  // nodemailer throws on a hard SMTP failure (auth rejected, connection
+  // refused), unlike Resend's { data, error } shape — nothing further to
+  // check here, a resolved sendMail() means Gmail accepted the message.
+  return { id: info.messageId ?? null }
 }
 
 /** Minimal HTML-entity escaping for user-supplied text landing in an email
@@ -44,30 +119,30 @@ function throwIfFailed(result: { error: { message: string } | null }) {
 }
 
 export async function sendPasswordResetEmail(to: string, resetUrl: string) {
-  const result = await getResendClient().emails.send({
+  await sendEmail({
     from: FROM,
     to,
     subject: "Reset your ProPCB password",
+    text: `We received a request to reset your ProPCB account password.\n\nSet a new password: ${resetUrl}\n\nThis link expires in 1 hour. If you didn't request this, you can safely ignore this email.`,
     html: `
       <p>We received a request to reset your ProPCB account password.</p>
       <p><a href="${resetUrl}">Click here to set a new password</a> — this link expires in 1 hour.</p>
       <p>If you didn't request this, you can safely ignore this email.</p>
     `,
   })
-  throwIfFailed(result)
 }
 
 export async function sendStaffWelcomeEmail(to: string, role: string, setPasswordUrl: string) {
-  const result = await getResendClient().emails.send({
+  await sendEmail({
     from: FROM,
     to,
     subject: "You've been added to the ProPCB team",
+    text: `An admin has created a ProPCB staff account for you with the role ${role}.\n\nSet your password: ${setPasswordUrl}\n\nThis link expires in 1 hour.`,
     html: `
       <p>An admin has created a ProPCB staff account for you with the role <strong>${role}</strong>.</p>
       <p><a href="${setPasswordUrl}">Click here to set your password</a> — this link expires in 1 hour.</p>
     `,
   })
-  throwIfFailed(result)
 }
 
 const SHARE_KIND_LABEL: Record<"FILM" | "DRILL" | "TEST", string> = {
@@ -109,16 +184,17 @@ export interface ShareBundleEmailInput {
  * reports honestly.
  */
 /**
- * Set SHARE_EMAIL_DRY_RUN to skip calling Resend entirely for share emails
- * — writes the rendered HTML/text to disk instead, so the whole
+ * Set SHARE_EMAIL_DRY_RUN to skip calling either email provider for share
+ * emails — writes the rendered HTML/text to disk instead, so the whole
  * POST /api/share flow (bundle creation, disk write, DB rows marked sent)
- * completes successfully without a real Resend account. Exists specifically
- * because RESEND_API_KEY is a placeholder in most dev setups, and
- * "API key is invalid" (Resend's own error text, surfaced verbatim via
- * throwIfFailed) is otherwise the ONLY way to exercise sharing end-to-end
- * locally. Scoped to share emails only — password reset / staff welcome
- * keep their existing behavior, since dry-running an auth flow isn't useful
- * the same way.
+ * completes successfully without real Resend/Gmail credentials. Checked
+ * BEFORE sendEmail's provider branch, so it's provider-agnostic by
+ * construction — this was originally written for a placeholder
+ * RESEND_API_KEY specifically, but the need (exercise sharing end-to-end
+ * with no real credentials configured) is the same regardless of which
+ * provider is live. Scoped to share emails only — password reset / staff
+ * welcome keep their existing behavior, since dry-running an auth flow
+ * isn't useful the same way.
  */
 async function writeDryRunEmail(input: { to: string; subject: string; html: string; text: string }): Promise<string> {
   const dir = path.join(process.env.UPLOADS_DIR ?? path.join(process.cwd(), "uploads"), "share-dry-run")
@@ -170,7 +246,7 @@ export async function sendShareBundleEmail(input: ShareBundleEmailInput): Promis
     return { id: null, dryRun: true }
   }
 
-  const result = await getResendClient().emails.send({
+  const result = await sendEmail({
     from: FROM,
     to: input.to,
     replyTo: input.replyTo,
@@ -181,6 +257,5 @@ export async function sendShareBundleEmail(input: ShareBundleEmailInput): Promis
       ? [{ filename: input.attachment.filename, content: input.attachment.content }]
       : undefined,
   })
-  throwIfFailed(result)
-  return { id: result.data?.id ?? null, dryRun: false }
+  return { id: result.id, dryRun: false }
 }

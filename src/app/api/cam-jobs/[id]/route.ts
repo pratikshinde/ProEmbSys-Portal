@@ -69,6 +69,11 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     ownerName: job.user.name,
     ownerEmail: job.user.email,
     orderReference: job.order?.reference ?? null,
+    // Read by loadCamJobById (src/lib/load-cam-job.ts) to decide whether
+    // reloading this job should silently regenerate routing/G-code — see
+    // CamJob.routingGeneratedAt's own schema comment.
+    hadRouting: job.routingGeneratedAt != null,
+    hadGcode: job.gcodeGeneratedAt != null,
   })
 }
 

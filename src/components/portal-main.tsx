@@ -1894,7 +1894,7 @@ export function PanelizationPage() {
         <div style={{ display:"flex", alignItems:"center", gap:8 }}>
           <Cpu style={{ width:20, height:20, color:C.accent }} />
           <h2 style={{ fontSize:14, fontWeight:700, letterSpacing:"-0.3px", fontFamily:"'DM Sans',sans-serif", color:C.text0, margin:0 }}>
-            CAM Panelization Tool
+            ProPCB CAM Suite
           </h2>
           <span style={{ fontSize:10, color:C.text3, background:C.bg3, padding:"2px 8px", borderRadius:4, fontFamily:"'DM Mono',monospace", letterSpacing:0.5 }}>
             v1.0

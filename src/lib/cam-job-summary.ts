@@ -21,6 +21,13 @@ export interface CamJobSummary {
   designCount: number
   layerCount: number
   health: CamJobHealth
+  /** Panel/PCB size captured once at save time — see CamJob.panelWidthMm's
+   *  own schema comment. Null means "never panelized as of the last save",
+   *  not zero. */
+  panelWidthMm: number | null
+  panelHeightMm: number | null
+  pcbWidthMm: number | null
+  pcbHeightMm: number | null
   createdAt: Date
   updatedAt: Date
 }
@@ -47,6 +54,10 @@ export type CamJobForSummary = Pick<
   | "exportRanAt"
   | "exportWarnings"
   | "importWarnings"
+  | "panelWidthMm"
+  | "panelHeightMm"
+  | "pcbWidthMm"
+  | "pcbHeightMm"
   | "createdAt"
   | "updatedAt"
 >
@@ -77,6 +88,10 @@ export function toCamJobSummary(job: CamJobForSummary): CamJobSummary {
     designCount: config.designs?.length ?? 0,
     layerCount: fileCount,
     health,
+    panelWidthMm: job.panelWidthMm,
+    panelHeightMm: job.panelHeightMm,
+    pcbWidthMm: job.pcbWidthMm,
+    pcbHeightMm: job.pcbHeightMm,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
   }
@@ -102,6 +117,10 @@ export const CAM_JOB_SUMMARY_SELECT = {
   exportRanAt: true,
   exportWarnings: true,
   importWarnings: true,
+  panelWidthMm: true,
+  panelHeightMm: true,
+  pcbWidthMm: true,
+  pcbHeightMm: true,
   createdAt: true,
   updatedAt: true,
 } satisfies Prisma.CamJobSelect

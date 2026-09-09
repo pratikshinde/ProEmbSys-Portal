@@ -759,6 +759,34 @@ model CamJob {
   // than nullable, unlike the DFM/export fields above.
   importWarnings Int       @default(0)
 
+  // Dimensions, captured ONCE at save time from the live `panelResult`
+  // (handleSaveJob) — same "column, not JSON, because the library reads it
+  // on every row" precedent as the health fields above. Nullable: a job can
+  // be saved before "Create Panel" was ever clicked, and that's an honest
+  // "not computed yet", not a zero. panelWidthMm/panelHeightMm are the whole
+  // panel; pcbWidthMm/pcbHeightMm are the ACTIVE design's board size at save
+  // time (PanelDesignSummary.widthMm/heightMm) — unambiguous for the
+  // overwhelming single-design case, and an honest "one representative
+  // size" (not "every design is this size") for a multi-design panel, which
+  // the library already labels with its own design count.
+  panelWidthMm  Float?
+  panelHeightMm Float?
+  pcbWidthMm    Float?
+  pcbHeightMm   Float?
+
+  // Whether routing / G-code had actually been generated as of this save
+  // (`!!routingResult` / `!!gcodeFiles`, captured the same way as the health
+  // fields above) — read back by loadCamJobById (src/lib/load-cam-job.ts) to
+  // decide whether reloading this job should silently regenerate those
+  // (deterministic recomputation from the restored config/layers, not a
+  // guess) so the tool reopens exactly as it was left, or leave them alone
+  // for the common case of a job that never touched those tabs. Nullable
+  // DateTime for the same "never ran" reason as dfmRanAt/exportRanAt above,
+  // even though only presence/absence is read today — matches the sibling
+  // columns' shape rather than degrading to a boolean.
+  routingGeneratedAt DateTime?
+  gcodeGeneratedAt   DateTime?
+
   // CamJobSnapshot (src/lib/store.ts) — flat CAM config slices (panelConfig,
   // routingConfig, gcodeContext, panelArrayConfig, stencilConfig, designs,
   // panelInfo, etc.) plus a `files[]` metadata array (fileName, designId,

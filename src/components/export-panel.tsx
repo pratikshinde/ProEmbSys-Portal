@@ -93,6 +93,10 @@ export default function ExportPanel() {
   const computePanelResult = useAppStore(s => s.computePanelResult)
   // Route files ride along in the full panel export when a plan exists.
   const routingResult = useAppStore(s => s.routingResult)
+  // Read only to capture "had G-code been generated" into the health
+  // snapshot at save time (see handleSaveJob below) — this panel doesn't
+  // otherwise touch G-code files itself.
+  const gcodeFiles = useAppStore(s => s.gcodeFiles)
   // Meta-panelization (multi-panel-array) Gerber + Excellon ride along the
   // same way, in their own Meta-Panelization/ subfolder, when generated on
   // the G-Code tab's array section.
@@ -250,6 +254,13 @@ export default function ExportPanel() {
       // JSON). dfmRanAt/exportRanAt stay null when that step never ran
       // this session — see cam-job-health.ts's "never checked != clean"
       // rule, which depends on this distinction surviving to the DB.
+      // Active design's dimensions, for the library's "PCB WxH" — panelResult
+      // is only null when Create Panel was never clicked (honest "not
+      // computed yet", not a zero). See the CamJob model's own comment on
+      // why this is a representative size for a multi-design panel, not a
+      // claim every design shares it.
+      const activeDesignSummary = panelResult?.designs.find(d => d.designId === activeDesignId2)
+
       const health = {
         dfmRanAt: dfmReport?.ranAt ?? null,
         dfmErrors: dfmReport?.summary.errors ?? null,
@@ -259,6 +270,16 @@ export default function ExportPanel() {
         exportRanAt: lastExport?.at ?? null,
         exportWarnings: lastExport ? lastExport.dcode.length + lastExport.film.length : null,
         importWarnings: importWarnings.length,
+        panelWidthMm: panelResult?.panelWidth ?? null,
+        panelHeightMm: panelResult?.panelHeight ?? null,
+        pcbWidthMm: activeDesignSummary?.widthMm ?? null,
+        pcbHeightMm: activeDesignSummary?.heightMm ?? null,
+        // Captured as "was it generated at all", not the routing/gcode
+        // content itself (that's still deliberately never persisted) — read
+        // back by loadCamJobById to decide whether a reload should silently
+        // regenerate them. See CamJob.routingGeneratedAt's own comment.
+        hadRouting: !!routingResult,
+        hadGcode: !!gcodeFiles,
       }
 
       const formData = new FormData()

@@ -66,6 +66,8 @@ export async function POST(req: Request) {
   let health: Partial<{
     dfmRanAt: string | null; dfmErrors: number | null; dfmWarnings: number | null; dfmInfos: number | null
     dfmLayerCount: number | null; exportRanAt: string | null; exportWarnings: number | null; importWarnings: number
+    panelWidthMm: number | null; panelHeightMm: number | null; pcbWidthMm: number | null; pcbHeightMm: number | null
+    hadRouting: boolean; hadGcode: boolean
   }> = {}
   const healthRaw = formData.get("health")
   if (typeof healthRaw === "string") {
@@ -131,6 +133,15 @@ export async function POST(req: Request) {
         exportRanAt: health.exportRanAt ? new Date(health.exportRanAt) : null,
         exportWarnings: health.exportWarnings ?? null,
         importWarnings: health.importWarnings ?? 0,
+        panelWidthMm: health.panelWidthMm ?? null,
+        panelHeightMm: health.panelHeightMm ?? null,
+        pcbWidthMm: health.pcbWidthMm ?? null,
+        pcbHeightMm: health.pcbHeightMm ?? null,
+        // Captured "was it generated" as a timestamp, matching the sibling
+        // dfmRanAt/exportRanAt shape — the boolean from the client just
+        // decides whether `new Date()` is stamped now, at save time.
+        routingGeneratedAt: health.hadRouting ? new Date() : null,
+        gcodeGeneratedAt: health.hadGcode ? new Date() : null,
       },
     })
   } catch (err) {
