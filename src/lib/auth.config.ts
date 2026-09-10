@@ -11,10 +11,19 @@ export const authConfig: NextAuthConfig = {
   },
   callbacks: {
     authorized({ auth, request: { nextUrl } }) {
-      const isAdminRoute = nextUrl.pathname.startsWith("/admin")
-      if (!isAdminRoute) return true
+      const { pathname } = nextUrl
       const role = auth?.user?.role
-      return role === "ADMIN" || role === "ENGINEER"
+
+      if (pathname.startsWith("/admin")) {
+        return role === "ADMIN" || role === "ENGINEER"
+      }
+      // Production tracker — staff plus the OPERATOR role, never customers.
+      // Kept in sync with canAccessProduction() in src/lib/roles.ts (not
+      // imported here — this file stays Edge-safe with zero deps).
+      if (pathname.startsWith("/production")) {
+        return role === "ADMIN" || role === "ENGINEER" || role === "OPERATOR"
+      }
+      return true
     },
   },
   providers: [],

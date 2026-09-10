@@ -11,6 +11,13 @@ enum Role {
   CUSTOMER
   ENGINEER
   ADMIN
+  // Shop-floor worker for the production tracker (/production, /admin/
+  // production). A NON-staff role: every existing `role === "ADMIN" || role
+  // === "ENGINEER"` allow-list check already excludes it, so adding this
+  // value grants no access anywhere on its own — the only gates that admit it
+  // are middleware.ts's /production branch and src/lib/roles.ts. Login still
+  // respects `isActive` like every other role.
+  OPERATOR
 }
 
 model User {
@@ -43,6 +50,8 @@ model User {
   camJobs             CamJob[]
   contacts            Contact[]
   shareBundles        ShareBundle[]
+  operatorProfile     OperatorProfile?
+  assignedJobs        ProductionJob[]      @relation("JobAssignee")
 
   @@map("users")
 }
@@ -815,4 +824,278 @@ model CamJob {
   @@index([userId, customerRef])
   @@index([orderId])
   @@map("cam_jobs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Production tracking — the in-portal shop-floor tracker (/production for
+// operators, /admin/production for the office). An admin assigns an order (or a
+// manual job) to one OPERATOR, who works an ordered checklist of manufacturing
+// steps and marks each done; the office watches progress live. See
+// src/lib/production/* and src/app/(production stuff). Internal tool — no
+// customer ever touches these tables.
+//
+// These tables already existed in the database (created by the earlier
+// stand-alone propcb-mes app, which shared this DB). This block models them so
+// the portal owns them going forward; `prisma db push` should report them as
+// already in sync. All @@map("production_*").
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ProductionJobStatus {
+  DRAFT
+  QUEUED
+  IN_PROGRESS
+  ON_HOLD
+  DONE
+  CANCELLED
+}
+
+enum StageStatus {
+  BLOCKED
+  READY
+  IN_PROGRESS
+  DONE
+  REWORK
+  SKIPPED
+  CANCELLED
+}
+
+enum StagePriority {
+  LOW
+  NORMAL
+  HIGH
+  RUSH
+}
+
+model ProductionStageType {
+  id       String  @id @default(cuid())
+  key      String  @unique
+  label    String
+  icon     String?
+  color    String?
+  sortHint Int     @default(0)
+  isActive Boolean @default(true)
+
+  @@map("production_stage_types")
+}
+
+model Station {
+  id            String   @id @default(cuid())
+  name          String
+  stageTypeKeys String[]
+  capacity      Int?
+  isActive      Boolean  @default(true)
+
+  @@map("production_stations")
+}
+
+model RoutingTemplate {
+  id          String                @id @default(cuid())
+  name        String
+  description String?
+  isActive    Boolean               @default(true)
+  steps       RoutingTemplateStep[]
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  @@map("production_routing_templates")
+}
+
+model RoutingTemplateStep {
+  id               String          @id @default(cuid())
+  templateId       String
+  template         RoutingTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  sequence         Int
+  stageTypeKey     String
+  defaultStationId String?
+  isOutsourced     Boolean         @default(false)
+  slaHours         Float?
+  photoRequired    Boolean         @default(false)
+  qtyOutRequired   Boolean         @default(true)
+  instruction      String?
+  parallelWithPrev Boolean         @default(false)
+
+  @@unique([templateId, sequence])
+  @@map("production_routing_template_steps")
+}
+
+model ProductionJob {
+  id             String              @id @default(cuid())
+  reference      String              @unique // WO-YYYYMMDD-NNNN — src/lib/production/reference.ts
+  orderId        String?
+  orderReference String?
+  customerName   String
+  boardName      String?
+  camJobId       String?
+  status         ProductionJobStatus @default(QUEUED)
+  priority       StagePriority       @default(NORMAL)
+  quantity       Int
+  dueDate        DateTime?
+  holdReason     String?
+  cancelReason   String?
+  notes          String?
+  templateId     String?
+  createdById    String
+  // The one operator responsible for this whole job. Every ProductionStage of
+  // the job also carries this id; reassigning updates the job + all not-yet-DONE
+  // stages together.
+  assignedToId   String?
+  assignedTo     User?               @relation("JobAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  // Captured by "Send to Fab" in the CAM Panel Config tab: the Panel Summary
+  // numbers (pcb/panel size, total PCBs, layout, tooling/reference holes,
+  // fiducials) and the rendered panel image (SVG on disk — see
+  // src/lib/production/panel-files.ts). What the operator actually manufactures.
+  panelSummary   Json?
+  panelImagePath String?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+  startedAt      DateTime?
+  completedAt    DateTime?
+  stages         ProductionStage[]
+  events         ProductionEvent[]
+
+  @@index([status, priority, dueDate])
+  @@index([orderId])
+  @@index([assignedToId, status])
+  @@map("production_jobs")
+}
+
+model ProductionStage {
+  id                   String                 @id @default(cuid())
+  jobId                String
+  job                  ProductionJob          @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  sequence             Int
+  attempt              Int                    @default(1)
+  stageTypeKey         String
+  label                String
+  status               StageStatus            @default(BLOCKED)
+  isOutsourced         Boolean                @default(false)
+  stationId            String?
+  assignedToId         String?
+  slaHours             Float?
+  photoRequired        Boolean                @default(false)
+  qtyOutRequired       Boolean                @default(true)
+  instruction          String?
+  qtyIn                Int?
+  qtyOut               Int?
+  scrapQty             Int?
+  readyAt              DateTime?
+  startedAt            DateTime?
+  completedAt          DateTime?
+  pausedSeconds        Int                    @default(0)
+  vendorName           String?
+  sentToVendorAt       DateTime?
+  receivedFromVendorAt DateTime?
+  attachments          ProductionAttachment[]
+
+  @@unique([jobId, sequence, attempt])
+  @@index([status, assignedToId])
+  @@index([stageTypeKey, status])
+  @@map("production_stages")
+}
+
+model ProductionAttachment {
+  id           String          @id @default(cuid())
+  stageId      String
+  stage        ProductionStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  kind         String
+  path         String
+  caption      String?
+  uploadedById String
+  createdAt    DateTime        @default(now())
+
+  @@map("production_attachments")
+}
+
+// Append-only audit trail + the source notifications fan out from.
+model ProductionEvent {
+  id        String        @id @default(cuid())
+  jobId     String
+  job       ProductionJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  stageId   String?
+  type      String
+  actorId   String?
+  actionId  String?       @unique
+  payload   Json
+  createdAt DateTime      @default(now())
+
+  @@index([jobId, createdAt])
+  @@map("production_events")
+}
+
+model NotificationOutbox {
+  id          String    @id @default(cuid())
+  eventId     String
+  recipientId String
+  channel     String
+  urgency     String
+  payload     Json
+  status      String    @default("PENDING")
+  attempts    Int       @default(0)
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  sentAt      DateTime?
+
+  @@index([status, createdAt])
+  @@map("production_notification_outbox")
+}
+
+model InAppNotification {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String
+  body      String
+  deeplink  String
+  eventId   String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, readAt])
+  @@map("production_in_app_notifications")
+}
+
+model PushSubscription {
+  id         String   @id @default(cuid())
+  userId     String
+  endpoint   String   @unique
+  p256dh     String
+  auth       String
+  userAgent  String?
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  @@map("production_push_subscriptions")
+}
+
+model NotificationPref {
+  id         String  @id @default(cuid())
+  userId     String
+  eventType  String
+  channel    String
+  enabled    Boolean @default(true)
+  digestOnly Boolean @default(false)
+
+  @@unique([userId, eventType, channel])
+  @@map("production_notification_prefs")
+}
+
+model OperatorProfile {
+  userId                String   @id
+  user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  eligibleStageTypeKeys String[]
+  stationIds            String[]
+  uiLanguage            String   @default("en")
+  pinHash               String?
+  telegramChatId        String?
+  isActive              Boolean  @default(true)
+
+  @@map("production_operator_profiles")
+}
+
+// Per-IST-day counter for WO-YYYYMMDD-NNNN references — see
+// src/lib/production/reference.ts.
+model DailyCounter {
+  day       String @id
+  lastValue Int    @default(0)
+
+  @@map("production_daily_counters")
 }
