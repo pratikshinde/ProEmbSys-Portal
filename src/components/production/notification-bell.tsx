@@ -13,7 +13,39 @@ interface Item {
   createdAt: string
 }
 
-export function NotificationBell() {
+// Two chromes: the operator app is a hardcoded dark shell (theme tokens there
+// don't resolve to dark), the admin area is theme-aware.
+const TONE = {
+  operator: {
+    button: "border-white/10 bg-white/5 text-slate-200",
+    panel: "border-white/10 bg-[#0b1a2e]",
+    headerBorder: "border-white/10",
+    headerText: "text-white",
+    empty: "text-slate-500",
+    itemBorder: "border-white/5",
+    itemHover: "hover:bg-white/5",
+    unread: "bg-sky-500/5",
+    title: "text-white",
+    body: "text-slate-400",
+    time: "text-slate-600",
+  },
+  admin: {
+    button: "border-border bg-card text-foreground hover:bg-muted",
+    panel: "border-border bg-popover",
+    headerBorder: "border-border",
+    headerText: "text-foreground",
+    empty: "text-muted-foreground",
+    itemBorder: "border-border",
+    itemHover: "hover:bg-muted",
+    unread: "bg-primary/5",
+    title: "text-foreground",
+    body: "text-muted-foreground",
+    time: "text-muted-foreground",
+  },
+} as const
+
+export function NotificationBell({ variant = "operator" }: { variant?: "operator" | "admin" }) {
+  const t = TONE[variant]
   const [open, setOpen] = useState(false)
   const [items, setItems] = useState<Item[]>([])
   const [unread, setUnread] = useState(0)
@@ -36,9 +68,10 @@ export function NotificationBell() {
 
   useEffect(() => {
     load()
-    const t = setInterval(() => load(), 60000)
+    const every = variant === "admin" ? 30000 : 60000
+    const t = setInterval(() => load(), every)
     return () => clearInterval(t)
-  }, [])
+  }, [variant])
 
   useEffect(() => {
     function onDoc(e: MouseEvent) {
@@ -67,7 +100,7 @@ export function NotificationBell() {
       <button
         type="button"
         onClick={toggle}
-        className="relative flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-slate-200"
+        className={`relative flex h-10 w-10 items-center justify-center rounded-lg border ${t.button}`}
         aria-label="Notifications"
       >
         <Bell className="h-5 w-5" />
@@ -79,13 +112,13 @@ export function NotificationBell() {
       </button>
 
       {open && (
-        <div className="absolute right-0 z-50 mt-2 w-80 max-w-[85vw] overflow-hidden rounded-xl border border-white/10 bg-[#0b1a2e] shadow-2xl">
-          <div className="border-b border-white/10 px-4 py-2.5 text-sm font-semibold text-white">
+        <div className={`absolute right-0 z-50 mt-2 w-80 max-w-[85vw] overflow-hidden rounded-xl border shadow-2xl ${t.panel}`}>
+          <div className={`border-b px-4 py-2.5 text-sm font-semibold ${t.headerBorder} ${t.headerText}`}>
             Notifications
           </div>
           <div className="max-h-96 overflow-y-auto">
             {items.length === 0 ? (
-              <p className="px-4 py-6 text-center text-sm text-slate-500">
+              <p className={`px-4 py-6 text-center text-sm ${t.empty}`}>
                 {loaded ? "Nothing yet" : "Loading…"}
               </p>
             ) : (
@@ -94,13 +127,13 @@ export function NotificationBell() {
                   key={n.id}
                   href={n.deeplink}
                   onClick={() => setOpen(false)}
-                  className={`block border-b border-white/5 px-4 py-3 transition hover:bg-white/5 ${
-                    n.read ? "" : "bg-sky-500/5"
+                  className={`block border-b px-4 py-3 transition ${t.itemBorder} ${t.itemHover} ${
+                    n.read ? "" : t.unread
                   }`}
                 >
-                  <p className="text-sm font-semibold text-white">{n.title}</p>
-                  <p className="text-xs text-slate-400">{n.body}</p>
-                  <p className="mt-0.5 text-[11px] text-slate-600">
+                  <p className={`text-sm font-semibold ${t.title}`}>{n.title}</p>
+                  <p className={`text-xs ${t.body}`}>{n.body}</p>
+                  <p className={`mt-0.5 text-[11px] ${t.time}`}>
                     {new Date(n.createdAt).toLocaleString("en-IN", {
                       day: "numeric",
                       month: "short",

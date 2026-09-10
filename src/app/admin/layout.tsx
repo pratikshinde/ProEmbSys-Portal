@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation"
 import Link from "next/link"
 import { auth } from "@/lib/auth"
+import { NotificationBell } from "@/components/production/notification-bell"
 
 // Coarse "must be logged in" gating for /admin/** already happens in
 // middleware.ts (Edge-safe, JWT-only check). This layout is the second,
@@ -56,9 +57,12 @@ export default async function AdminLayout({ children }: { children: React.ReactN
               </>
             )}
           </nav>
-          <Link href="/" className="ml-auto text-sm text-muted-foreground hover:text-primary">
-            &larr; Back to site
-          </Link>
+          <div className="ml-auto flex items-center gap-4">
+            <NotificationBell variant="admin" />
+            <Link href="/" className="text-sm text-muted-foreground hover:text-primary">
+              &larr; Back to site
+            </Link>
+          </div>
         </div>
       </header>
       <main className="mx-auto max-w-5xl px-6 py-8">{children}</main>

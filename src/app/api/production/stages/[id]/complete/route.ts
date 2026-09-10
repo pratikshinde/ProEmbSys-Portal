@@ -4,7 +4,7 @@ import { v4 as uuidv4 } from "uuid"
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
 import { notifyUser } from "@/lib/production/notify"
-import { friendlyStepLabel } from "@/lib/production/steps"
+import { friendlyStep } from "@/lib/production/steps"
 
 // qtyOut is OPTIONAL — the simple operator flow ("I finished this step") never
 // asks for it; it defaults to the stage's qtyIn (nothing scrapped). Only the
@@ -51,7 +51,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       db.productionStage.count({ where: { jobId: stage.jobId, attempt: 1 } }),
       db.productionStage.count({ where: { jobId: stage.jobId, attempt: 1, status: "DONE" } }),
     ])
-    const friendlyLabel = friendlyStepLabel(stage.stageTypeKey, stage.label)
+    const friendly = friendlyStep(stage.stageTypeKey, stage.label)
+    const friendlyLabel = friendly.short
     const operatorName = session.user.name || session.user.email || "an operator"
     const calculatedScrap =
       data.scrapQty !== undefined
@@ -132,9 +133,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       }
 
       if (!jobCompleted) {
+        const scrapNote = calculatedScrap > 0 ? ` · ${calculatedScrap} scrapped` : ""
         await notifyUser(tx, stage.job.createdById, {
-          title: `${friendlyLabel} done`,
-          body: `${stage.job.reference} · by ${operatorName} · ${doneBefore + 1} of ${totalSteps} steps.`,
+          title: `${friendly.emoji} ${friendlyLabel} done`,
+          body: `${stage.job.reference} · by ${operatorName} · ${doneBefore + 1} of ${totalSteps} steps${scrapNote}.`,
           deeplink: `/admin/production/${stage.jobId}`,
         })
       }
