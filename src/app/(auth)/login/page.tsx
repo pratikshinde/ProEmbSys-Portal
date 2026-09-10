@@ -21,7 +21,6 @@ type FormValues = z.infer<typeof schema>
 function LoginForm() {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const justVerified = searchParams.get("verified") === "1"
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const {
@@ -54,11 +53,6 @@ function LoginForm() {
         <CardDescription>Access your ProPCB account to track orders and quotes.</CardDescription>
       </CardHeader>
       <CardContent>
-        {justVerified && (
-          <p className="mb-4 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400">
-            Email confirmed — sign in to start.
-          </p>
-        )}
         <form onSubmit={handleSubmit(onSubmit)} className="flex flex-col gap-4">
           <div className="flex flex-col gap-2">
             <Label htmlFor="email">Email</Label>
@@ -84,12 +78,6 @@ function LoginForm() {
           Don&apos;t have an account?{" "}
           <Link href="/register" className="text-primary hover:underline">
             Register
-          </Link>
-        </p>
-        <p className="mt-1 text-center text-sm text-muted-foreground">
-          Shop-floor operator?{" "}
-          <Link href="/operator/register" className="text-primary hover:underline">
-            Set up your account
           </Link>
         </p>
       </CardContent>

@@ -21,7 +21,10 @@ export const authConfig: NextAuthConfig = {
       // Kept in sync with canAccessProduction() in src/lib/roles.ts (not
       // imported here — this file stays Edge-safe with zero deps).
       if (pathname.startsWith("/production")) {
-        return role === "ADMIN" || role === "ENGINEER" || role === "OPERATOR"
+        if (role === "ADMIN" || role === "ENGINEER" || role === "OPERATOR") return true
+        // A visitor here belongs in the operator app's own sign-in, not the
+        // main site's /login; a logged-in non-operator goes home.
+        return Response.redirect(new URL(auth?.user ? "/" : "/operator/login", nextUrl))
       }
       return true
     },

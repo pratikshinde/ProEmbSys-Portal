@@ -11,7 +11,7 @@ import { SignOutButton } from "@/components/production/sign-out-button"
 // this is the DB-aware second layer.
 export default async function ProductionLayout({ children }: { children: React.ReactNode }) {
   const session = await auth()
-  if (!session?.user) redirect("/login?callbackUrl=/production")
+  if (!session?.user) redirect("/operator/login")
   if (!canAccessProduction(session.user.role)) redirect("/")
 
   return (
