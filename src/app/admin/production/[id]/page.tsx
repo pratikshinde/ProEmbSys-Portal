@@ -155,7 +155,7 @@ export default function AdminJobDetail() {
       </div>
 
       {job.panelImageUrl && (
-        <a href={job.panelImageUrl} target="_blank" rel="noreferrer" className="block overflow-hidden rounded-lg border border-border bg-white">
+        <a href={job.panelImageUrl} target="_blank" rel="noreferrer" className="block overflow-hidden rounded-lg border border-border bg-[#020d1f]">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src={job.panelImageUrl} alt="Panel" className="h-64 w-full object-contain" />
         </a>

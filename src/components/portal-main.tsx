@@ -180,6 +180,8 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
     </a>
   ));
 
+  const isStaff = session?.user?.role === "ADMIN" || session?.user?.role === "ENGINEER";
+
   const accountMenu = status === "authenticated" ? (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -188,6 +190,17 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
+        {isStaff && (
+          <>
+            <DropdownMenuItem asChild>
+              <Link href="/admin">Admin dashboard</Link>
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link href="/admin/production">Production tracking</Link>
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
         <DropdownMenuItem asChild>
           <Link href="/account">My Account</Link>
         </DropdownMenuItem>
@@ -258,6 +271,13 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
           {status === "authenticated" ? (
             <>
               <div style={{ fontSize:12, color:C.text2, padding:"4px 14px", fontFamily:"'DM Sans',sans-serif" }}>{session?.user?.name || session?.user?.email}</div>
+              {isStaff && (
+                <>
+                  <Link href="/admin" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.accent2, fontWeight:600, fontFamily:"'DM Sans',sans-serif" }}>Admin dashboard</Link>
+                  <Link href="/admin/production" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.accent2, fontWeight:600, fontFamily:"'DM Sans',sans-serif" }}>Production tracking</Link>
+                  <div style={{ height:1, background:C.border, margin:"8px 0" }}/>
+                </>
+              )}
               <Link href="/account" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.text1, fontFamily:"'DM Sans',sans-serif" }}>My Account</Link>
               <Link href="/orders" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.text1, fontFamily:"'DM Sans',sans-serif" }}>My Orders</Link>
               <Link href="/cam-jobs" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.text1, fontFamily:"'DM Sans',sans-serif" }}>My CAM Jobs</Link>

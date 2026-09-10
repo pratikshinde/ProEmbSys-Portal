@@ -69,7 +69,21 @@ export default function SendToFabButton() {
     }
     setSending(true)
     try {
-      const panelSvg = new XMLSerializer().serializeToString(svgEl)
+      // The viewer draws the panel for a dark UI — light-grey rib text
+      // ("customer : board name") that vanishes on a white page. Bake the
+      // viewer's own dark background into the captured image so the text stays
+      // readable wherever the operator/admin sees it.
+      const clone = svgEl.cloneNode(true) as SVGSVGElement
+      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg")
+      const bg = document.createElementNS("http://www.w3.org/2000/svg", "rect")
+      bg.setAttribute("data-panel-bg", "1")
+      bg.setAttribute("x", "-100000")
+      bg.setAttribute("y", "-100000")
+      bg.setAttribute("width", "200000")
+      bg.setAttribute("height", "200000")
+      bg.setAttribute("fill", "#020d1f")
+      clone.insertBefore(bg, clone.firstChild)
+      const panelSvg = new XMLSerializer().serializeToString(clone)
       const pr = panelResult!
       const panelSummary = {
         pcbWidthMm: pr.designs[0]?.widthMm ?? null,

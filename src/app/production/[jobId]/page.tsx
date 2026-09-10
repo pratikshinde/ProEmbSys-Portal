@@ -205,7 +205,7 @@ export default function OperatorJobPage() {
         <button
           type="button"
           onClick={() => setImageOpen(true)}
-          className="block w-full overflow-hidden rounded-2xl border border-white/10 bg-white"
+          className="block w-full overflow-hidden rounded-2xl border border-white/10 bg-[#020d1f]"
         >
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src={job.panelImageUrl} alt="Panel to build" className="h-64 w-full object-contain" />
@@ -328,7 +328,7 @@ export default function OperatorJobPage() {
             <X className="h-6 w-6" />
           </button>
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={job.panelImageUrl} alt="Panel to build" className="max-h-full max-w-full rounded-lg bg-white" />
+          <img src={job.panelImageUrl} alt="Panel to build" className="max-h-full max-w-full rounded-lg bg-[#020d1f]" />
         </div>
       )}
 

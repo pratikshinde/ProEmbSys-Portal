@@ -21,7 +21,18 @@ export async function GET(_req: Request, { params }: { params: Promise<{ jobId: 
 
   try {
     const buf = await readPanelFile(job.panelImagePath)
-    return new NextResponse(new Uint8Array(buf), {
+    let svg = buf.toString("utf8")
+    // The CAM viewer draws light-grey rib text ("customer : board name") for a
+    // dark UI; on a transparent background it's invisible on a white page.
+    // Older captures have no backdrop — inject the viewer's dark one so the
+    // text stays readable everywhere, including when opened on its own.
+    if (svg.includes("<svg") && !svg.includes("data-panel-bg")) {
+      svg = svg.replace(
+        /(<svg\b[^>]*>)/,
+        `$1<rect data-panel-bg="1" x="-100000" y="-100000" width="200000" height="200000" fill="#020d1f"/>`
+      )
+    }
+    return new NextResponse(svg, {
       headers: {
         "Content-Type": "image/svg+xml",
         "Cache-Control": "private, max-age=86400",
