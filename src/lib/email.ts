@@ -132,6 +132,24 @@ export async function sendPasswordResetEmail(to: string, resetUrl: string) {
   })
 }
 
+/** Shop-floor operator self-registration — confirm the email address is real
+ *  and belongs to them before the account can log in. */
+export async function sendOperatorVerificationEmail(to: string, name: string, verifyUrl: string) {
+  const safeName = escapeHtml(name)
+  await sendEmail({
+    from: FROM,
+    to,
+    subject: "Confirm your email for ProPCB shop-floor access",
+    text: `Hi ${name},\n\nConfirm this email address to finish setting up your ProPCB operator account:\n${verifyUrl}\n\nThis link expires in 24 hours. If you didn't sign up, you can ignore this email.`,
+    html: `
+      <p>Hi ${safeName},</p>
+      <p>Confirm this email address to finish setting up your ProPCB operator account.</p>
+      <p><a href="${verifyUrl}">Verify my email</a> — this link expires in 24 hours.</p>
+      <p>If you didn't sign up, you can ignore this email.</p>
+    `,
+  })
+}
+
 export async function sendStaffWelcomeEmail(to: string, role: string, setPasswordUrl: string) {
   await sendEmail({
     from: FROM,
