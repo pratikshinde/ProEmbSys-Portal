@@ -1,0 +1,117 @@
+import Link from "next/link"
+import { db } from "@/lib/db"
+import { StatusBadge } from "@/components/status-badge"
+import { productionJobStatusMeta, friendlyStepLabel } from "@/lib/production/steps"
+
+export default async function AdminProductionPage() {
+  const jobs = await db.productionJob.findMany({
+    orderBy: [{ status: "asc" }, { priority: "desc" }, { createdAt: "desc" }],
+    take: 200,
+    include: {
+      assignedTo: { select: { name: true, email: true } },
+      stages: {
+        where: { attempt: 1 },
+        orderBy: { sequence: "asc" },
+        select: { status: true, stageTypeKey: true, label: true },
+      },
+    },
+  })
+
+  const rows = jobs.map((j) => {
+    const total = j.stages.length
+    const done = j.stages.filter((s) => s.status === "DONE").length
+    const current =
+      j.stages.find((s) => s.status === "IN_PROGRESS") ?? j.stages.find((s) => s.status === "READY") ?? null
+    return {
+      id: j.id,
+      reference: j.reference,
+      boardName: j.boardName || "Panel job",
+      orderReference: j.orderReference,
+      operator: j.assignedTo?.name || j.assignedTo?.email || "—",
+      status: j.status,
+      done,
+      total,
+      left: total - done,
+      currentStep: current ? friendlyStepLabel(current.stageTypeKey, current.label) : j.status === "DONE" ? "Finished" : "—",
+      updatedAt: j.updatedAt,
+    }
+  })
+
+  const active = rows.filter((r) => r.status === "QUEUED" || r.status === "IN_PROGRESS").length
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div>
+        <h1 className="text-2xl font-bold text-foreground">Production</h1>
+        <p className="text-sm text-muted-foreground">
+          Panels sent to the shop floor from the CAM tool. {active} active.
+        </p>
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="rounded-lg border border-border bg-card p-8 text-sm text-muted-foreground">
+          Nothing sent to fab yet. Use <strong>Send to Fab</strong> on the CAM tool&apos;s Panel Config tab.
+        </div>
+      ) : (
+        <div className="overflow-x-auto rounded-lg border border-border">
+          <table className="w-full text-sm">
+            <thead className="bg-muted">
+              <tr>
+                {["Job", "Operator", "Progress", "Current step", "Status", "Updated"].map((h) => (
+                  <th key={h} className="px-4 py-3 text-left font-medium text-muted-foreground">
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => {
+                const meta = productionJobStatusMeta(r.status)
+                const pct = r.total ? Math.round((r.done / r.total) * 100) : 0
+                return (
+                  <tr key={r.id} className="border-t border-border hover:bg-muted/50">
+                    <td className="px-4 py-3">
+                      <Link href={`/admin/production/${r.id}`} className="font-medium text-primary hover:underline">
+                        {r.boardName}
+                      </Link>
+                      <div className="text-xs text-muted-foreground">
+                        {r.reference}
+                        {r.orderReference ? ` · ${r.orderReference}` : ""}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-foreground">{r.operator}</td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <div className="h-2 w-24 overflow-hidden rounded-full bg-muted">
+                          <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+                        </div>
+                        <span className="whitespace-nowrap text-xs text-muted-foreground">
+                          {r.done}/{r.total}
+                          {r.status !== "DONE" && r.left > 0 ? ` · ${r.left} left` : ""}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-foreground">{r.currentStep}</td>
+                    <td className="px-4 py-3">
+                      <StatusBadge label={meta.label} bg={meta.bg} text={meta.text} />
+                    </td>
+                    <td
+                      className="px-4 py-3 text-muted-foreground"
+                      title={new Date(r.updatedAt).toString()}
+                    >
+                      {new Date(r.updatedAt).toLocaleString("en-IN", {
+                        dateStyle: "medium",
+                        timeStyle: "short",
+                        timeZone: "Asia/Kolkata",
+                      })}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
