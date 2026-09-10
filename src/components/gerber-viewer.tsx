@@ -1104,6 +1104,7 @@ export default function GerberViewer() {
     <div ref={containerRef} className="relative w-full h-full min-h-[400px] bg-[#020d1f] rounded-lg overflow-hidden border border-[#1a3a5c]">
       <svg
         ref={svgRef}
+        data-panel-svg
         className="absolute inset-0 w-full cursor-crosshair"
         style={{ height: `calc(100% - 28px)` }}
         viewBox={viewState.viewBox}
