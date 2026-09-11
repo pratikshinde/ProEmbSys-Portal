@@ -3,7 +3,7 @@ import { z } from "zod"
 import { v4 as uuidv4 } from "uuid"
 import { auth } from "@/lib/auth"
 import { db } from "@/lib/db"
-import { notifyUser } from "@/lib/production/notify"
+import { notifyStaff, notifyUser } from "@/lib/production/notify"
 import { friendlyStep } from "@/lib/production/steps"
 
 // qtyOut is OPTIONAL — the simple operator flow ("I finished this step") never
@@ -123,22 +123,30 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
             payload: { completedAt: now.toISOString(), finalQtyOut: qtyOut },
           },
         })
-        await notifyUser(tx, stage.job.createdById, {
-          title: `Job finished: ${stage.job.boardName ?? stage.job.reference}`,
-          body: `${stage.job.reference} — all ${totalSteps} steps done.`,
-          deeplink: `/admin/production/${stage.jobId}`,
-        })
+        await notifyStaff(
+          tx,
+          {
+            title: `Job finished: ${stage.job.boardName ?? stage.job.reference}`,
+            body: `${stage.job.reference} — all ${totalSteps} steps done.`,
+            deeplink: `/admin/production/${stage.jobId}`,
+          },
+          stage.job.createdById
+        )
         // The portal admin owns "shipped"/"completed" — the order status is
         // deliberately NOT changed on job completion.
       }
 
       if (!jobCompleted) {
         const scrapNote = calculatedScrap > 0 ? ` · ${calculatedScrap} scrapped` : ""
-        await notifyUser(tx, stage.job.createdById, {
-          title: `${friendly.emoji} ${friendlyLabel} done`,
-          body: `${stage.job.reference} · by ${operatorName} · ${doneBefore + 1} of ${totalSteps} steps${scrapNote}.`,
-          deeplink: `/admin/production/${stage.jobId}`,
-        })
+        await notifyStaff(
+          tx,
+          {
+            title: `${friendly.emoji} ${friendlyLabel} done`,
+            body: `${stage.job.reference} · by ${operatorName} · ${doneBefore + 1} of ${totalSteps} steps${scrapNote}.`,
+            deeplink: `/admin/production/${stage.jobId}`,
+          },
+          stage.job.createdById
+        )
       }
 
       return { completedStage, nextStage, jobCompleted }

@@ -2,7 +2,10 @@
 
 import { useEffect, useRef, useState } from "react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { Bell } from "lucide-react"
+import { toast } from "@/hooks/use-toast"
+import { ToastAction } from "@/components/ui/toast"
 
 interface Item {
   id: string
@@ -45,19 +48,59 @@ const TONE = {
 } as const
 
 export function NotificationBell({ variant = "operator" }: { variant?: "operator" | "admin" }) {
+  const router = useRouter()
   const t = TONE[variant]
   const [open, setOpen] = useState(false)
   const [items, setItems] = useState<Item[]>([])
   const [unread, setUnread] = useState(0)
   const [loaded, setLoaded] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
+  const seenIds = useRef<Set<string>>(new Set())
+  const initialLoaded = useRef(false)
 
   async function load() {
     try {
       const res = await fetch("/api/production/notifications")
       if (!res.ok) return
       const data = (await res.json()) as { items?: Item[]; unread?: number }
-      setItems(data.items || [])
+      const newItems = data.items || []
+
+      const freshUnread = newItems.filter((i) => !i.read && !seenIds.current.has(i.id))
+      if (initialLoaded.current) {
+        for (const n of freshUnread) {
+          toast({
+            title: n.title,
+            description: n.body,
+            action: n.deeplink ? (
+              <ToastAction altText="View" onClick={() => router.push(n.deeplink)}>
+                View
+              </ToastAction>
+            ) : undefined,
+          })
+        }
+      } else {
+        const twoMinAgo = Date.now() - 2 * 60 * 1000
+        for (const n of freshUnread) {
+          if (new Date(n.createdAt).getTime() > twoMinAgo) {
+            toast({
+              title: n.title,
+              description: n.body,
+              action: n.deeplink ? (
+                <ToastAction altText="View" onClick={() => router.push(n.deeplink)}>
+                  View
+                </ToastAction>
+              ) : undefined,
+            })
+          }
+        }
+      }
+
+      for (const n of newItems) {
+        seenIds.current.add(n.id)
+      }
+      initialLoaded.current = true
+
+      setItems(newItems)
       setUnread(data.unread || 0)
     } catch {
       /* ignore */
@@ -68,9 +111,10 @@ export function NotificationBell({ variant = "operator" }: { variant?: "operator
 
   useEffect(() => {
     load()
-    const every = variant === "admin" ? 30000 : 60000
-    const t = setInterval(() => load(), every)
-    return () => clearInterval(t)
+    // Poll every 6 seconds for admin, 15 seconds for operator
+    const every = variant === "admin" ? 6000 : 15000
+    const timer = setInterval(() => load(), every)
+    return () => clearInterval(timer)
   }, [variant])
 
   useEffect(() => {
