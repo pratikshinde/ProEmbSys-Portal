@@ -1,50 +1,37 @@
-import { mkdir, writeFile, readFile, rm, stat } from 'fs/promises'
-import { createReadStream, type ReadStream } from 'fs'
-import path from 'path'
+import { storagePut, storageGet, storageGetStream, storageStat, storageDeletePrefix } from "./blob-storage"
 
 /**
- * Local-disk storage for share-bundle ZIPs — same per-parent-subfolder shape
- * as cam-job-files.ts (uploads/shares/<bundleId>/bundle.zip), but with two
- * differences that matter specifically for this feature:
+ * Share-bundle ZIP storage, via the dual-backend abstraction in
+ * blob-storage.ts (local disk in dev, Vercel Blob in production) — same
+ * per-parent-namespace shape as cam-job-files.ts (shares/<bundleId>/bundle.zip),
+ * but with one difference that matters specifically for this feature: content
+ * is a binary ZIP, not UTF-8 text, so read/write work in Buffers, and the
+ * public download route needs a real stream (not the full-buffer-then-
+ * NextResponse pattern every other file route in this app uses) — see
+ * readShareBundleStream's own doc comment.
  *
- *  - `UPLOADS_ROOT` is `process.env.UPLOADS_DIR ?? path.join(process.cwd(),
- *    "uploads")`, not a bare cwd-relative constant. Every other upload lib
- *    in this repo (attachments.ts, order-files.ts, cam-job-files.ts) hard-
- *    codes cwd — survivable for those because the content is the
- *    customer's own re-uploadable input. A share bundle is different: it's
- *    a promise to an EXTERNAL third party that a link keeps working for up
- *    to 30 days. `output: "standalone"` builds can run with a different
- *    cwd than the source tree, so a hardcoded path here would turn every
- *    emailed link into a 404 in production. This is the one upload lib
- *    that needed the env override; the other three are deliberately left
- *    alone (see .env.example's own comment).
- *  - content is a binary ZIP, not UTF-8 text, so read/write work in
- *    Buffers, and the public download route needs a real stream (not the
- *    full-buffer-then-NextResponse pattern every other file route in this
- *    app uses) — see readShareBundleStream's own doc comment.
+ * A share bundle is a promise to an EXTERNAL third party that a link keeps
+ * working for up to 30 days — unlike the other upload libs' content (the
+ * customer's own re-uploadable input), this is the reason `blob-storage.ts`
+ * unified `UPLOADS_DIR` handling across all five libs: an `output:
+ * "standalone"` build can run with a different cwd than the source tree, and
+ * an emailed link must not turn into a 404 in production.
  */
 
-const UPLOADS_ROOT = process.env.UPLOADS_DIR ?? path.join(process.cwd(), 'uploads')
-const SHARE_ROOT = path.join(UPLOADS_ROOT, 'shares')
+const NAMESPACE = "shares"
 
 // Prisma cuid()s are lowercase-alphanumeric, same guard as cam-job-files.ts.
 const SAFE_ID = /^[a-z0-9]+$/i
 
 export const MAX_BUNDLE_SIZE_BYTES = 40 * 1024 * 1024 // 40MB per bundle
 
-function bundleDir(bundleId: string): string {
-  if (!SAFE_ID.test(bundleId)) throw new Error('Invalid bundle id.')
-  return path.join(SHARE_ROOT, bundleId)
-}
-
-function bundleFilePath(bundleId: string): string {
-  return path.join(bundleDir(bundleId), 'bundle.zip')
+function bundleKey(bundleId: string): string {
+  if (!SAFE_ID.test(bundleId)) throw new Error("Invalid bundle id.")
+  return `${NAMESPACE}/${bundleId}/bundle.zip`
 }
 
 export async function saveShareBundleFile(bundleId: string, bytes: Uint8Array): Promise<{ size: number }> {
-  const dir = bundleDir(bundleId)
-  await mkdir(dir, { recursive: true })
-  await writeFile(path.join(dir, 'bundle.zip'), bytes)
+  await storagePut(bundleKey(bundleId), Buffer.from(bytes), "application/zip")
   return { size: bytes.byteLength }
 }
 
@@ -53,33 +40,30 @@ export async function saveShareBundleFile(bundleId: string, bytes: Uint8Array): 
  *  under the attach-size threshold). Never used by the public download
  *  route — see readShareBundleStream for why that one streams instead. */
 export async function readShareBundleFile(bundleId: string): Promise<Buffer> {
-  return readFile(bundleFilePath(bundleId))
+  return storageGet(bundleKey(bundleId))
 }
 
 export async function statShareBundleFile(bundleId: string): Promise<{ size: number } | null> {
-  try {
-    const s = await stat(bundleFilePath(bundleId))
-    return { size: s.size }
-  } catch {
-    return null
-  }
+  return storageStat(bundleKey(bundleId))
 }
 
 /**
- * A real Node stream, not a buffered read — deliberately breaking from
- * every other file-serving route in this app (which all do
- * `new NextResponse(new Uint8Array(await readFile(...)))`). The public
- * download route is the ONLY unauthenticated, externally-linkable,
- * repeatedly-hittable route in the app (an emailed link can be clicked any
- * number of times over 30 days, including by link-scanners that fetch it
+ * A real stream, not a buffered read — deliberately breaking from every
+ * other file-serving route in this app (which all do `new
+ * NextResponse(new Uint8Array(await readFile(...)))`). The public download
+ * route is the ONLY unauthenticated, externally-linkable, repeatedly-
+ * hittable route in the app (an emailed link can be clicked any number of
+ * times over 30 days, including by link-scanners that fetch it
  * automatically) — buffering a large ZIP fully into memory per request on
  * that specific route is the one place the existing precedent is actually
- * wrong to copy.
+ * wrong to copy. Returns a Web ReadableStream directly (async, since Blob's
+ * own `get()` is) — the route hands it straight to `Response` with no
+ * further conversion.
  */
-export function readShareBundleStream(bundleId: string): ReadStream {
-  return createReadStream(bundleFilePath(bundleId))
+export async function readShareBundleStream(bundleId: string): Promise<ReadableStream<Uint8Array>> {
+  return storageGetStream(bundleKey(bundleId))
 }
 
 export async function deleteShareBundleDir(bundleId: string): Promise<void> {
-  await rm(bundleDir(bundleId), { recursive: true, force: true })
+  await storageDeletePrefix(`${NAMESPACE}/${bundleId}/`)
 }

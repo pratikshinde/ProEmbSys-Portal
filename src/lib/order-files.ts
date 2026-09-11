@@ -1,21 +1,21 @@
-import { mkdir, readFile, writeFile } from "fs/promises"
 import path from "path"
 import crypto from "crypto"
+import { storagePut, storageGet } from "./blob-storage"
 
 /**
- * Local-disk storage for order Gerber uploads. Same reasoning and caveats as
- * src/lib/attachments.ts (fine for local/single-instance, swap for object
- * storage before scaling) — two differences suited to Gerber files:
+ * Order Gerber uploads, via the dual-backend abstraction in blob-storage.ts
+ * (local disk in dev, Vercel Blob in production). Two differences suited to
+ * Gerber files:
  *  - validated by file extension, not MIME type, since browsers don't
  *    reliably report a MIME type for .gbr/.rar (often blank or
  *    application/octet-stream), unlike images.
  *  - no per-order subfolder: unlike a message thread (which always exists
  *    before an attachment is added to it), the order doesn't exist yet at
  *    upload time — it's created in the same request — so this just uses a
- *    flat, globally-unique filename directly under uploads/orders/.
+ *    flat, globally-unique key directly under the "orders/" namespace.
  */
 
-const UPLOAD_ROOT = path.join(process.cwd(), "uploads", "orders")
+const NAMESPACE = "orders"
 
 const ALLOWED_EXTENSIONS = new Set([".gbr", ".zip", ".rar"])
 
@@ -37,9 +37,8 @@ export async function saveOrderFile(file: File): Promise<SavedOrderFile> {
     throw new Error("Gerber file must be under 25MB.")
   }
 
-  await mkdir(UPLOAD_ROOT, { recursive: true })
   const filename = `${crypto.randomUUID()}${ext}`
-  await writeFile(path.join(UPLOAD_ROOT, filename), Buffer.from(await file.arrayBuffer()))
+  await storagePut(`${NAMESPACE}/${filename}`, Buffer.from(await file.arrayBuffer()), file.type || undefined)
 
   return {
     path: filename,
@@ -49,7 +48,7 @@ export async function saveOrderFile(file: File): Promise<SavedOrderFile> {
   }
 }
 
-/** Validates the stored-path shape before touching the filesystem — the
+/** Validates the stored-path shape before touching storage — the
  *  filename is always server-generated (uuid + ext), so anything that
  *  doesn't match this shape is rejected rather than resolved. */
 const SAFE_PATH = /^[a-f0-9-]+\.(gbr|zip|rar)$/i
@@ -58,5 +57,5 @@ export async function readOrderFile(relativePath: string): Promise<Buffer> {
   if (!SAFE_PATH.test(relativePath)) {
     throw new Error("Invalid file path.")
   }
-  return readFile(path.join(UPLOAD_ROOT, relativePath))
+  return storageGet(`${NAMESPACE}/${relativePath}`)
 }

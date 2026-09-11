@@ -1,15 +1,12 @@
-import { mkdir, readFile, writeFile } from "fs/promises"
-import path from "path"
 import crypto from "crypto"
+import { storagePut, storageGet } from "./blob-storage"
 
 /**
- * Local-disk storage for message screenshot attachments. Fine for local/
- * single-instance deployment; won't survive container restarts or scale to
- * multiple instances — swap for S3-compatible object storage before a real
- * production deploy.
+ * Message screenshot attachments, via the dual-backend abstraction in
+ * blob-storage.ts (local disk in dev, Vercel Blob in production).
  */
 
-const UPLOAD_ROOT = path.join(process.cwd(), "uploads", "messages")
+const NAMESPACE = "messages"
 
 const ALLOWED_TYPES: Record<string, string> = {
   "image/png": ".png",
@@ -37,9 +34,7 @@ export async function saveMessageAttachment(threadId: string, file: File): Promi
   }
 
   const filename = `${crypto.randomUUID()}${ext}`
-  const dir = path.join(UPLOAD_ROOT, threadId)
-  await mkdir(dir, { recursive: true })
-  await writeFile(path.join(dir, filename), Buffer.from(await file.arrayBuffer()))
+  await storagePut(`${NAMESPACE}/${threadId}/${filename}`, Buffer.from(await file.arrayBuffer()), file.type)
 
   return {
     attachmentPath: `${threadId}/${filename}`,
@@ -49,7 +44,7 @@ export async function saveMessageAttachment(threadId: string, file: File): Promi
   }
 }
 
-/** Validates the stored-path shape before touching the filesystem — both
+/** Validates the stored-path shape before touching storage — both
  *  segments are server-generated (cuid threadId, uuid+ext filename), so
  *  anything that doesn't match this shape is rejected rather than resolved. */
 const SAFE_PATH = /^[a-z0-9]+\/[a-f0-9-]+\.(png|jpg|jpeg|webp|gif)$/i
@@ -58,5 +53,5 @@ export async function readMessageAttachment(attachmentPath: string): Promise<Buf
   if (!SAFE_PATH.test(attachmentPath)) {
     throw new Error("Invalid attachment path.")
   }
-  return readFile(path.join(UPLOAD_ROOT, attachmentPath))
+  return storageGet(`${NAMESPACE}/${attachmentPath}`)
 }

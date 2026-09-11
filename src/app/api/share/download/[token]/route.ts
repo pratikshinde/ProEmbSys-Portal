@@ -1,4 +1,3 @@
-import { Readable } from "stream"
 import { db } from "@/lib/db"
 import { readShareBundleStream, statShareBundleFile } from "@/lib/share-files"
 import { isTokenUsable } from "@/lib/share/tokens"
@@ -9,7 +8,7 @@ export const dynamic = "force-dynamic"
  * The app's only unauthenticated, externally-linkable, repeatedly-hittable
  * route — an emailed link can be clicked any number of times over 30 days,
  * including by link-scanners that fetch it automatically. Streams the file
- * (Readable.toWeb) rather than following the existing full-buffer
+ * rather than following the existing full-buffer
  * `new NextResponse(new Uint8Array(await readFile()))` precedent every
  * other file route in this app uses — see share-files.ts's own
  * readShareBundleStream doc comment for why that precedent is wrong here
@@ -48,8 +47,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ token: 
     },
   })
 
-  const nodeStream = readShareBundleStream(recipient.bundle.id)
-  const webStream = Readable.toWeb(nodeStream) as ReadableStream
+  const webStream = await readShareBundleStream(recipient.bundle.id)
 
   return new Response(webStream, {
     headers: {
