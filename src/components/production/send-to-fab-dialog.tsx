@@ -55,7 +55,23 @@ export default function SendToFabButton() {
       .catch(() => {})
   }, [open])
 
-  if (!isStaff || !panelResult) return null
+  if (!isStaff) return null
+
+  // Shown but disabled (not hidden) once a panel doesn't exist yet — a
+  // totally absent button read as "did this even get built?" (reported
+  // live: staff on a fresh Info & Export tab, no Gerbers imported, saw
+  // nothing here at all). Staff should always see it's there.
+  if (!panelResult) {
+    return (
+      <div className="flex flex-col gap-1.5">
+        <Button disabled className="w-full h-9 bg-emerald-500 text-white text-sm font-semibold">
+          <Send className="w-4 h-4 mr-1.5" />
+          Send to Fab
+        </Button>
+        <p className="text-center text-xs text-muted-foreground">Import Gerbers and click Create Panel first.</p>
+      </div>
+    )
+  }
 
   async function send() {
     if (!operatorId) {
