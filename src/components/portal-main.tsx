@@ -27,6 +27,7 @@ import Link from 'next/link';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import type { AddressRecord } from '@/components/account/account-client';
+import { NotificationBell } from '@/components/production/notification-bell';
 import { SOLDER_MASK_SWATCH } from '@/lib/solder-mask-colors';
 import BoardPreview from './board-preview';
 import type { BoardColorName } from '@/lib/board-colors';
@@ -182,6 +183,17 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
 
   const isStaff = session?.user?.role === "ADMIN" || session?.user?.role === "ENGINEER";
 
+  // A real, always-visible nav link (not tucked in the account dropdown) so
+  // staff can jump straight to shop-floor tracking from anywhere on the site.
+  const productionNavLink = isStaff ? (
+    <Link key="production" href="/admin/production" onClick={()=>setMenuOpen(false)}
+      style={{ background:"transparent", padding: isMobile?"12px 14px":"7px 14px", borderRadius:8, fontSize: isMobile?15:13.5, textDecoration:"none", fontFamily:"'DM Sans',sans-serif", color:C.accent2, fontWeight:600, transition:"all 0.15s", display:"block", whiteSpace:"nowrap" }}
+      onMouseEnter={e=>{ e.currentTarget.style.background=C.bg3; }}
+      onMouseLeave={e=>{ e.currentTarget.style.background="transparent"; }}>
+      Production
+    </Link>
+  ) : null;
+
   const accountMenu = status === "authenticated" ? (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -194,9 +206,6 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
           <>
             <DropdownMenuItem asChild>
               <Link href="/admin">Admin dashboard</Link>
-            </DropdownMenuItem>
-            <DropdownMenuItem asChild>
-              <Link href="/admin/production">Production tracking</Link>
             </DropdownMenuItem>
             <DropdownMenuSeparator />
           </>
@@ -240,10 +249,11 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
         </Link>
 
         {/* Nav links — desktop only; mobile gets the drawer below */}
-        {!isMobile && <div style={{ display:"flex", gap:2, flex:1, alignItems:"center" }}>{navLinks}</div>}
+        {!isMobile && <div style={{ display:"flex", gap:2, flex:1, alignItems:"center" }}>{navLinks}{productionNavLink}</div>}
 
         {/* Right actions */}
         <div style={{ display:"flex", gap:10, alignItems:"center", flexShrink:0 }}>
+          {isStaff && <NotificationBell variant="admin" />}
           {cartCount>0 && (
             <button onClick={()=>goToPage("shop")} aria-label={`Cart with ${cartCount} items — view in shop`} style={{ cursor:"pointer", background:C.accentDim, border:`1px solid ${C.border2}`, borderRadius:8, padding:"7px 14px", fontSize:13, color:C.accent2, fontFamily:"'DM Sans',sans-serif", fontWeight:700 }}>
               🛒 {cartCount}
@@ -267,6 +277,7 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
       {isMobile && menuOpen && (
         <div style={{ borderTop:`1px solid ${C.border}`, background:C.bg0, padding:"10px 16px 16px", display:"flex", flexDirection:"column", gap:2 }}>
           {navLinks}
+          {productionNavLink}
           <div style={{ height:1, background:C.border, margin:"8px 0" }}/>
           {status === "authenticated" ? (
             <>
@@ -274,7 +285,6 @@ export function Navbar({ page, setPage, cartCount = 0 }: { page?: string; setPag
               {isStaff && (
                 <>
                   <Link href="/admin" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.accent2, fontWeight:600, fontFamily:"'DM Sans',sans-serif" }}>Admin dashboard</Link>
-                  <Link href="/admin/production" onClick={()=>setMenuOpen(false)} style={{ padding:"12px 14px", borderRadius:8, fontSize:15, textDecoration:"none", color:C.accent2, fontWeight:600, fontFamily:"'DM Sans',sans-serif" }}>Production tracking</Link>
                   <div style={{ height:1, background:C.border, margin:"8px 0" }}/>
                 </>
               )}
