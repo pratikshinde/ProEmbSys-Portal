@@ -1,5 +1,29 @@
+import type { Metadata, Viewport } from "next"
 import Link from "next/link"
 import { HardHat } from "lucide-react"
+
+// Scoped to /operator/** only — Next.js only allows one special app/manifest.ts
+// file, which would apply site-wide (see the "PWA install manifest" note in
+// CLAUDE.md's production-tracker section). Setting `manifest` per-segment
+// metadata instead keeps "Add to Home Screen" giving the operator app its own
+// name/icon/standalone display without touching the main site's own tab icon.
+export const metadata: Metadata = {
+  title: "ProPCB Work",
+  manifest: "/operator-manifest.webmanifest",
+  icons: {
+    icon: "/icons/operator-192.png",
+    apple: "/icons/operator-apple-touch-180.png",
+  },
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "ProPCB Work",
+  },
+}
+
+export const viewport: Viewport = {
+  themeColor: "#061628",
+}
 
 // The operator app's own sign-in / sign-up chrome — dark and mobile-first,
 // completely separate from the main site's /login. Public (not gated by

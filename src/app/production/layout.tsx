@@ -1,3 +1,4 @@
+import type { Metadata, Viewport } from "next"
 import { redirect } from "next/navigation"
 import Link from "next/link"
 import { HardHat } from "lucide-react"
@@ -5,6 +6,27 @@ import { auth } from "@/lib/auth"
 import { canAccessProduction } from "@/lib/roles"
 import { NotificationBell } from "@/components/production/notification-bell"
 import { SignOutButton } from "@/components/production/sign-out-button"
+
+// Same per-segment manifest as /operator/layout.tsx (see that file's own
+// comment) — this is the actual work app the operator lives in day to day,
+// so it's the one "Add to Home Screen" is really for.
+export const metadata: Metadata = {
+  title: "ProPCB Work",
+  manifest: "/operator-manifest.webmanifest",
+  icons: {
+    icon: "/icons/operator-192.png",
+    apple: "/icons/operator-apple-touch-180.png",
+  },
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "ProPCB Work",
+  },
+}
+
+export const viewport: Viewport = {
+  themeColor: "#061628",
+}
 
 // The shop-floor operator app. Its own minimal chrome (no marketing navbar) —
 // mobile-first, big, dark. Staff can view it too. Gated in middleware.ts;
