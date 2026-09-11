@@ -30,6 +30,7 @@ import { loadCamJobById } from '@/lib/load-cam-job'
 import { renderFilmPdfs } from '@/lib/gerber-svg'
 import { defaultFilmLayerSetting } from '@/lib/film-types'
 import FilmExportCard from './film-export-card'
+import SendToFabButton from './production/send-to-fab-dialog'
 
 interface CamJobListItem {
   id: string
@@ -927,6 +928,11 @@ export default function ExportPanel() {
             {panelArrayFiles && ' · includes Meta-Panelization/ (multi-panel-array Gerber + Excellon)'}
             {filmConfig.enabled && ' · includes Film/ (photo-plot film PDFs)'}
           </p>
+
+          {/* Hand this computed panel to a shop-floor operator — staff only,
+              hidden until a panel exists (see SendToFabButton's own guard). */}
+          <SendToFabButton />
+
           <div className="grid grid-cols-2 gap-2">
             <Button
               variant="outline"

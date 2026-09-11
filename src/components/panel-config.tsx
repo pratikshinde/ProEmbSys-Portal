@@ -11,7 +11,6 @@ import { Separator } from '@/components/ui/separator'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Grid3x3, Crosshair, LayoutGrid, Settings2, RotateCcw, FileDown, Play } from 'lucide-react'
 import PanelTemplatePicker from './panel-template-picker'
-import SendToFabButton from './production/send-to-fab-dialog'
 
 export default function PanelConfigPanel() {
   const panelConfig = useAppStore(s => s.panelConfig)
@@ -869,9 +868,6 @@ export default function PanelConfigPanel() {
             </div>
           </div>
         )}
-
-        {/* Send this panel to a shop-floor operator (staff only, panel required) */}
-        <SendToFabButton />
 
         {/* Create Panel Button - Bottom */}
         <Button
