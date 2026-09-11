@@ -131,6 +131,117 @@ async function main() {
     },
   })
   console.log("Seeded the ProEmbSys Standard panelization template.")
+
+  // ── Seed Users (Admin & Operator) ──────────────────────────────────────────
+  const bcrypt = await import("bcryptjs")
+  const adminPasswordHash = await bcrypt.hash("admin123", 10)
+  const operatorPasswordHash = await bcrypt.hash("operator123", 10)
+
+  await db.user.upsert({
+    where: { email: "admin@propcb.in" },
+    update: {
+      name: "Shop Owner & Admin",
+      role: "ADMIN",
+      passwordHash: adminPasswordHash,
+      isActive: true,
+    },
+    create: {
+      email: "admin@propcb.in",
+      name: "Shop Owner & Admin",
+      role: "ADMIN",
+      passwordHash: adminPasswordHash,
+      isActive: true,
+    },
+  })
+  console.log("Seeded Admin user: admin@propcb.in")
+
+  await db.user.upsert({
+    where: { email: "operator@propcb.in" },
+    update: {
+      name: "Ramesh (CNC Operator)",
+      role: "OPERATOR",
+      passwordHash: operatorPasswordHash,
+      isActive: true,
+    },
+    create: {
+      email: "operator@propcb.in",
+      name: "Ramesh (CNC Operator)",
+      role: "OPERATOR",
+      passwordHash: operatorPasswordHash,
+      isActive: true,
+    },
+  })
+  console.log("Seeded Operator user: operator@propcb.in")
+
+  // ── Seed 15 Production Stage Types ─────────────────────────────────────────
+  const stageTypes = [
+    { key: "INCOMING_QC", label: "Kitting / Incoming check", icon: "clipboard-check", color: "#38bdf8", sortHint: 1 },
+    { key: "PANEL_CUTTING", label: "Panel cutting / shearing", icon: "scissors", color: "#f59e0b", sortHint: 2 },
+    { key: "DRILLING", label: "CNC drilling", icon: "disc", color: "#ef4444", sortHint: 3 },
+    { key: "ELECTROLESS_COPPER", label: "Electroless copper / PTH", icon: "droplets", color: "#06b6d4", sortHint: 4 },
+    { key: "COPPER_IMAGE", label: "Copper image transfer", icon: "film", color: "#8b5cf6", sortHint: 5 },
+    { key: "PATTERN_PLATING", label: "Pattern plating (Cu + Sn)", icon: "layers", color: "#6366f1", sortHint: 6 },
+    { key: "ETCH_STRIP", label: "Etch & strip", icon: "flame", color: "#f97316", sortHint: 7 },
+    { key: "AOI", label: "Automated optical inspection", icon: "scan", color: "#ec4899", sortHint: 8 },
+    { key: "SOLDERMASK", label: "Solder mask (LPI)", icon: "shield", color: "#10b981", sortHint: 9 },
+    { key: "SILKSCREEN", label: "Legend / silkscreen", icon: "type", color: "#14b8a6", sortHint: 10 },
+    { key: "SURFACE_FINISH", label: "Surface finish (HASL/ENIG)", icon: "sparkles", color: "#eab308", sortHint: 11 },
+    { key: "ROUTING_DEPANEL", label: "Routing / V-score / depanel", icon: "grid", color: "#a855f7", sortHint: 12 },
+    { key: "ELECTRICAL_TEST", label: "Electrical test (flying probe / BBT)", icon: "zap", color: "#0ea5e9", sortHint: 13 },
+    { key: "FINAL_QC", label: "Final QC / inspection", icon: "check-circle", color: "#22c55e", sortHint: 14 },
+    { key: "PACKAGING_DISPATCH", label: "Packaging & dispatch", icon: "package", color: "#64748b", sortHint: 15 },
+  ]
+  for (const st of stageTypes) {
+    await db.productionStageType.upsert({
+      where: { key: st.key },
+      update: { label: st.label, icon: st.icon, color: st.color, sortHint: st.sortHint, isActive: true },
+      create: { ...st, isActive: true },
+    })
+  }
+  console.log("Seeded 15 ProductionStageType rows.")
+
+  // ── Seed Standard Routing Template ─────────────────────────────────────────
+  const TEMPLATE_ID = "cmtv5zsuq000swt409pkrib4o"
+  const template = await db.routingTemplate.upsert({
+    where: { id: TEMPLATE_ID },
+    update: {
+      name: "Standard 2-layer FR4, ENIG",
+      description: "Default standard 2-layer rigid fabrication process with vendor ENIG finish.",
+      isActive: true,
+    },
+    create: {
+      id: TEMPLATE_ID,
+      name: "Standard 2-layer FR4, ENIG",
+      description: "Default standard 2-layer rigid fabrication process with vendor ENIG finish.",
+      isActive: true,
+    },
+  })
+
+  const steps = [
+    { sequence: 1, stageTypeKey: "INCOMING_QC", slaHours: 4, photoRequired: false, qtyOutRequired: true, instruction: "Verify raw FR4 laminate specs, copper thickness, and CAM job checklist." },
+    { sequence: 2, stageTypeKey: "PANEL_CUTTING", slaHours: 4, photoRequired: false, qtyOutRequired: true, instruction: "Cut sheet to production working panel dimensions (e.g. 12x18 inch)." },
+    { sequence: 3, stageTypeKey: "DRILLING", slaHours: 8, photoRequired: false, qtyOutRequired: true, instruction: "Load CNC NC drill program from portal, inspect tool bits, drill pilot & via holes." },
+    { sequence: 4, stageTypeKey: "ELECTROLESS_COPPER", slaHours: 8, photoRequired: false, qtyOutRequired: true, instruction: "Chemical copper bath deposition for through-hole conductivity (PTH)." },
+    { sequence: 5, stageTypeKey: "COPPER_IMAGE", slaHours: 8, photoRequired: true, qtyOutRequired: true, instruction: "Apply dry film photoresist, align film plots, UV expose, develop circuitry image." },
+    { sequence: 6, stageTypeKey: "PATTERN_PLATING", slaHours: 8, photoRequired: false, qtyOutRequired: true, instruction: "Electroplate copper traces to target weight followed by tin etch-resist coating." },
+    { sequence: 7, stageTypeKey: "ETCH_STRIP", slaHours: 6, photoRequired: false, qtyOutRequired: true, instruction: "Strip dry film, alkaline etch unwanted base copper, strip tin etch-resist." },
+    { sequence: 8, stageTypeKey: "AOI", slaHours: 4, photoRequired: true, qtyOutRequired: true, instruction: "Automated optical inspection against Gerber data for shorts/opens." },
+    { sequence: 9, stageTypeKey: "SOLDERMASK", slaHours: 12, photoRequired: false, qtyOutRequired: true, instruction: "Apply liquid photoimageable (LPI) solder mask, expose pads, develop, thermal cure." },
+    { sequence: 10, stageTypeKey: "SILKSCREEN", slaHours: 6, photoRequired: false, qtyOutRequired: true, instruction: "Print component legend/silkscreen markings on top/bottom layers and cure." },
+    { sequence: 11, stageTypeKey: "SURFACE_FINISH", isOutsourced: true, slaHours: 72, photoRequired: false, qtyOutRequired: true, instruction: "Dispatch working panels to surface finish plating vendor for Electroless Nickel Immersion Gold (ENIG)." },
+    { sequence: 12, stageTypeKey: "ROUTING_DEPANEL", slaHours: 6, photoRequired: false, qtyOutRequired: true, instruction: "CNC contour routing, V-scoring, and slot milling per mechanical drawing." },
+    { sequence: 13, stageTypeKey: "ELECTRICAL_TEST", slaHours: 8, photoRequired: true, qtyOutRequired: true, instruction: "100% netlist electrical continuity and isolation test via flying probe machine." },
+    { sequence: 14, stageTypeKey: "FINAL_QC", slaHours: 4, photoRequired: true, qtyOutRequired: true, instruction: "Final dimensional, solderability, visual quality inspection and microsection verification." },
+    { sequence: 15, stageTypeKey: "PACKAGING_DISPATCH", slaHours: 4, photoRequired: true, qtyOutRequired: true, instruction: "Vacuum pack with desiccant and humidity indicator card; stamp Traveler DONE." },
+  ]
+  for (const s of steps) {
+    await db.routingTemplateStep.upsert({
+      where: { templateId_sequence: { templateId: template.id, sequence: s.sequence } },
+      update: { stageTypeKey: s.stageTypeKey, slaHours: s.slaHours, photoRequired: s.photoRequired, qtyOutRequired: s.qtyOutRequired, instruction: s.instruction, isOutsourced: s.isOutsourced ?? false },
+      create: { templateId: template.id, sequence: s.sequence, stageTypeKey: s.stageTypeKey, slaHours: s.slaHours, photoRequired: s.photoRequired, qtyOutRequired: s.qtyOutRequired, instruction: s.instruction, isOutsourced: s.isOutsourced ?? false },
+    })
+  }
+  console.log("Seeded Standard Routing Template with 15 steps.")
 }
 
 main()
