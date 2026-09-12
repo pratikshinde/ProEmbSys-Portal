@@ -16,7 +16,7 @@ COPY patches/ ./patches/
 COPY prisma/ ./prisma/
 
 # Install dependencies (runs postinstall: prisma generate && patch-package)
-RUN npm ci
+RUN npm install
 
 # Stage 2: Builder
 FROM node:20-bookworm-slim AS builder
