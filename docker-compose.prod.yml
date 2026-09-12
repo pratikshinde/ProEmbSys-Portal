@@ -14,6 +14,7 @@ services:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-propcb}:${POSTGRES_PASSWORD:-propcb_prod_password}@db:5432/${POSTGRES_DB:-propcb}?schema=public
       - UPLOADS_DIR=/app/uploads
       - NODE_OPTIONS=--max-old-space-size=1536
+      - AUTH_TRUST_HOST=true
     volumes:
       - propcb_uploads:/app/uploads
     depends_on:
