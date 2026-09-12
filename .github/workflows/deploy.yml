@@ -1,0 +1,61 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+jobs:
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            echo "=========================================="
+            echo " Starting Deployment on AWS EC2..."
+            echo "=========================================="
+
+            cd ~/propcb-website
+
+            echo "1. Pulling latest changes from GitHub..."
+            git pull origin main
+
+            echo "2. Rebuilding and starting containers..."
+            docker compose -f docker-compose.prod.yml up -d --build
+
+            echo "3. Running Prisma schema push..."
+            docker compose -f docker-compose.prod.yml exec -T app npx prisma db push
+
+            echo "4. Checking application health..."
+            sleep 10
+            docker compose -f docker-compose.prod.yml exec -T app node -e "
+              fetch('http://127.0.0.1:3000/api/health')
+                .then(res => {
+                  if (!res.ok) throw new Error('Health check returned HTTP ' + res.status);
+                  console.log('Health check PASSED! Status: ' + res.status);
+                })
+                .catch(err => {
+                  console.error('Health check FAILED:', err);
+                  process.exit(1);
+                });
+            "
+
+            echo "5. Cleaning up dangling Docker images..."
+            docker image prune -f
+
+            echo "=========================================="
+            echo " Deployment Finished Successfully!"
+            echo "=========================================="
