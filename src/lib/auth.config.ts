@@ -1,4 +1,5 @@
 import type { NextAuthConfig } from "next-auth"
+import type { Role } from "@prisma/client"
 
 // Edge-safe subset of the auth config — used directly by middleware.ts, which
 // runs on the Edge runtime and cannot load the Prisma adapter or bcryptjs.
@@ -9,6 +10,7 @@ export const authConfig: NextAuthConfig = {
     signIn: "/login",
     error: "/login",
   },
+  session: { strategy: "jwt" },
   callbacks: {
     authorized({ auth, request: { nextUrl } }) {
       const { pathname } = nextUrl
@@ -27,6 +29,20 @@ export const authConfig: NextAuthConfig = {
         return Response.redirect(new URL(auth?.user ? "/" : "/operator/login", nextUrl))
       }
       return true
+    },
+    async jwt({ token, user }) {
+      if (user) {
+        token.role = (user as { role: Role }).role
+        token.sub = user.id
+      }
+      return token
+    },
+    async session({ session, token }) {
+      if (session.user) {
+        session.user.role = token.role as Role
+        session.user.id = token.sub as string
+      }
+      return session
     },
   },
   providers: [],
