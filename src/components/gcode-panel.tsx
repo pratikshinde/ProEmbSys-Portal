@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
+import SlotDrillControl from '@/components/slot-drill-control'
 import { Separator } from '@/components/ui/separator'
 import {
   Cpu, Play, AlertTriangle, CheckCircle2, Settings2, Download, RotateCcw, FileCode, Grid3x3,
@@ -230,6 +231,11 @@ export default function GcodePanel() {
               onCheckedChange={v => updateGcodeContext({ mirrorX: v })}
               className="scale-75"
             />
+          </div>
+          {/* Drill slots — same control (and same PanelConfig fields) as the
+              Info & Export tab, so the G-code and the export can't disagree. */}
+          <div className="mt-3">
+            <SlotDrillControl />
           </div>
         </div>
 

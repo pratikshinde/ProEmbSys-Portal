@@ -1,0 +1,375 @@
+/**
+ * tracespace plot tree -> path/paint operations, parameterised by a sink.
+ *
+ * Extracted verbatim from `film/plot-to-pdf.ts` so the PDF (photo-plot film)
+ * and raster (AOI reference) outputs share ONE traversal. Two independent
+ * walkers would drift, and the raster one is far harder to eyeball for
+ * correctness than a film a shop visually checks on a lightbox.
+ *
+ * Everything below is geometry + polarity only: mm in, sink calls out. It
+ * knows nothing about PDF points, canvas pixels, Y-flips or page margins —
+ * the sink's own coordinate transform handles all of that. In particular
+ * this module NEVER negates Y (see invariant 1 below).
+ *
+ * ── The four invariants this traversal exists to protect ──────────────────
+ *
+ * Ports the 10 shape/graphic cases from `@tracespace/renderer`'s
+ * `shapeToElement`/`renderPath` (the correct reference for *structure*), but
+ * THREE things there must not be copied — each would ship a real artwork
+ * defect:
+ *
+ * 1. Coordinates stay in the source's own Y-UP handedness. The renderer
+ *    negates Y everywhere (`cy: -cy`, `M${x} ${-y}`, ...) because SVG is
+ *    Y-down. Copying that verbatim flips the output vertically: a mirror
+ *    composed with a 180 deg rotation, exactly the emulsion-side error the
+ *    "never mirror" export option exists to prevent. A Y-down sink (canvas)
+ *    must get its flip from its own transform, never from here.
+ * 2. Arcs are parameterized directly from `center`/`radius`/`start[2]`/
+ *    `end[2]` and split at <=90 deg, not via SVG arc syntax (which needs a
+ *    sweep-flag flip for Y-down and a two-arc special case for a full
+ *    circle — neither applies to a Bezier-based emitter).
+ * 3. `LayeredShape.erase` handling: the renderer wraps everything painted SO
+ *    FAR in a `clipPath` of the erase shape, and `clipPath` INTERSECTS — the
+ *    opposite of erasing. For a macro with an exposure=0 primitive
+ *    (thermals, donuts) that renders only the hole and discards the pad.
+ *    This module instead applies a COMPLEMENT clip (covering rect + the
+ *    erase subpath, even-odd) to every shape painted BEFORE that eraser,
+ *    which is the correct subtraction. See `emitLayeredShape`'s own docs.
+ *
+ * And the fourth, which is about how fills compose:
+ *
+ * 4. `plotRectPath` (upstream) turns a stroke made with a RECTANGULAR
+ *    aperture into a `LayeredShape` of one polygon per line segment,
+ *    polygons OVERLAPPING at the joints, none of them `erase`. Filling that
+ *    under one shared even-odd path would cancel every overlap and punch a
+ *    hole in every corner. Rule enforced throughout: ONE fill operator per
+ *    graphic, and one per non-erase LayeredShape sub-shape. Union comes from
+ *    painting independently, never from winding rules. A sink must therefore
+ *    never batch or coalesce the fills it is handed.
+ *
+ * Clear polarity (`%LPC*%`) and macro `erase` are DISTINCT mechanisms and
+ * must not be unified: clear polarity removes from the whole image (paint
+ * the background color), `erase` subtracts within one aperture's own
+ * geometry (complement clip). Polarity comes from the `@tracespace/plotter`
+ * patch in `patches/@tracespace+plotter+*.patch` (see that patch's own
+ * comments) — the shipped `.d.ts` is deliberately left untouched, so the
+ * `polarity` field is typed locally here via `PolarizedGraphic` rather than
+ * patched into the package's types.
+ */
+import type {
+  ImageTree,
+  ImageGraphic,
+  ImagePath,
+  Shape,
+  SimpleShape,
+  LayeredShape,
+  PathSegment,
+} from '@tracespace/plotter'
+
+/** Gerber load polarity, mirroring the plotter patch's own field. */
+export type GraphicPolarity = 'dark' | 'clear'
+
+export type PolarizedGraphic = ImageGraphic & { polarity?: GraphicPolarity }
+export type PolarizedImageTree = Omit<ImageTree, 'children'> & {
+  children: PolarizedGraphic[]
+}
+
+/**
+ * The paint surface this traversal drives. Deliberately shaped as the exact
+ * method subset `PdfContentBuilder` (film/pdf-writer.ts) already exposes, so
+ * the PDF path needs no adapter and the extraction of this module was a
+ * provably behaviour-free move. Coordinates are always mm in the source's
+ * own Y-up space; `strokeCurrentPath`'s width is likewise mm.
+ *
+ * ⚠ A sink must honour invariant 4 above: each `fillEvenOdd` /
+ * `strokeCurrentPath` call is its own independent paint. Never coalesce.
+ */
+export interface PathSink {
+  moveTo(x: number, y: number): void
+  lineTo(x: number, y: number): void
+  curveTo(x1: number, y1: number, x2: number, y2: number, x3: number, y3: number): void
+  closePath(): void
+  rectPath(x: number, y: number, w: number, h: number): void
+  fillEvenOdd(): void
+  strokeCurrentPath(widthMm: number): void
+  setGrayFill(g: 0 | 1): void
+  setGrayStroke(g: 0 | 1): void
+  save(): void
+  restore(): void
+  clipEvenOddNoPaint(): void
+}
+
+/** 4/3 * (sqrt(2) - 1) — NOT used directly (see `emitArc`'s per-segment
+ *  `tan(delta/4)` formula, the general form for an arbitrary-angle arc);
+ *  kept only as the well-known reference constant for the special case of
+ *  a single 90 deg quadrant, which the general formula reduces to exactly. */
+const QUARTER_ARC_KAPPA = 0.5522847498307936
+void QUARTER_ARC_KAPPA // documentation constant; see comment above
+
+/** Default bound for a `LayeredShape` erase complement-clip's covering
+ *  rectangle — generous enough to contain any real aperture's local geometry
+ *  (macro coordinates are always small, single-digit-to-low-triple-digit mm)
+ *  with no risk of ever clipping something it shouldn't.
+ *
+ *  ⚠ A raster sink should override this via `WalkOptions.eraseClipBoundMm`:
+ *  under a px/mm transform the default becomes ~10^7 device px, which some
+ *  rasterisers handle poorly. Any bound that covers the real output extent
+ *  is equally correct — the rectangle only exists to be "everything". */
+const DEFAULT_ERASE_CLIP_BOUND_MM = 1e6
+
+export interface WalkOptions {
+  /** See `DEFAULT_ERASE_CLIP_BOUND_MM`. */
+  eraseClipBoundMm?: number
+}
+
+/**
+ * Walks one top-level graphic onto the sink. `foreground`/`background` are
+ * the sink's two ink values (0 = black, 1 = white); which one a graphic
+ * actually paints depends on its own Gerber polarity — see
+ * `grayForPolarity`.
+ */
+export function walkGraphic(
+  sink: PathSink,
+  graphic: PolarizedGraphic,
+  foreground: 0 | 1,
+  background: 0 | 1,
+  warnings: string[],
+  opts: WalkOptions = {}
+): void {
+  const eraseBound = opts.eraseClipBoundMm ?? DEFAULT_ERASE_CLIP_BOUND_MM
+  const gray = grayForPolarity(graphic.polarity, foreground, background)
+
+  if (graphic.type === 'imageShape') {
+    emitShape(sink, graphic.shape, gray, eraseBound)
+  } else if (graphic.type === 'imagePath') {
+    emitPath(sink, graphic, gray, warnings)
+  } else if (graphic.type === 'imageRegion') {
+    if (graphic.segments.length === 0) return
+    emitSegmentsPath(sink, graphic.segments)
+    sink.closePath()
+    sink.setGrayFill(gray)
+    sink.fillEvenOdd()
+  }
+}
+
+export function grayForPolarity(
+  graphicPolarity: GraphicPolarity | undefined,
+  foreground: 0 | 1,
+  background: 0 | 1
+): 0 | 1 {
+  // Spec default (no %LP seen yet) is dark -> foreground, matching the
+  // plotter patch's own `zDarkPolarity` initial value.
+  return graphicPolarity === 'clear' ? background : foreground
+}
+
+function emitShape(sink: PathSink, shape: Shape, gray: 0 | 1, eraseBound: number): void {
+  if (shape.type === 'layeredShape') {
+    emitLayeredShape(sink, shape, gray, eraseBound)
+    return
+  }
+  emitSimpleShapePath(sink, shape)
+  sink.setGrayFill(gray)
+  sink.fillEvenOdd()
+}
+
+/**
+ * A LayeredShape's sub-shapes paint in array order; a sub-shape flagged
+ * `erase` subtracts from every sub-shape BEFORE it (matches Gerber macro
+ * semantics: an exposure=0 primitive knocks a hole in what came before it
+ * in the same aperture, not what comes after). Implemented as a complement
+ * clip — for each non-erase sub-shape, intersect the clip region with the
+ * complement (covering-rect minus subpath, even-odd) of every erase
+ * sub-shape that appears LATER in the array, then paint. De Morgan's:
+ * intersecting N complements equals intersecting with the complement of
+ * their union, so applying them one at a time via `clipEvenOddNoPaint` is
+ * exact, not an approximation.
+ */
+function emitLayeredShape(sink: PathSink, shape: LayeredShape, gray: 0 | 1, eraseBound: number): void {
+  const subs = shape.shapes
+  for (let i = 0; i < subs.length; i++) {
+    const sub = subs[i]
+    if (sub.erase) continue // erase sub-shapes never paint themselves
+
+    const laterErasers = subs.slice(i + 1).filter((s) => s.erase)
+    sink.save()
+    for (const eraser of laterErasers) {
+      sink.rectPath(-eraseBound, -eraseBound, 2 * eraseBound, 2 * eraseBound)
+      emitSimpleShapePath(sink, eraser)
+      sink.clipEvenOddNoPaint()
+    }
+    emitSimpleShapePath(sink, sub)
+    sink.setGrayFill(gray)
+    sink.fillEvenOdd()
+    sink.restore()
+  }
+}
+
+function emitPath(
+  sink: PathSink,
+  path: ImagePath,
+  gray: 0 | 1,
+  warnings: string[]
+): void {
+  if (path.width <= 0) {
+    warnings.push(
+      `Zero/negative-width stroked path skipped (width=${path.width}mm) — PDF defines 0 w as the thinnest line the device can render, a visible hairline not present in the source.`
+    )
+    return
+  }
+  if (path.segments.length === 0) return
+
+  // A single zero-length segment (D01 to the current point) is how
+  // tracespace represents a point flash drawn via a moving-tool aperture.
+  // PDF's "single-point subpath with a round cap draws a dot" behavior is
+  // inconsistently implemented across RIPs, so emit an explicit filled
+  // circle instead of relying on it.
+  if (path.segments.length === 1) {
+    const seg = path.segments[0]
+    if (seg.type === 'line' && seg.start[0] === seg.end[0] && seg.start[1] === seg.end[1]) {
+      circlePath(sink, seg.start[0], seg.start[1], path.width / 2)
+      sink.setGrayFill(gray)
+      sink.fillEvenOdd()
+      return
+    }
+  }
+
+  emitSegmentsPath(sink, path.segments)
+  sink.setGrayStroke(gray)
+  sink.strokeCurrentPath(path.width)
+}
+
+function emitSimpleShapePath(sink: PathSink, shape: SimpleShape): void {
+  switch (shape.type) {
+    case 'circle':
+      circlePath(sink, shape.cx, shape.cy, shape.r)
+      return
+    case 'rectangle':
+      rectanglePath(sink, shape.x, shape.y, shape.xSize, shape.ySize, shape.r)
+      return
+    case 'polygon': {
+      const pts = shape.points
+      if (pts.length === 0) return
+      sink.moveTo(pts[0][0], pts[0][1])
+      for (let i = 1; i < pts.length; i++) sink.lineTo(pts[i][0], pts[i][1])
+      sink.closePath()
+      return
+    }
+    case 'outline':
+      emitSegmentsPath(sink, shape.segments)
+      sink.closePath()
+      return
+  }
+}
+
+function circlePath(sink: PathSink, cx: number, cy: number, r: number): void {
+  if (r <= 0) return
+  sink.moveTo(cx + r, cy)
+  emitArc(sink, cx, cy, r, 0, 2 * Math.PI)
+  sink.closePath()
+}
+
+/** Rounded-rectangle path (RectangleShape.r = corner radius, the
+ *  obround/rounded-pad case) — a plain `re` would grow the pad at the
+ *  corners, so this walks the 4 straight edges + 4 quarter-circle corners
+ *  explicitly, CCW starting from the bottom edge. */
+function rectanglePath(
+  sink: PathSink,
+  x: number,
+  y: number,
+  xSize: number,
+  ySize: number,
+  r: number | undefined
+): void {
+  if (!r || r <= 0) {
+    sink.rectPath(x, y, xSize, ySize)
+    return
+  }
+  const rr = Math.min(r, xSize / 2, ySize / 2)
+  const HALF_PI = Math.PI / 2
+
+  sink.moveTo(x + rr, y)
+  sink.lineTo(x + xSize - rr, y)
+  emitArc(sink, x + xSize - rr, y + rr, rr, -HALF_PI, 0)
+  sink.lineTo(x + xSize, y + ySize - rr)
+  emitArc(sink, x + xSize - rr, y + ySize - rr, rr, 0, HALF_PI)
+  sink.lineTo(x + rr, y + ySize)
+  emitArc(sink, x + rr, y + ySize - rr, rr, HALF_PI, Math.PI)
+  sink.lineTo(x, y + rr)
+  emitArc(sink, x + rr, y + rr, rr, Math.PI, 3 * HALF_PI)
+  sink.closePath()
+}
+
+/** Walks a plot-tree `PathSegment[]` into the sink's current path,
+ *  mirroring the renderer's own discontinuity detection (`M` only when the
+ *  previous segment's end doesn't match this one's start) so a
+ *  region/outline with multiple disjoint rings (a hole) becomes multiple
+ *  subpaths under one even-odd fill, not one continuous (wrong) path. */
+function emitSegmentsPath(sink: PathSink, segments: PathSegment[]): void {
+  let prevEndX: number | null = null
+  let prevEndY: number | null = null
+
+  for (const seg of segments) {
+    const [sx, sy] = seg.start
+    if (prevEndX === null || prevEndX !== sx || prevEndY !== sy) {
+      sink.moveTo(sx, sy)
+    }
+
+    if (seg.type === 'line') {
+      sink.lineTo(seg.end[0], seg.end[1])
+    } else {
+      emitArc(sink, seg.center[0], seg.center[1], seg.radius, seg.start[2], seg.end[2])
+    }
+
+    prevEndX = seg.end[0]
+    prevEndY = seg.end[1]
+  }
+}
+
+/**
+ * Emits `curveTo` calls approximating the circular arc from `theta0` to
+ * `theta1` (radians, signed — negative = clockwise) around `(cx, cy)` at
+ * radius `r`. Assumes the sink's current point is already at the arc's
+ * start `(cx + r*cos(theta0), cy + r*sin(theta0))` (true for every call
+ * site: either a preceding `moveTo`/`lineTo` landed there, or (for
+ * `circlePath`) the caller places it there itself).
+ *
+ * Splits into <=90 deg sub-arcs (the standard accuracy bound for a single
+ * cubic Bezier per arc) and uses the general per-segment control-point
+ * formula `alpha = (4/3) * tan(delta/4)` — this is the SAME formula
+ * `QUARTER_ARC_KAPPA` is the well-known special case of at exactly delta =
+ * 90 deg, so no separate quadrant-specific code path is needed. A full
+ * circle (delta = 2*PI) needs no special case either, unlike an SVG `A`
+ * command — it simply splits into 4 exact quadrants.
+ */
+function emitArc(
+  sink: PathSink,
+  cx: number,
+  cy: number,
+  r: number,
+  theta0: number,
+  theta1: number
+): void {
+  const totalDelta = theta1 - theta0
+  if (totalDelta === 0 || r <= 0) return
+
+  // -1e-9 guards against a delta that's floating-point-adjacent to an exact
+  // multiple of 90 deg (e.g. 2*PI computed as 6.283185307179587) rounding
+  // UP into one extra, unnecessary (but still correct) sub-arc.
+  const steps = Math.max(1, Math.ceil(Math.abs(totalDelta) / (Math.PI / 2) - 1e-9))
+  const stepDelta = totalDelta / steps
+
+  for (let i = 0; i < steps; i++) {
+    const a0 = theta0 + stepDelta * i
+    const a1 = theta0 + stepDelta * (i + 1)
+    const alpha = (4 / 3) * Math.tan((a1 - a0) / 4)
+
+    const p1x = cx + r * Math.cos(a1)
+    const p1y = cy + r * Math.sin(a1)
+    const c1x = cx + r * Math.cos(a0) - alpha * r * Math.sin(a0)
+    const c1y = cy + r * Math.sin(a0) + alpha * r * Math.cos(a0)
+    const c2x = p1x + alpha * r * Math.sin(a1)
+    const c2y = p1y - alpha * r * Math.cos(a1)
+
+    sink.curveTo(c1x, c1y, c2x, c2y, p1x, p1y)
+  }
+}

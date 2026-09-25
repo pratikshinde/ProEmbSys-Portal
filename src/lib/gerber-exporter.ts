@@ -37,6 +37,8 @@ import { generateRoutFile, generateMouseBiteDrill } from './routing/emit-excello
 import type { GcodeFile } from './routing/gcode'
 import type { PanelArrayResult } from './panel-array'
 import type { FilmConfig, FilmPolarity } from './film-types'
+import type { AoiGeneratedFile } from './aoi/types'
+import { resolveSlotDrillSettings, slotDrillPoints } from './drill-slots'
 import { zipArtifacts, type CamArtifact } from './share/artifacts'
 import { buildFilmManifest, renderFilmReadme, type FilmManifest } from './share/manifest'
 
@@ -134,6 +136,130 @@ export interface FilmRenderer {
 }
 
 /**
+ * Every layer belongs to a design — callers that have never heard of
+ * designs (or a single-design panel) get one synthetic id, so every
+ * computation here (which is always PER-DESIGN) reduces to exactly a single
+ * global computation in that case.
+ *
+ * Computes a UNIFORM base offset PER DESIGN from the layer that sizes that
+ * design — explicit 'outline' first, else the largest visible layer. All of
+ * one design's layers must use that SAME offset so they align perfectly in
+ * the panel; a different design has its own unrelated native-coordinate
+ * origin and must never share another design's offset. Shared with
+ * `computePanelResult`/`generateGcodeFilesAction`/
+ * `generatePanelArrayFilesAction` via `resolveDesignGeometry` so all four
+ * agree — see that function's own docs.
+ *
+ * Also computes per-design L-shape-mark eligibility — a rectangular design
+ * sharing a merged file with a non-rectangular one must not lose its own
+ * marks, so this is never a single panel-wide flag (see the D-code/macro
+ * remap section in CLAUDE.md).
+ *
+ * Extracted out of `buildPanelArtifacts` so `buildPanelizedCopperSources`
+ * (the AOI reference generator's panelized-content builder) can reuse the
+ * EXACT same per-design offset/config a real export produces, rather than
+ * risk a second, independently-derived copy drifting from it — an AOI
+ * reference computed against the wrong offset or the wrong L-shape-mark
+ * eligibility would silently disagree with the board that's actually
+ * fabricated, defeating the whole point of an inspection reference.
+ */
+export function computeDesignOffsetsAndConfigs(
+  layers: LayerFile[],
+  config: PanelConfig
+): {
+  layersWithDesignId: (LayerFile & { designId: string })[]
+  designIds: string[]
+  baseOffsetByDesign: Map<string, BaseOffset>
+  effectiveConfigByDesign: Map<string, PanelConfig>
+} {
+  const layersWithDesignId = layers.map(l => ({ ...l, designId: l.designId ?? '__default__' }))
+  const designIds = [...new Set(layersWithDesignId.map(l => l.designId))]
+
+  const baseOffsetByDesign = new Map<string, BaseOffset>()
+  const effectiveConfigByDesign = new Map<string, PanelConfig>()
+  for (const designId of designIds) {
+    const designLayers = layersWithDesignId.filter(l => l.designId === designId)
+    const geometry = resolveDesignGeometry(designLayers)
+    if (geometry) {
+      baseOffsetByDesign.set(designId, geometry.datum)
+      console.log(`[Export] Design "${designId}" base offset from ${geometry.fromFallback ? 'largest-area fallback layer' : 'outline'}: (${geometry.datum.x.toFixed(3)}, ${geometry.datum.y.toFixed(3)})`)
+    } else {
+      console.warn(`[Export] Design "${designId}" has no layer with usable bounds — its layers will use their own bounds for offset (may cause misalignment)`)
+    }
+
+    const outlineLayer = designLayers.find(l => l.type === 'outline' && l.parsedLayer?.bounds)
+    let outlineIsRectangular = false
+    if (config.enableLShapeMarks && outlineLayer?.parsedLayer) {
+      outlineIsRectangular = isRectangularOutline(outlineLayer.parsedLayer)
+      if (!outlineIsRectangular) {
+        console.warn(`[Export] Design "${designId}" outline is not rectangular — skipping its L-shape marks`)
+      }
+    }
+    effectiveConfigByDesign.set(designId, outlineIsRectangular ? config : { ...config, enableLShapeMarks: false })
+  }
+
+  return { layersWithDesignId, designIds, baseOffsetByDesign, effectiveConfigByDesign }
+}
+
+/**
+ * The panelized Top_Copper / Bottom_Copper Gerber text for a computed
+ * panel — the AOI reference generator's equivalent of `filmSources` inside
+ * `buildPanelArtifacts`. Deliberately its own small function rather than a
+ * full `buildPanelArtifacts` call: AOI only ever needs these two merge
+ * groups, and running the whole export (drill, routing, README, every other
+ * layer) for a raster that only reads two of the results would be wasted
+ * work on every "Generate" click. Reuses `computeDesignOffsetsAndConfigs`
+ * so the offset/L-shape-mark-eligibility computation can never disagree
+ * with what a real export produces — an AOI reference built from a
+ * different offset would silently fail to match the fabricated board.
+ *
+ * Auto-upgrades `outputFormat`'s integer digits exactly like
+ * `buildPanelArtifacts` does, for the same reason (coordinate truncation on
+ * an unusually large panel).
+ */
+export function buildPanelizedCopperSources(
+  layers: LayerFile[],
+  panel: PanelResult,
+  config: PanelConfig,
+  outputFormat?: OutputFormat
+): { top: string | null; bottom: string | null; warnings: string[] } {
+  const warnings: string[] = []
+  const fmt: OutputFormat = { ...(outputFormat || DEFAULT_OUTPUT_FORMAT) }
+  const neededDigits = autoDetectIntegerDigits(panel.panelWidth, panel.panelHeight, fmt.unit)
+  if (fmt.integerDigits < neededDigits) fmt.integerDigits = neededDigits
+
+  const { layersWithDesignId, designIds, baseOffsetByDesign, effectiveConfigByDesign } =
+    computeDesignOffsetsAndConfigs(layers, config)
+  const designOrder = panel.designs.length > 0 ? panel.designs.map(d => d.designId) : designIds
+  for (const id of designIds) if (!designOrder.includes(id)) designOrder.push(id)
+
+  const buildSide = (side: 'top' | 'bottom'): string | null => {
+    const sideLayers = layersWithDesignId.filter(l => l.type === 'copper' && l.side === side)
+    if (sideLayers.length === 0) return null
+
+    const contributors: GerberExportContributor[] = []
+    for (const designId of designOrder) {
+      const layerFile = sideLayers.find(l => l.designId === designId)
+      if (!layerFile?.parsedLayer) continue
+      const placements = panel.placements.filter(p => p.designId === designId)
+      if (placements.length === 0) continue
+      const baseOffset = baseOffsetByDesign.get(designId)
+      if (!baseOffset) continue
+      const effectiveConfig = effectiveConfigByDesign.get(designId) ?? config
+      contributors.push({ parsedLayer: layerFile.parsedLayer, rawContent: layerFile.content, baseOffset, placements, effectiveConfig })
+    }
+    if (contributors.length === 0) return null
+
+    const groupWarnings: string[] = []
+    const panelized = generateMergedPanelizedGerber(contributors, panel, config, fmt, 'copper', side, groupWarnings)
+    for (const w of groupWarnings) warnings.push(`${side === 'top' ? 'Top_Copper' : 'Bottom_Copper'}: ${w}`)
+    return panelized
+  }
+
+  return { top: buildSide('top'), bottom: buildSide('bottom'), warnings }
+}
+
+/**
  * Export all panelized Gerber files as a ZIP download.
  */
 /**
@@ -207,47 +333,8 @@ export async function buildPanelArtifacts(
     console.warn(`[Export] Auto-upgraded Gerber format to ${neededDigits}.${fmt.decimalDigits} to prevent coordinate truncation`)
   }
 
-  // Every layer belongs to a design — callers that have never heard of
-  // designs (or a single-design panel) get one synthetic id, so every
-  // computation below (which is now always PER-DESIGN) reduces to exactly
-  // today's single global computation in that case.
-  const layersWithDesignId = layers.map(l => ({ ...l, designId: l.designId ?? '__default__' }))
-  const designIds = [...new Set(layersWithDesignId.map(l => l.designId))]
-
-  // CRITICAL: Compute a UNIFORM base offset PER DESIGN from the layer that
-  // sizes that design — explicit 'outline' first, else the largest visible
-  // layer. All of one design's layers must use that SAME offset so they
-  // align perfectly in the panel; a different design has its own unrelated
-  // native-coordinate origin and must never share another design's offset.
-  // Shared with `computePanelResult`/`generateGcodeFilesAction`/
-  // `generatePanelArrayFilesAction` via `resolveDesignGeometry` so all four
-  // agree — see that function's own docs.
-  const baseOffsetByDesign = new Map<string, BaseOffset>()
-  // Per-design L-shape-mark eligibility — a rectangular design sharing a
-  // merged file with a non-rectangular one must not lose its own marks, so
-  // this is never a single panel-wide flag (see the D-code/macro remap
-  // section in CLAUDE.md).
-  const effectiveConfigByDesign = new Map<string, PanelConfig>()
-  for (const designId of designIds) {
-    const designLayers = layersWithDesignId.filter(l => l.designId === designId)
-    const geometry = resolveDesignGeometry(designLayers)
-    if (geometry) {
-      baseOffsetByDesign.set(designId, geometry.datum)
-      console.log(`[Export] Design "${designId}" base offset from ${geometry.fromFallback ? 'largest-area fallback layer' : 'outline'}: (${geometry.datum.x.toFixed(3)}, ${geometry.datum.y.toFixed(3)})`)
-    } else {
-      console.warn(`[Export] Design "${designId}" has no layer with usable bounds — its layers will use their own bounds for offset (may cause misalignment)`)
-    }
-
-    const outlineLayer = designLayers.find(l => l.type === 'outline' && l.parsedLayer?.bounds)
-    let outlineIsRectangular = false
-    if (config.enableLShapeMarks && outlineLayer?.parsedLayer) {
-      outlineIsRectangular = isRectangularOutline(outlineLayer.parsedLayer)
-      if (!outlineIsRectangular) {
-        console.warn(`[Export] Design "${designId}" outline is not rectangular — skipping its L-shape marks`)
-      }
-    }
-    effectiveConfigByDesign.set(designId, outlineIsRectangular ? config : { ...config, enableLShapeMarks: false })
-  }
+  const { layersWithDesignId, designIds, baseOffsetByDesign, effectiveConfigByDesign } =
+    computeDesignOffsetsAndConfigs(layers, config)
   // Kept for the drill export below and as the single-design fallback.
   const globalBaseOffset: BaseOffset | undefined = baseOffsetByDesign.get(designIds[0])
 
@@ -740,6 +827,57 @@ export async function exportStencilFiles(
   saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_Stencil.zip`)
 }
 
+export async function exportAoiFiles(
+  aoiFiles: AoiGeneratedFile[],
+  info?: PanelInfo
+): Promise<void> {
+  const partNumber = sanitizeForFilename(info?.pcbName, 'PCB')
+  const customerName = sanitizeForFilename(info?.customerRef, 'Customer')
+  const version = sanitizeVersionForFilename(info?.revision, 'v1')
+  const dateStr = sanitizeForFilename(info?.date, formatPanelDate())
+
+  const zip = new JSZip()
+  const folder = zip.folder('aoi')
+  if (!folder) throw new Error('Failed to create ZIP folder')
+
+  for (const f of aoiFiles) folder.file(f.filename, f.kind === 'binary' ? f.bytes : f.content)
+
+  const lines: string[] = []
+  lines.push('=== AOI Inspection Reference ===')
+  lines.push('')
+  lines.push(`Generated: ${new Date().toISOString()}`)
+  lines.push('')
+  lines.push('Binary copper rasters (1-bit greyscale PNG, copper = white unless aoi.json')
+  lines.push('says otherwise) of the ACTIVE DESIGN\'S OWN SINGLE BOARD — never the whole')
+  lines.push('panel tiled — at 1:1 real-world scale via the pxPerMm value in aoi.json.')
+  lines.push('The Bottom_*.png images are horizontally mirrored, as a camera sees the')
+  lines.push('board once flipped over. Every drilled hole (component holes, vias and')
+  lines.push('slots) is already punched out of the copper, so a plated pad or via renders')
+  lines.push('as a real donut — a ring of copper around a substrate-coloured hole —')
+  lines.push('exactly as a camera sees it on a real board, not as a solid disc.')
+  lines.push('')
+  lines.push('Top_Drill.png / Bottom_Drill.png are a SUPPLEMENTARY standalone mask of the')
+  lines.push('same hole geometry (every hole painted in the same value the copper images')
+  lines.push('use for copper, at identical dimensions and scale) — useful for registration')
+  lines.push('or for classifying a defect near a hole, but not required for a plain diff:')
+  lines.push('the copper images above already account for every hole on their own.')
+  lines.push('')
+  lines.push('aoi.json maps every pixel back to a board millimetre coordinate (mmToPx per')
+  lines.push('image). Since this is a single un-panelized board, there are no panel')
+  lines.push('fiducials or tooling holes to list (those only exist on a computed panel\'s')
+  lines.push('own ribs) — the manifest\'s fiducials/holes arrays are always empty.')
+  lines.push('')
+  lines.push('This is a reference for automated optical inspection, not a fabrication')
+  lines.push('file — do not send these PNGs to a fab.')
+  lines.push('')
+  lines.push('--- Files ---')
+  for (const f of aoiFiles) lines.push(f.filename)
+  folder.file('README.txt', lines.join('\n'))
+
+  const blob = await zip.generateAsync({ type: 'blob' })
+  saveAs(blob, `${partNumber}_${customerName}_${version}_${dateStr}_AOI.zip`)
+}
+
 /**
  * The routing section of a README. Shared by both exports.
  *
@@ -1104,6 +1242,7 @@ export function generatePanelizedDrill(
   }
 
   const fmtCoord = (v: number) => formatDrillCoordinate(v, drillFmt)
+  const slotDrill = resolveSlotDrillSettings(config)
 
   // Drill hits from drill layers — repeat for each panel position
   for (const dl of drillLayers) {
@@ -1156,6 +1295,25 @@ export function generatePanelizedDrill(
       if (slot.diameterMm <= 0) continue
       const tCode = getTCode(slot.diameterMm)
       lines.push(tCode)
+
+      // Slots-as-drills (the default): the same tool, but a row of overlapping
+      // ROUND hits along the slot's centreline instead of one G85 line — for
+      // shops whose drilling machine can only drill. Reported live as "drill
+      // slots are replaced by two drills" (the parser was reading only the two
+      // endpoints as holes) and "we need drill slots to output multiple drills
+      // in the export panel". The hit list is computed ONCE in the slot's own
+      // (layer-local) frame and then translated per placement, so every
+      // placement gets an identical, correctly-registered set.
+      if (slotDrill.asDrills) {
+        const localHits = slotDrillPoints(slot, slot.diameterMm, slotDrill.pitchRatio)
+        for (const pos of positions) {
+          for (const p of localHits) {
+            lines.push(`X${fmtCoord(p.x + pos.x + boX)}Y${fmtCoord(p.y + pos.y + boY)}`)
+          }
+        }
+        continue
+      }
+
       for (const pos of positions) {
         const sx = slot.start.x + pos.x + boX
         const sy = slot.start.y + pos.y + boY

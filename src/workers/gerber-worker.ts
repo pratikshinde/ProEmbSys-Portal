@@ -30,6 +30,10 @@ import { flattenPlotTree, computeSpacing } from '../lib/dfm/capsules'
 import { extractPasteApertures } from '../lib/stencil-geometry'
 import { gerberToFilmPdf } from '../lib/film/gerber-to-film'
 import type { FilmPolarity } from '../lib/film/plot-to-pdf'
+import { gerberToAoiBitmap, drillMaskBitmap, type AoiCanvas, type AoiCanvasFactory } from '../lib/aoi/gerber-to-aoi'
+import { encodeBinaryPng } from '../lib/aoi/png-encode'
+import type { Canvas2DLike, DrillHoleGroup, DrillSlotGroup } from '../lib/aoi/plot-to-raster'
+import type { AoiSide, AoiImageKind } from '../lib/aoi/types'
 
 export interface GerberWorkerResult {
   svgFragment: string
@@ -485,7 +489,145 @@ function renderFilmPdf(input: FilmRenderInput): FilmRenderOutput {
   return { files }
 }
 
-const api = { parseGerber, renderBoardView, checkCopperSpacing, extractStencilApertures, renderFilmPdf }
+/** `AoiCanvasFactory` over `OffscreenCanvas` — a worker global, not a DOM
+ *  import, so this keeps the worker's zero-DOM-dependency property intact.
+ *  Satisfies `Canvas2DLike` structurally; the headless verification script
+ *  (`scripts/verify-aoi-raster.mts`) supplies `@napi-rs/canvas` instead, so
+ *  `rasterizePlotTree`/`CanvasSink` run completely unmodified in both.
+ *
+ * ⚠ `willReadFrequently: true` is load-bearing, not a micro-optimisation.
+ * Every AOI raster is drawn once and immediately read back via
+ * `getImageData` — the entire point of this canvas. Without this hint, the
+ * browser is free to back the context with a GPU-composited surface tuned
+ * for on-screen display, and `getImageData` is a documented source of
+ * exactly the symptom reported live here: a canvas that visually painted
+ * correctly reads back as blank/stale, because the GPU->CPU sync a readback
+ * requires hadn't completed — a risk that's worse for a SHORT burst of
+ * drawing (the drill mask's ~80 small strokes) than a LONG one (the copper
+ * raster's hundreds of plot-tree primitives, which incidentally give the
+ * GPU pipeline more time to flush before its own later readback), matching
+ * the exact pattern reported — copper always fine, the drill mask
+ * consistently blank. This hint forces a CPU-backed (software) surface,
+ * which has no such sync gap; `getImageData` becomes a plain memory read. */
+const offscreenCanvasFactory: AoiCanvasFactory = (widthPx: number, heightPx: number): AoiCanvas => {
+  const canvas = new OffscreenCanvas(widthPx, heightPx)
+  const ctx = canvas.getContext('2d', { willReadFrequently: true }) as unknown as Canvas2DLike
+  return {
+    ctx,
+    readPixels: () => (ctx as unknown as OffscreenCanvasRenderingContext2D).getImageData(0, 0, widthPx, heightPx).data,
+    dispose: () => {
+      canvas.width = 0
+      canvas.height = 0
+    },
+  }
+}
+
+export interface AoiLayerSource {
+  side: AoiSide
+  /** The already-panelized Gerber text for this side's copper layer — NOT
+   *  the raw customer upload (see gerber-to-aoi.ts's own docs for why). */
+  content: string
+}
+
+export interface AoiRenderInput {
+  layers: AoiLayerSource[]
+  panelWidthMm: number
+  panelHeightMm: number
+  pxPerMm: number
+  invert: boolean
+  /** Panel-absolute drilled geometry, shared by both sides (a through-hole
+   *  exists on top and bottom alike — only the mirror transform differs).
+   *  Used twice per side whenever non-empty: punched directly into the
+   *  copper raster (so plated pads render as donuts, not discs) AND emitted
+   *  as a supplementary standalone drill mask. */
+  drillHoleGroups?: DrillHoleGroup[]
+  drillSlotGroups?: DrillSlotGroup[]
+}
+
+export interface AoiRenderedFile {
+  side: AoiSide
+  kind: AoiImageKind
+  /** PNG bytes, or null when this specific raster could not be safely
+   *  generated — see `warnings` for why. A per-side failure never blocks
+   *  the other side. */
+  bytes: Uint8Array | null
+  widthPx: number
+  heightPx: number
+  warnings: string[]
+}
+
+export interface AoiRenderOutput {
+  files: AoiRenderedFile[]
+}
+
+/**
+ * Renders every requested side's AOI reference PNG in one Comlink call, run
+ * SEQUENTIALLY — same rationale as `renderFilmPdf`: Comlink already
+ * serializes onto this one worker regardless, and top/bottom must never
+ * both be alive as RGBA buffers at once (a 16 MP panel is ~64 MB per side).
+ * Unlike `renderFilmPdf` this is `async`: PNG encoding goes through
+ * `CompressionStream`, which has no synchronous form.
+ */
+async function renderAoiRasters(input: AoiRenderInput): Promise<AoiRenderOutput> {
+  const files: AoiRenderedFile[] = []
+  const holeGroups = input.drillHoleGroups ?? []
+  const slotGroups = input.drillSlotGroups ?? []
+
+  for (const layer of input.layers) {
+    const sideLabel = layer.side === 'top' ? 'Top' : 'Bottom'
+
+    const copper = gerberToAoiBitmap({
+      content: layer.content,
+      side: layer.side,
+      pxPerMm: input.pxPerMm,
+      panelWidthMm: input.panelWidthMm,
+      panelHeightMm: input.panelHeightMm,
+      layerLabel: `${sideLabel}_Copper`,
+      invert: input.invert,
+      // Punches every drilled hole out of the copper raster so plated pads
+      // render as real donuts, not solid discs — see punchDrillHoles's docs.
+      holeGroups,
+      slotGroups,
+      createCanvas: offscreenCanvasFactory,
+    })
+    files.push({
+      side: layer.side,
+      kind: 'copper',
+      bytes: copper.bitmap ? await encodeBinaryPng(copper.bitmap, copper.widthPx, copper.heightPx) : null,
+      widthPx: copper.widthPx,
+      heightPx: copper.heightPx,
+      warnings: copper.warnings,
+    })
+
+    // Supplementary standalone mask (§ drillMaskBitmap's own docs) — the
+    // copper raster above already has these holes punched into it. Rides
+    // with its own side rather than being emitted once: a through-hole is at
+    // the same panel mm on both sides, but the bottom image is mirrored, so
+    // the two masks are genuinely different rasters.
+    const drill = drillMaskBitmap({
+      holeGroups,
+      slotGroups,
+      side: layer.side,
+      pxPerMm: input.pxPerMm,
+      panelWidthMm: input.panelWidthMm,
+      panelHeightMm: input.panelHeightMm,
+      layerLabel: `${sideLabel}_Drill`,
+      invert: input.invert,
+      createCanvas: offscreenCanvasFactory,
+    })
+    files.push({
+      side: layer.side,
+      kind: 'drill',
+      bytes: drill.bitmap ? await encodeBinaryPng(drill.bitmap, drill.widthPx, drill.heightPx) : null,
+      widthPx: drill.widthPx,
+      heightPx: drill.heightPx,
+      warnings: drill.warnings,
+    })
+  }
+  return { files }
+}
+
+const api = { parseGerber, renderBoardView, checkCopperSpacing, extractStencilApertures, renderFilmPdf, renderAoiRasters }
 export type GerberWorkerApi = typeof api
 
 Comlink.expose(api)

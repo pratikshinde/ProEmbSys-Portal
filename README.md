@@ -20,6 +20,14 @@ Actively developed. Core ordering flow, backend, and panelization tool are funct
 
 Reverse-chronological. Each entry is a real commit — see `git log` for full diffs.
 
+### 2026-09-25 — Drill slots output as multiple drills; KiCad route-mode slots parsed correctly
+
+- **Reported on the saved "MF Rev 1.1" job**: drill slots came out of the panelized export as two round holes instead of slots, and the G-code / export needed slots drilled as multiple overlapping hits.
+- **Parser fix** (`gerber-parser.ts`): KiCad 10 writes slots as route moves (`G00` → `M15` → `G01` → `M16`), which were read as two separate drill hits. `normalizeExcellonRouteSlots` converts them to slots before parsing. Also fixed slots being dropped/misdecoded when the Eagle-TZ or trailing-zero correction re-decodes a file. Compared against the old parser on all saved drill files: only the route-mode files differ.
+- **Slots as multiple drills** (`src/lib/drill-slots.ts`): each slot becomes N+1 evenly spaced round hits of the slot's own diameter, both ends exact, spacing ≤ 0.5× diameter by default. Applied to the panelized Excellon export, the G-code drilling programs, and the meta-panel array export, for every design in a multi-design panel.
+- **Setting**: "Output slots as multiple drills" + hit-spacing field (`PanelConfig.slotsAsDrills` / `slotDrillPitchRatio`, also in panel templates), shown in Info & Export and the G-Code tab. On by default, including for previously saved jobs; off restores native slots (`G85` / lateral cut). Changing it clears already-generated G-code / array bundles.
+- Regression scripts: `scripts/verify-drill-slots.mts`, `scripts/e2e-slot-drills.mts`.
+
 ### 2026-09-10 — Shop-floor production tracker folded into the portal ("Send to Fab" → operator app → admin tracking)
 
 - **User-requested, from real operations**: the shop needed a way to hand a computed panel to a shop-floor operator, have that operator report progress step-by-step from their phone, and track it from the office. This had been prototyped as a *separate* Next.js app (`propcb-mes`, its own port) sharing the portal's database; the user asked for it merged into the portal as one codebase, one deploy, with the separate app retired. The `production_*` tables, the `OPERATOR` role, the 15 seeded stage types, the routing template, and the seed operator account already existed in the shared database from that prototype — so this change adds the Prisma models to match what the DB already has (`prisma generate` only; `migrate diff` reports **no difference** — never `db push`), then ports the code in.

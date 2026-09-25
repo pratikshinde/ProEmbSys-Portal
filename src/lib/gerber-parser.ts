@@ -1004,12 +1004,54 @@ function parseApertureMacro(data: string, state: ParserState): void {
 // ============================================================================
 
 /**
+ * An arc's swept curve can bulge well past the straight chord between its
+ * start and end points (a rounded board corner, a near-full-circle pad) —
+ * `calculateBounds` used to bound an arc by its two endpoints alone, which
+ * silently undersizes a board/panel whenever its outline (or any other
+ * layer feeding `resolveDesignGeometry`'s datum) contains a real curve. This
+ * returns whichever of the full circle's four axis-aligned extremes
+ * (rightmost/topmost/leftmost/bottommost) the swept arc actually passes
+ * through, in the SAME angle convention `resolveSingleQuadrantIJ`'s
+ * `sweepDeg` already uses (i, j signed and relative to the START point).
+ */
+function arcBoundsExtremes(
+  startX: number, startY: number, endX: number, endY: number,
+  i: number, j: number, direction: 'arc_cw' | 'arc_ccw'
+): { x: number; y: number }[] {
+  const cx = startX + i;
+  const cy = startY + j;
+  const r = Math.hypot(startX - cx, startY - cy);
+  if (!(r > 1e-9)) return []; // degenerate (zero-radius) arc — no bulge possible
+
+  const TWO_PI = Math.PI * 2;
+  const norm = (a: number) => ((a % TWO_PI) + TWO_PI) % TWO_PI;
+  const a1 = Math.atan2(startY - cy, startX - cx);
+  const a2 = Math.atan2(endY - cy, endX - cx);
+
+  // Coincident start/end is the standard way to draw a full circle (e.g. a
+  // ring pad flashed via arc), not a zero-length arc — treat it as a full
+  // 360° sweep rather than 0°.
+  const isFullCircle = Math.abs(startX - endX) < 1e-9 && Math.abs(startY - endY) < 1e-9;
+  const sweep = isFullCircle ? TWO_PI : norm(direction === 'arc_ccw' ? a2 - a1 : a1 - a2);
+
+  const extremes: { x: number; y: number }[] = [];
+  for (const angle of [0, Math.PI / 2, Math.PI, Math.PI * 1.5]) {
+    const t = direction === 'arc_ccw' ? norm(angle - a1) : norm(a1 - angle);
+    if (t <= sweep + 1e-9) {
+      extremes.push({ x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) });
+    }
+  }
+  return extremes;
+}
+
+/**
  * Calculate the bounding box of all geometry in the Gerber layer.
  *
  * The bounds are computed from:
  * - Flash positions (X, Y of flash commands)
  * - Draw endpoints (X, Y of interpolate and move commands)
- * - For arcs, the approximate endpoint position
+ * - For arcs, both endpoints AND the swept curve's own extremes (see
+ *   `arcBoundsExtremes`) — the curve can bulge past the endpoint-only chord
  *
  * @param commands - List of all draw commands
  * @param apertures - Map of aperture definitions (used for flash size consideration)
@@ -1025,12 +1067,22 @@ function calculateBounds(
   let maxY = -Infinity;
 
   let hasGeometry = false;
+  // Running absolute position — only needed to know an arc's START point
+  // (the previous command's endpoint); every other bound check below still
+  // reads each command's own coordinate exactly as before.
+  let curX = 0;
+  let curY = 0;
 
   for (const cmd of commands) {
     const { x, y } = cmd.coordinate;
     if (x === undefined && y === undefined) continue;
 
     hasGeometry = true;
+
+    const startX = curX;
+    const startY = curY;
+    if (x !== undefined) curX = x;
+    if (y !== undefined) curY = y;
 
     if (x !== undefined) {
       minX = Math.min(minX, x);
@@ -1039,6 +1091,16 @@ function calculateBounds(
     if (y !== undefined) {
       minY = Math.min(minY, y);
       maxY = Math.max(maxY, y);
+    }
+
+    if ((cmd.type === 'arc_cw' || cmd.type === 'arc_ccw') &&
+        cmd.coordinate.i !== undefined && cmd.coordinate.j !== undefined) {
+      for (const pt of arcBoundsExtremes(startX, startY, curX, curY, cmd.coordinate.i, cmd.coordinate.j, cmd.type)) {
+        minX = Math.min(minX, pt.x);
+        maxX = Math.max(maxX, pt.x);
+        minY = Math.min(minY, pt.y);
+        maxY = Math.max(maxY, pt.y);
+      }
     }
 
     // For flash commands, account for the aperture size
@@ -1644,6 +1706,100 @@ export interface DrillMeta {
 }
 
 /**
+ * Excellon ROUTE-MODE slots -> the canonical G85 slot form.
+ *
+ * KiCad (confirmed on 10.0.2) and several other EDAs export an oval/slot hole
+ * NOT as `X..Y..G85X..Y..` but as a routed segment inside the drill file:
+ *
+ *     T4
+ *     G00X51555Y-38425      rapid to the slot's start
+ *     M15                   tool down
+ *     G01X51555Y-38819      cut to the slot's end
+ *     M16                   tool up
+ *     G05                   back to drill mode
+ *
+ * The parser had no idea what to do with this: `G00X..Y..` and `G01X..Y..`
+ * each fell into the generic "coordinate hit" branch and became an ordinary
+ * ROUND hole, so every slot turned into two round holes (its two endpoints)
+ * with the slot body silently lost — reported live on a real KiCad board as
+ * "drill slots are replaced by two drills in the panelized output".
+ *
+ * Rather than teach every parse path about a second slot dialect, this
+ * rewrites each route block into the G85 line the parser already handles
+ * end-to-end (bounds, unit conversion, drill align, serialization, the
+ * panelized Excellon writer and G-code). Operating on the RAW coordinate
+ * strings — never decoding them — is what makes this safe: zero suppression,
+ * digit format and the Eagle-TZ correction all keep applying downstream,
+ * exactly as they do for a real G85 file.
+ *
+ * A G01 chain (several segments between one M15/M16) becomes one G85 line per
+ * segment, sharing endpoints. Axes omitted from a G01 line are modal (carried
+ * from the previous point), per the Excellon spec.
+ *
+ * ⚠ Deliberately conservative: a block is only rewritten when it matches the
+ * whole `G00 -> M15 -> G01... -> M16/M17` shape. Anything else (arcs G02/G03,
+ * a G01 with no M15, a block that never closes) is left byte-for-byte
+ * untouched, so a file that used G00/G01 some other way keeps its previous
+ * behaviour rather than being silently reinterpreted.
+ */
+export function normalizeExcellonRouteSlots(text: string): { text: string; converted: number } {
+  const lines = text.split('\n')
+  const out: string[] = []
+  let converted = 0
+
+  const clean = (l: string) => l.trim().replace(/\*$/, '').trim()
+  /** Parses `G00/G0/G01/G1` + optional X/Y raw digit strings. */
+  const parseMove = (l: string, mode: 0 | 1): { x?: string; y?: string } | null => {
+    const m = clean(l).match(/^G0?([01])\s*(?:X([+-]?[\d.]+))?\s*(?:Y([+-]?[\d.]+))?$/i)
+    if (!m || Number(m[1]) !== mode) return null
+    if (m[2] === undefined && m[3] === undefined) return null
+    return { x: m[2], y: m[3] }
+  }
+  const nextNonBlank = (from: number): number => {
+    let j = from
+    while (j < lines.length && clean(lines[j]) === '') j++
+    return j
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const start = parseMove(lines[i], 0)
+    const m15At = start ? nextNonBlank(i + 1) : -1
+    if (start && start.x !== undefined && start.y !== undefined && m15At < lines.length && /^M15$/i.test(clean(lines[m15At]))) {
+      let curX: string = start.x
+      let curY: string = start.y
+      const segments: string[] = []
+      let closed = false
+      let j = m15At + 1
+      while (j < lines.length) {
+        const t = clean(lines[j])
+        if (t === '') { j++; continue }
+        const seg = parseMove(t, 1)
+        if (seg) {
+          const nx = seg.x ?? curX
+          const ny = seg.y ?? curY
+          segments.push(`X${curX}Y${curY}G85X${nx}Y${ny}`)
+          curX = nx
+          curY = ny
+          j++
+          continue
+        }
+        if (/^M1[67]$/i.test(t)) { closed = segments.length > 0; j++ }
+        break
+      }
+      if (closed) {
+        out.push(...segments)
+        converted += segments.length
+        i = j - 1
+        continue
+      }
+    }
+    out.push(lines[i])
+  }
+
+  return { text: converted > 0 ? out.join('\n') : text, converted }
+}
+
+/**
  * Parse an Excellon NC drill file into a GerberLayer structure.
  *
  * This parser handles:
@@ -1668,7 +1824,10 @@ export interface DrillMeta {
  * @returns Parsed GerberLayer with drill data
  */
 export function parseExcellonDrill(content: string, fileName: string, forceFormat?: DrillFormatOverride): GerberLayer {
-  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  // Route-mode slots (KiCad: G00 / M15 / G01 / M16) are rewritten into the
+  // G85 form up front — see `normalizeExcellonRouteSlots`. Done once here so
+  // the main pass AND both re-parse paths below see the same slot lines.
+  const normalized = normalizeExcellonRouteSlots(content.replace(/\r\n/g, '\n').replace(/\r/g, '\n')).text
   const lines = normalized.split('\n')
 
   const apertures = new Map<number, GerberAperture>()
@@ -2196,13 +2355,20 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
       // we can correct by re-interpreting: the TZ coords were padEnd, we need padStart.
       // For each command, re-extract the original coordinate from rawContent and parse as LZ.
       // Simpler: re-run body parsing with LZ suppression.
-      const lzCommands = reparseExcellonBody(normalized, fmtInt, fmtDec, 'leading', units)
-      if (lzCommands.length > 0) {
-        newCommands.push(...lzCommands)
+      const lzParsed = reparseExcellonBody(normalized, fmtInt, fmtDec, 'leading', units)
+      if (lzParsed.commands.length > 0) {
+        newCommands.push(...lzParsed.commands)
       }
       // Replace commands and recalculate bounds
       commands.length = 0
       commands.push(...newCommands)
+      // ⚠ Slots were decoded in the FIRST pass, under the wrong (declared TZ)
+      // suppression — so they'd keep garbage coordinates while every hole
+      // moved to its corrected position. Replace them with the re-decoded set.
+      // (This job — a real KiCad export declaring "INCH,TZ" over leading-zero
+      // data — is exactly the case that hits this.)
+      slots.length = 0
+      slots.push(...lzParsed.slots)
     }
   }
 
@@ -2243,11 +2409,16 @@ export function parseExcellonDrill(content: string, fileName: string, forceForma
     }
 
     if (implausible(calculateBounds(commands, apertures))) {
-      const tzCommands = reparseExcellonBody(normalized, fmtInt, fmtDec, 'trailing', units)
+      const tzParsed = reparseExcellonBody(normalized, fmtInt, fmtDec, 'trailing', units)
+      const tzCommands = tzParsed.commands
       const tzBounds = calculateBounds(tzCommands, apertures)
       if (tzCommands.length > 0 && !implausible(tzBounds)) {
         commands.length = 0
         commands.push(...tzCommands)
+        // Same reason as the Eagle-TZ branch above: slots must be re-decoded
+        // under the suppression that's actually being kept.
+        slots.length = 0
+        slots.push(...tzParsed.slots)
         actualZeroSuppression = 'trailing'
         warnings.push(
           'No zero suppression declared — the default (leading) interpretation produced an implausible board size; re-parsed as trailing.'
@@ -2331,9 +2502,13 @@ function reparseExcellonBody(
   fmtDec: number,
   zeroSuppression: DrillZeroSuppressionMode,
   fileUnits: GerberUnit
-): GerberDrawCommand[] {
+): { commands: GerberDrawCommand[]; slots: DrillSlot[] } {
   const lines = normalized.split('\n')
   const commands: GerberDrawCommand[] = []
+  // Slots (G85, including route-mode slots normalised to G85 by the caller).
+  // `diameterMm` is a 0 placeholder here, resolved by the caller once the tool
+  // table's own units are final — same contract as the main pass.
+  const slots: DrillSlot[] = []
   let inBody = false
   let currentTool: number | null = null
   let lastX: number | null = null
@@ -2362,6 +2537,30 @@ function reparseExcellonBody(
     const toolSelectMatch = clean.match(/^T(\d{1,2})$/i)
     if (toolSelectMatch) {
       currentTool = parseInt(toolSelectMatch[1], 10)
+      continue
+    }
+
+    // G85 slot — checked BEFORE the generic coordinate hit, exactly as in the
+    // main pass: that regex would keep only the start point and turn the slot
+    // into a phantom round hole (which this re-parse used to do to every G85
+    // line, on top of never re-decoding the slot's own coordinates).
+    const slotMatch = clean.match(/X([+-]?\d*\.?\d*)Y([+-]?\d*\.?\d*)G85X([+-]?\d*\.?\d*)Y([+-]?\d*\.?\d*)/i)
+    if (slotMatch) {
+      const sx = parseExcellonCoord(slotMatch[1], fmtInt, fmtDec, zeroSuppression, fileUnits)
+      const sy = parseExcellonCoord(slotMatch[2], fmtInt, fmtDec, zeroSuppression, fileUnits)
+      const ex = parseExcellonCoord(slotMatch[3], fmtInt, fmtDec, zeroSuppression, fileUnits)
+      const ey = parseExcellonCoord(slotMatch[4], fmtInt, fmtDec, zeroSuppression, fileUnits)
+      if (sx !== null && sy !== null && ex !== null && ey !== null) {
+        const toMm = (v: number) => (fileUnits === 'mm' ? v : v * 25.4)
+        slots.push({
+          start: { x: toMm(sx), y: toMm(sy) },
+          end: { x: toMm(ex), y: toMm(ey) },
+          toolCode: currentTool ?? 1,
+          diameterMm: 0,
+        })
+        lastX = toMm(ex)
+        lastY = toMm(ey)
+      }
       continue
     }
 
@@ -2423,7 +2622,7 @@ function reparseExcellonBody(
     }
   }
 
-  return commands
+  return { commands, slots }
 }
 
 /**

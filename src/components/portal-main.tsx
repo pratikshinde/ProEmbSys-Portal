@@ -12,9 +12,10 @@ import DfmPanel from './dfm-panel';
 import RoutingPanel from './routing-panel';
 import GcodePanel from './gcode-panel';
 import StencilPanel from './stencil-panel';
+import AoiPanel from './aoi-panel';
 import SharingPanel from './sharing-panel';
 import { Button } from './ui/button';
-import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck, Scissors, Terminal, Boxes, Square, Stamp, Share2 } from 'lucide-react';
+import { Layers, LayoutGrid, FileText, Download, Cpu, ChevronLeft, ChevronRight, ShieldCheck, Scissors, Terminal, Boxes, Square, Stamp, Share2, ScanEye } from 'lucide-react';
 import { useAppStore } from '../lib/store';
 import { loadCamJobById } from '../lib/load-cam-job';
 import JSZip from 'jszip';
@@ -1947,6 +1948,7 @@ export function PanelizationPage() {
             { key: 'routing' as const, icon: Scissors, label: 'Routing' },
             { key: 'gcode' as const, icon: Terminal, label: 'G-Code' },
             { key: 'stencil' as const, icon: Stamp, label: 'Stencil' },
+            { key: 'aoi' as const, icon: ScanEye, label: 'AOI' },
             { key: 'sharing' as const, icon: Share2, label: 'Sharing' },
           ].filter(t => camMode === 'multi' || t.key !== 'designs').map(({ key, icon: Icon, label }) => (
             <button
@@ -2024,6 +2026,7 @@ export function PanelizationPage() {
                 {activeTab === 'routing' && <RoutingPanel />}
                 {activeTab === 'gcode' && <GcodePanel />}
                 {activeTab === 'stencil' && <StencilPanel />}
+                {activeTab === 'aoi' && <AoiPanel />}
                 {activeTab === 'export' && <ExportPanel />}
                 {activeTab === 'sharing' && <SharingPanel />}
               </div>

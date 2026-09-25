@@ -693,6 +693,19 @@ export interface PanelConfig {
   vScoreMarkRailBoundary: boolean
   // Standalone documentation layer with full-length score lines (own Gerber file)
   enableVScoreLayer: boolean
+  // ── Drill SLOTS (oval holes) in the drill outputs ─────────────────────────
+  // See `src/lib/drill-slots.ts`. ⚠ Read these through `resolveSlotDrillSettings`
+  // rather than directly: a CAM job saved before these fields existed has
+  // neither, and `undefined` must resolve to the DEFAULT (multi-drill), not to
+  // "off".
+  /** Output every slot as a row of overlapping ROUND drill hits along its
+   *  centreline — in the panelized Excellon export AND the G-code drilling
+   *  programs — instead of a native slot (G85 / a lateral cut). For shops whose
+   *  drilling machine can only drill, not mill. */
+  slotsAsDrills: boolean
+  /** Spacing between consecutive slot hits as a fraction of the drill
+   *  diameter: 0.5 = each hit overlaps the previous by half. */
+  slotDrillPitchRatio: number
 }
 
 export interface PanelInfo {
@@ -837,6 +850,8 @@ export const DEFAULT_PANEL_CONFIG: PanelConfig = {
   vScoreMarkInternalSeams: true,
   vScoreMarkRailBoundary: true,
   enableVScoreLayer: false,
+  slotsAsDrills: true,
+  slotDrillPitchRatio: 0.5,
 }
 
 // ============================================================================
@@ -1379,11 +1394,79 @@ function finishPanel(
     // design (same corner, aligned along one Y), so using a different Y here
     // would both reintroduce the same routing collision for these holes AND
     // break that alignment.
+    //
+    // ⚠ Each corner's X is a single fixed candidate, unlike fiducials (which
+    // get a whole scanning fallback because "minimum 3" is a hard
+    // requirement) — `addHole` just silently drops it if that one spot is
+    // blocked. On a panel with `sideRibLeft`/`sideRibRight` at 0, that fixed
+    // X sits almost exactly where a V-score RAIL mark also lands (both are
+    // measured from the same now-coincident rib/panel edge), so 3 of the 4
+    // standard corners were silently lost to that collision on a real
+    // customer panel (`WLC_Indicator`, V-score marks + zero side ribs) —
+    // only `ref_tl2` survived, because its existing +2.5mm orientation
+    // offset happened to clear it by luck. Nudge each candidate off any
+    // V-score mark first, reusing the same `clearHolesAlongAxis` obstacle-
+    // avoidance every other V-score-aware placement in this function already
+    // uses, growing INTO the panel (away from the rail) rather than adding a
+    // second, independent fallback scheme. `addHole`'s own edge/grid/overlap
+    // checks still run on the nudged position, so this can only ever recover
+    // a hole that was previously dropped — never introduce a new rejection —
+    // EXCEPT that nudging blindly off a V-score mark can walk straight into
+    // an already-placed hole on the same row (confirmed live: `ref_bl`'s
+    // V-score-only nudge landed 2.5mm from `tooling_bl`, inside its own
+    // 3.5mm minimum spacing, trading a V-score rejection for an "overlapping"
+    // one). So the SAME-Y entries in `occupied` are folded in as obstacles
+    // too, at their real `isOverlapping` minimum-spacing exclusion, not just
+    // V-score marks — this must stay in sync with `isOverlapping`'s own
+    // per-type-pair spacing table above.
+    //
+    // ⚠ Deliberately NOT `clearHolesAlongAxis` here, even though it does the
+    // same job for rib text elsewhere in this file. That function picks
+    // whichever of retreat/advance is CLOSER on every single-obstacle
+    // collision, which is right for text (there's normally one obstacle to
+    // dodge, from either side) but oscillates when two obstacles' exclusion
+    // zones OVERLAP each other — confirmed live: `ref_bl`'s V-score exclusion
+    // ([-3.5, 3.5]) and `tooling_bl`'s spacing exclusion ([2.5, 9.5]) overlap
+    // in [2.5, 3.5], so "closer of the two" bounced the candidate back and
+    // forth between 2.5 and 3.5 forever, settling on whichever obstacle was
+    // checked last — still inside BOTH zones. A reference hole always knows
+    // which way is "into the panel" (this function's own `growRight`), so it
+    // never needs retreat-vs-advance tie-breaking — always pushing further in
+    // that one fixed direction past whatever it's currently inside of cannot
+    // oscillate (each move strictly increases, or strictly decreases, the
+    // candidate), and converges past chained/overlapping obstacles correctly.
+    const pushClearOneWay = (x: number, obstacles: { x: number; diameter: number }[], growRight: boolean): number => {
+      let anchor = x
+      for (let iter = 0; iter <= obstacles.length; iter++) {
+        let moved = false
+        for (const o of obstacles) {
+          const lo = o.x - o.diameter / 2
+          const hi = o.x + o.diameter / 2
+          if (anchor > lo && anchor < hi) {
+            anchor = growRight ? hi : lo
+            moved = true
+          }
+        }
+        if (!moved) break
+      }
+      return anchor
+    }
+    const clearRefHoleX = (x: number, y: number, onTopRib: boolean, growRight: boolean): number => {
+      const marks = config.enableVScoreMarks ? vScoreMarksAsHoles(vScoreLines, config, onTopRib) : []
+      const obstacles = [
+        ...marks.map(m => ({ x: m.x, diameter: m.diameter + config.referenceHoleDiameter + 4.0 })),
+        ...occupied
+          .filter(o => Math.abs(o.y - y) < 0.01)
+          .map(o => ({ x: o.x, diameter: 2 * (o.type === 'tooling' ? minSpacingToolingToRef : minSpacingRefToRef) })),
+      ]
+      if (obstacles.length === 0) return x
+      return pushClearOneWay(x, obstacles, growRight)
+    }
 
     // Bottom-left corner: 1 reference hole - moved to 7mm as specified
     if (config.sideRibBottom > 0) {
       const yRef = gridBottom - inset  // From bottom edge (low Y in CAM350)
-      const xLeft = config.sideRibLeft + refInset - 1.0           // 7mm from panel edge (5mm rib + 2mm)
+      const xLeft = clearRefHoleX(config.sideRibLeft + refInset - 1.0, yRef, false, true)  // 7mm from panel edge (5mm rib + 2mm), nudged right (into panel) off any V-score mark
       console.log(`[Reference holes] Bottom-left: (${xLeft.toFixed(2)}, ${yRef.toFixed(2)})`)
       addHole('ref_bl', xLeft, yRef, config.referenceHoleDiameter, 'reference')
     }
@@ -1391,7 +1474,7 @@ function finishPanel(
     // Bottom-right corner: 1 reference hole
     if (config.sideRibBottom > 0) {
       const yRef = gridBottom - inset  // From bottom edge (low Y in CAM350)
-      const xRight = panelWidth - config.sideRibRight - refInset  // 102mm from panel edge
+      const xRight = clearRefHoleX(panelWidth - config.sideRibRight - refInset, yRef, false, false)  // 102mm from panel edge, nudged left (into panel)
       console.log(`[Reference holes] Bottom-right: (${xRight.toFixed(2)}, ${yRef.toFixed(2)})`)
       addHole('ref_br', xRight, yRef, config.referenceHoleDiameter, 'reference')
     }
@@ -1399,21 +1482,25 @@ function finishPanel(
     // Top-right corner: 1 reference hole
     if (config.sideRibTop > 0) {
       const yRef = gridTop + inset  // From bottom edge (high Y in CAM350)
-      const xRight = panelWidth - config.sideRibRight - refInset  // 102mm from panel edge
+      const xRight = clearRefHoleX(panelWidth - config.sideRibRight - refInset, yRef, true, false)  // 102mm from panel edge, nudged left (into panel)
       console.log(`[Reference holes] Top-right: (${xRight.toFixed(2)}, ${yRef.toFixed(2)})`)
       addHole('ref_tr', xRight, yRef, config.referenceHoleDiameter, 'reference')
     }
 
-    // Top-left corner: 2 reference holes (for PCB orientation understanding)
+    // Top-left corner: 2 reference holes (for PCB orientation understanding).
+    // ref_tl1 is nudged and ADDED before ref_tl2's own nudge is computed
+    // (rather than computing both candidates up front) so ref_tl2 sees
+    // ref_tl1's real, possibly-nudged position in `occupied` too — computing
+    // both first would let ref_tl2's nudge walk into where ref_tl1 actually
+    // ended up landing.
     if (config.sideRibTop > 0) {
       const yRef = gridTop + inset  // From bottom edge (high Y in CAM350)
-      const xLeft1 = config.sideRibLeft + refInset - 1.0       // 7mm from panel edge (5mm rib + 2mm) - gives 3.5mm spacing
-      const xLeft2 = config.sideRibLeft + refInset + 2.5      // ~10.5mm from panel edge
-
+      const xLeft1 = clearRefHoleX(config.sideRibLeft + refInset - 1.0, yRef, true, true)  // 7mm from panel edge (5mm rib + 2mm) - gives 3.5mm spacing, nudged right (into panel)
       console.log(`[Reference holes] Top-left 1: (${xLeft1.toFixed(2)}, ${yRef.toFixed(2)})`)
-      console.log(`[Reference holes] Top-left 2: (${xLeft2.toFixed(2)}, ${yRef.toFixed(2)})`)
-
       addHole('ref_tl1', xLeft1, yRef, config.referenceHoleDiameter, 'reference')
+
+      const xLeft2 = clearRefHoleX(config.sideRibLeft + refInset + 2.5, yRef, true, true)  // ~10.5mm from panel edge, nudged right (into panel)
+      console.log(`[Reference holes] Top-left 2: (${xLeft2.toFixed(2)}, ${yRef.toFixed(2)})`)
       addHole('ref_tl2', xLeft2, yRef, config.referenceHoleDiameter, 'reference')
     }
   }

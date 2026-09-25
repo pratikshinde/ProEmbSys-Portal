@@ -406,25 +406,32 @@ export function planRouting(
     [...resolvedModeByDesign.values()].some(m => m === 'contour') ? 'contour' : 'bbox'
 
   if (cfg.routeIndividualPcbs && bit > 0) {
-    // Contour-mode designs run FIRST so their tabs already exist in the
-    // shared `tabs` array by the time the bbox pass below folds in "foreign
-    // tab" protection (its own Phase 2, which scans the whole `tabs` array).
-    // That gives one-directional cross-mode tab protection in a panel mixing
-    // bbox and contour designs (a bbox pass won't cut through a contour
-    // design's tab); the reverse is a known, documented gap — see CLAUDE.md's
-    // routing section. Same-mode panels (every design bbox, or every design
-    // contour — the common case) are fully protected either way, since each
-    // branch's own internal cross-instance protection doesn't depend on
-    // processing order.
     const contourDesignIds = [...resolvedModeByDesign.entries()].filter(([, m]) => m === 'contour').map(([id]) => id)
-    if (contourDesignIds.length > 0) {
-      runContourModeRouting(contourDesignIds, placementsByDesign, ctx, panel, panelConfig, cfg, bit, r, paths, tabs, issues)
-    }
 
     const bboxEntries: { pos: PanelPlacement; pcbIndex: number }[] = []
     for (const [designId, entries] of placementsByDesign) {
       if (resolvedModeByDesign.get(designId) === 'bbox') bboxEntries.push(...entries)
     }
+
+    // Contour-mode designs run FIRST so their tabs already exist in the
+    // shared `tabs` array by the time the bbox pass below folds in "foreign
+    // tab" protection (its own Phase 2, which scans the whole `tabs` array)
+    // — that gives bbox-side protection against cutting through a contour
+    // tab. The REVERSE direction (a bbox neighbor's tab surviving a
+    // contour pass computed before that tab existed) is covered by handing
+    // contour the bbox side's own DEFAULT tab positions up front, computed
+    // here purely for that avoidance check — `runBboxModeRouting` below
+    // still computes and emits its own (possibly realigned) tabs exactly as
+    // before, this is a read-only preview of where they'll default to.
+    const foreignTabPointsAbs =
+      contourDesignIds.length > 0 && bboxEntries.length > 0
+        ? bboxDefaultTabWorldPoints(computeBboxEdgeDefaults(bboxEntries, panel.toolingHoles, cfg, r), r)
+        : []
+
+    if (contourDesignIds.length > 0) {
+      runContourModeRouting(contourDesignIds, placementsByDesign, ctx, panel, panelConfig, cfg, bit, r, paths, tabs, issues, foreignTabPointsAbs)
+    }
+
     if (bboxEntries.length > 0) {
       runBboxModeRouting(bboxEntries, panel.placements, panel.toolingHoles, cfg, bit, r, paths, tabs)
     }
@@ -587,32 +594,31 @@ export function planRouting(
  * just the bbox-resolved subset of a multi-design panel while preserving
  * every placement's original global `pcbIndex`.
  */
-function runBboxModeRouting(
+type BboxEdgeDefault = { pcbIndex: number; edge: RouteEdge; a: Pt; b: Pt; edgeLen: number; centersAlong: number[]; isReversedEdge: boolean; pos: PanelPlacement }
+
+/**
+ * Each bbox-mode PCB's OWN default tab centers — needs nothing but that
+ * PCB's own geometry, no path emission yet. Extracted out of
+ * `runBboxModeRouting` (where it's still Sub-pass 1 of that function) so
+ * `planRouting` can also call it standalone, EARLY, purely to learn where a
+ * bbox design's tabs will default to — before contour-mode designs run —
+ * so a contour instance sharing a gap with a bbox neighbor can avoid
+ * cutting through a tab that doesn't exist yet. See `runContourModeRouting`'s
+ * `foreignTabPointsAbs` param for why: contour runs first, so without this,
+ * a bbox default tab at a position contour never independently protects
+ * (no contour tab of its own nearby) gets destroyed by contour's own
+ * already-finalized, unaware pass — the "reverse" half of the documented
+ * one-directional cross-mode tab protection gap.
+ */
+function computeBboxEdgeDefaults(
   entries: { pos: PanelPlacement; pcbIndex: number }[],
-  allPlacements: PanelPlacement[],
   toolingHoles: PanelResult['toolingHoles'],
   cfg: RoutingConfig,
-  bit: number,
-  r: number,
-  paths: RoutePath[],
-  tabs: RouteTab[]
-): void {
-  // Collect as segments first so coincident passes along shared gaps can be
-  // deduped across PCB instances before being turned into paths.
-  const pending: { pcbIndex: number; edge: RouteEdge; seg: RouteSegment }[] = []
+  r: number
+): BboxEdgeDefault[] {
+  const pathGap = cfg.tabWidthMm + r * 2
+  const perEdgeInfos: BboxEdgeDefault[] = []
 
-  // Three sub-passes, not one — Sub-pass 1 below computes each PCB's OWN
-  // default tabs (needs nothing but that PCB's own geometry, no emission
-  // yet); Sub-pass 1.5 reconciles tabs on FACING edges between adjacent
-  // placements (needs every PCB's defaults to already exist); Sub-pass 2
-  // emits the final `RouteTab`s. Phase 2 (after all of this) then folds in
-  // silent interrupts for any FOREIGN PCB's tab that physically coincides
-  // with this edge, which by definition can't be known until every PCB's
-  // real tabs exist. See that phase's own comment for why that's separate.
-  const pathGap = cfg.tabWidthMm + bit
-  const perEdgeInfos: { pcbIndex: number; edge: RouteEdge; a: Pt; b: Pt; edgeLen: number; centersAlong: number[]; isReversedEdge: boolean; pos: PanelPlacement }[] = []
-
-  // ---- Sub-pass 1: each PCB's own default tab centers ----------------------
   for (const { pos, pcbIndex } of entries) {
     const corners = offsetRectOutward(pos.x, pos.y, pos.w, pos.h, r)
 
@@ -676,6 +682,53 @@ function runBboxModeRouting(
       perEdgeInfos.push({ pcbIndex, edge, a, b, edgeLen, centersAlong, isReversedEdge, pos })
     }
   }
+
+  return perEdgeInfos
+}
+
+/**
+ * Flattens `computeBboxEdgeDefaults`' per-edge centers into panel-absolute
+ * board-edge points (via `boardEdgePoint`, the same conversion Sub-pass 2
+ * uses for real tab emission) — the shape `runContourModeRouting` needs to
+ * treat them as foreign points to avoid cutting through.
+ */
+function bboxDefaultTabWorldPoints(perEdgeInfos: BboxEdgeDefault[], r: number): Pt[] {
+  const pts: Pt[] = []
+  for (const { pos, edge, edgeLen, centersAlong, isReversedEdge } of perEdgeInfos) {
+    for (const dGlobal of centersAlong) {
+      const d = isReversedEdge ? edgeLen - dGlobal : dGlobal
+      pts.push(boardEdgePoint(pos, edge, d, r))
+    }
+  }
+  return pts
+}
+
+function runBboxModeRouting(
+  entries: { pos: PanelPlacement; pcbIndex: number }[],
+  allPlacements: PanelPlacement[],
+  toolingHoles: PanelResult['toolingHoles'],
+  cfg: RoutingConfig,
+  bit: number,
+  r: number,
+  paths: RoutePath[],
+  tabs: RouteTab[]
+): void {
+  // Collect as segments first so coincident passes along shared gaps can be
+  // deduped across PCB instances before being turned into paths.
+  const pending: { pcbIndex: number; edge: RouteEdge; seg: RouteSegment }[] = []
+
+  // Three sub-passes, not one — Sub-pass 1 below computes each PCB's OWN
+  // default tabs (needs nothing but that PCB's own geometry, no emission
+  // yet); Sub-pass 1.5 reconciles tabs on FACING edges between adjacent
+  // placements (needs every PCB's defaults to already exist); Sub-pass 2
+  // emits the final `RouteTab`s. Phase 2 (after all of this) then folds in
+  // silent interrupts for any FOREIGN PCB's tab that physically coincides
+  // with this edge, which by definition can't be known until every PCB's
+  // real tabs exist. See that phase's own comment for why that's separate.
+  const pathGap = cfg.tabWidthMm + bit
+
+  // ---- Sub-pass 1: each PCB's own default tab centers ----------------------
+  const perEdgeInfos = computeBboxEdgeDefaults(entries, toolingHoles, cfg, r)
 
   // ---- Sub-pass 1.5: align tabs on FACING edges between adjacent PCBs -----
   // Deliberately placement-geometric (AABB-based via `findFacingPairs`), not
@@ -1066,7 +1119,18 @@ function runContourModeRouting(
   r: number,
   paths: RoutePath[],
   tabs: RouteTab[],
-  issues: RoutingIssue[]
+  issues: RoutingIssue[],
+  // Bbox-mode designs' own DEFAULT tab positions (pre-alignment, panel-
+  // absolute) — computed early by the caller, before this function runs, so
+  // a contour instance sharing a gap with a bbox neighbor can silently gap
+  // its own cut there too. Without this, only bbox's Phase 2 (which runs
+  // after this function, once contour's real tabs already exist) can avoid
+  // destroying the OTHER side's tab — a one-directional gap. Using the
+  // PRE-alignment default is sufficient: if a contour tab already exists
+  // near this position, Sub-pass 1.5 later snaps the bbox tab onto it
+  // exactly (redundant with this, harmless); if not, the bbox tab stays at
+  // this default position, which is exactly what's being protected here.
+  foreignTabPointsAbs: Pt[] = []
 ): void {
   const multiDesign = panel.designs.length > 1
   const designName = (id: string) => panel.designs.find(d => d.designId === id)?.name ?? id
@@ -1198,6 +1262,14 @@ function runContourModeRouting(
         const { distance, d } = nearestArcLengthOnRing(geo.outerPts, geo.outerTable, local)
         if (distance < coincidenceToleranceMm) extraSilentDs.push(d)
       }
+    }
+    // Bbox-mode neighbors' own default tab positions — see this function's
+    // `foreignTabPointsAbs` param doc for why this direction of cross-mode
+    // protection would otherwise be missing.
+    for (const abs of foreignTabPointsAbs) {
+      const local = { x: abs.x - inst.dx, y: abs.y - inst.dy }
+      const { distance, d } = nearestArcLengthOnRing(geo.outerPts, geo.outerTable, local)
+      if (distance < coincidenceToleranceMm) extraSilentDs.push(d)
     }
 
     const holeProtectiveDs: number[] = []

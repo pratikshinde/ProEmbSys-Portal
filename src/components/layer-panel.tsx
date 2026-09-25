@@ -657,6 +657,11 @@ export default function LayerPanel() {
               <p className="mt-2 text-[10px] text-[#2a4a6a]">
                 .gtl .gbl .gts .gbs .gto .gbo .gko .gtp .gbp .gbr .drl
               </p>
+              {camMode === 'multi' && (
+                <p className="mt-2 text-[10px] text-[#4a6f94]">
+                  Loose files join the active design — use &quot;New Design&quot; on the Designs tab first for a different board.
+                </p>
+              )}
             </div>
           ) : (
             <p className="text-[#4a6f94] text-xs">

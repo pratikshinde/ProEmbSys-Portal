@@ -143,6 +143,8 @@ const panelSectionSchema = z.object({
   vScoreMarkInternalSeams: z.boolean(),
   vScoreMarkRailBoundary: z.boolean(),
   enableVScoreLayer: z.boolean(),
+  slotsAsDrills: z.boolean(),
+  slotDrillPitchRatio: z.number().min(0.1).max(1),
 }).partial()
 
 const outputSectionSchema = z.object({

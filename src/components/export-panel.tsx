@@ -4,6 +4,7 @@ import React from 'react'
 import { useAppStore } from '@/lib/store'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import SlotDrillControl from '@/components/slot-drill-control'
 import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
@@ -123,6 +124,7 @@ export default function ExportPanel() {
   const panelArrayConfig = useAppStore(s => s.panelArrayConfig)
   const stencilConfig = useAppStore(s => s.stencilConfig)
   const filmConfig = useAppStore(s => s.filmConfig)
+  const aoiConfig = useAppStore(s => s.aoiConfig)
   const panelTemplateId = useAppStore(s => s.panelTemplateId)
   const showGrid = useAppStore(s => s.showGrid)
   const showCrosshair = useAppStore(s => s.showCrosshair)
@@ -246,7 +248,7 @@ export default function ExportPanel() {
         camMode, activeTab, designs, activeDesignId: activeDesignId2, materialSizeMm,
         panelConfig, panelInfo: effectivePanelInfo, outputFormat, targetUnit, boardViewSide, viewMode, boardColor,
         dfmTemplateId, dfmContext, routingConfig, gcodeContext, panelArrayConfig, stencilConfig,
-        filmConfig, panelTemplateId, showGrid, showCrosshair, files,
+        filmConfig, aoiConfig, panelTemplateId, showGrid, showCrosshair, files,
       }
 
       // Health, captured once here from live store state at the moment of
@@ -775,6 +777,12 @@ export default function ExportPanel() {
             {drillFmt.zeroSuppression !== 'none' && (
               <div>READER: {drillFmt.camCompatibility === 'standard' ? 'STANDARD' : 'CAM350'}</div>
             )}
+          </div>
+
+          {/* Drill slots — same control (and same PanelConfig fields) as the
+              G-Code tab, so the export and the G-code can't disagree. */}
+          <div className="mt-3">
+            <SlotDrillControl />
           </div>
         </div>
 

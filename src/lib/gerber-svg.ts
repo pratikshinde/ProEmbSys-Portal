@@ -11,7 +11,7 @@ import * as Comlink from 'comlink'
 import type { GerberWorkerApi } from '@/workers/gerber-worker'
 import { normalizeGerberMacroPrimitives, scalePlotTreeToMm, scaleBoardShapeToMm } from './gerber-preprocess'
 import type { CopperSpacingResult } from './dfm/types'
-import type { StencilApertureOutput, FilmRenderInput, FilmRenderOutput } from '@/workers/gerber-worker'
+import type { StencilApertureOutput, FilmRenderInput, FilmRenderOutput, AoiRenderInput, AoiRenderOutput } from '@/workers/gerber-worker'
 import { boardShapeCoversContent, boardShapeToContour } from './board-contour'
 import type { BoardContour } from './routing/types'
 
@@ -203,6 +203,44 @@ export async function renderFilmPdfs(input: FilmRenderInput): Promise<FilmRender
         warnings: [`${layer.descriptiveName}: film rendering failed (${message}).`],
       })),
     }
+  }
+}
+
+/**
+ * Renders every requested side's AOI reference PNG in one worker call. Same
+ * failure-degrades-never-throws contract as renderFilmPdfs — a worker-
+ * unavailable or Comlink-call failure degrades to a null-bytes file per
+ * side, each with an explanatory warning, rather than throwing past the
+ * caller (an AOI generation failure must never take down the export flow).
+ */
+export async function renderAoiRasters(input: AoiRenderInput): Promise<AoiRenderOutput> {
+  // One failure entry per image the successful call would have produced —
+  // copper AND drill mask per side — so the caller's manifest/file bookkeeping
+  // sees the same shape whether the worker ran or not.
+  const failureFiles = (reason: string): AoiRenderOutput['files'] =>
+    input.layers.flatMap((layer) => {
+      const sideLabel = layer.side === 'top' ? 'Top' : 'Bottom'
+      return ([
+        { kind: 'copper' as const, label: `${sideLabel}_Copper` },
+        { kind: 'drill' as const, label: `${sideLabel}_Drill` },
+      ]).map(({ kind, label }) => ({
+        side: layer.side,
+        kind,
+        bytes: null,
+        widthPx: 0,
+        heightPx: 0,
+        warnings: [`${label}: ${reason}`],
+      }))
+    })
+
+  const worker = getWorker()
+  if (!worker) return { files: failureFiles('AOI rendering unavailable (worker failed to start).') }
+  try {
+    return (await worker.renderAoiRasters(input)) as AoiRenderOutput
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.warn('renderAoiRasters worker call failed:', message)
+    return { files: failureFiles(`AOI rendering failed (${message}).`) }
   }
 }
 

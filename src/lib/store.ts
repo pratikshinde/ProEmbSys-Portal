@@ -5,7 +5,7 @@
 import { create } from 'zustand'
 import JSZip from 'jszip'
 import { GerberLayer, parseGerber, parseExcellonDrill, isExcellonDrillFile, convertLayerUnits, GerberUnit, rotateGerberLayer, autoDetectDrillFormat, generateNormalizedExcellon, serializeParsedDrillToExcellon, DrillZeroSuppressionMode, DrillMeta, expandBoundsForSlots, actionableParseWarnings } from './gerber-parser'
-import { gerberToSvg, gerberRenderBoardView, checkCopperSpacing, extractStencilApertures, BoardView, GerberSvgResult } from './gerber-svg'
+import { gerberToSvg, gerberRenderBoardView, checkCopperSpacing, extractStencilApertures, renderAoiRasters, BoardView, GerberSvgResult } from './gerber-svg'
 import { recoverDrillOffset, resolvedFlashCenters } from './drill-alignment'
 import { runDfm } from './dfm/run-dfm'
 import type { DfmContext, DfmLayerInput, DfmReport, DfmRules } from './dfm/types'
@@ -16,7 +16,8 @@ import { planRouting, resolveOutlineMode } from './routing/plan-routing'
 import { DEFAULT_ROUTING_CONFIG, type BoardContour, type RoutingConfig, type RoutingResult } from './routing/types'
 import { generateGcodeFiles as buildGcodeFiles, generateMetaPanelGcodeFiles, DEFAULT_GCODE_CONTEXT, type GcodeContext, type GcodeFile } from './routing/gcode'
 import { isRoutGcodeFile, parseRoutSlots, routSlotsToGerber } from './routing/import-rout'
-import { collectPanelizedDrillHoles, collectPanelizedDrillSlots, generateMetaPanelDrill, sanitizeForFilename } from './gerber-exporter'
+import { collectPanelizedDrillHoles, collectPanelizedDrillSlots, generateMetaPanelDrill, sanitizeForFilename, buildPanelizedCopperSources, type LayerFile } from './gerber-exporter'
+import { resolveSlotDrillSettings, expandSlotGroupsToHoles, mergeHoleGroups } from './drill-slots'
 import { traceBoardContour } from './board-contour'
 import { BoardColorName } from './board-colors'
 import {
@@ -36,6 +37,7 @@ import {
 import type { PanelTemplateSection, ResolvedPanelTemplateSettings } from './panel-template/types'
 import { DEFAULT_STENCIL_CONFIG, type StencilConfig, type StencilFile, type StencilPreviewData } from './stencil-types'
 import { DEFAULT_FILM_CONFIG, defaultFilmLayerSetting, type FilmConfig, type FilmLayerSetting } from './film-types'
+import { DEFAULT_AOI_CONFIG, type AoiConfig, type AoiGeneratedFile, type AoiManifest, type AoiFeature, type AoiPlacement, type AoiImageMeta, type AoiSide } from './aoi/types'
 import { tileAperturesAcrossPlacements, translateRings, type Point as StencilPoint } from './stencil-geometry'
 import { serializeStencilDxf, type DxfStencilLayer } from './stencil-dxf'
 import { getMirroredLayers, mirrorRingsX, mirrorBoardContourX } from './design-mirror'
@@ -45,7 +47,7 @@ export type { LayerType, LayerSide }
 /** The CAM tool's sidebar tabs. Previously this union was spelled out inline on
  *  both `activeTab` and `setActiveTab`, which meant adding a tab required
  *  editing two places that could silently drift apart. */
-export type CamTab = 'layers' | 'designs' | 'dfm' | 'panel' | 'routing' | 'gcode' | 'stencil' | 'export' | 'sharing'
+export type CamTab = 'layers' | 'designs' | 'dfm' | 'panel' | 'routing' | 'gcode' | 'stencil' | 'aoi' | 'export' | 'sharing'
 
 /** Tabs whose canvas shows the whole *panel* rather than the single imported
  *  PCB. `gerber-viewer.tsx` gates SIX separate things on this (bounds, the
@@ -54,7 +56,19 @@ export type CamTab = 'layers' | 'designs' | 'dfm' | 'panel' | 'routing' | 'gcode
  *  test lives here rather than being re-spelled as an `||` chain at each site.
  *  'sharing' is included because every bundle it composes (film/drill/test)
  *  describes the WHOLE panel, not the single active-design PCB — matching
- *  'export', the tab it sits next to in the sidebar. */
+ *  'export', the tab it sits next to in the sidebar.
+ *
+ *  ⚠ 'aoi' is deliberately NOT here (removed — it used to be, back when AOI
+ *  exported the whole tiled panel). Reported live as real, confusing
+ *  friction: with AOI now single-board (see generateAoiFilesAction's own
+ *  comment on this), leaving 'aoi' panel-scoped meant the viewer showed all
+ *  N tiled PCBs while configuring AOI, but "Generate Reference" produced
+ *  just one board — a visible mismatch between what you're looking at and
+ *  what you're about to generate, with no way to tell from the screen that
+ *  Layers-panel visibility toggles have zero effect on that output (AOI's
+ *  content has always been visibility-blind — see the Hide All fix). The
+ *  AOI tab's canvas now shows the single active-design PCB, matching what
+ *  Generate Reference actually produces. */
 export const PANEL_VIEW_TABS: ReadonlySet<CamTab> = new Set<CamTab>(['panel', 'routing', 'gcode', 'stencil', 'export', 'sharing'])
 
 export function isPanelViewTab(tab: CamTab): boolean {
@@ -233,6 +247,7 @@ export interface CamJobSnapshot {
   panelArrayConfig: PanelArrayConfig
   stencilConfig: StencilConfig
   filmConfig: FilmConfig
+  aoiConfig: AoiConfig
   panelTemplateId: string | null
   showGrid: boolean
   showCrosshair: boolean
@@ -283,6 +298,9 @@ interface AppState {
   designs: DesignEntry[]
   activeDesignId: string | null
   setActiveDesignId: (id: string) => void
+  /** Explicit "start a new design" for loose-file imports — see the doc on
+   *  `createBlankDesign` (store implementation) for why this exists. */
+  createBlankDesign: () => void
   renameDesign: (id: string, name: string) => void
   updateDesign: (id: string, updates: Partial<Pick<DesignEntry, 'minCount' | 'maxCount' | 'allowRotation' | 'priority'>>) => void
   removeDesign: (id: string) => void
@@ -488,6 +506,24 @@ interface AppState {
   stencilGenerating: boolean
   generateStencilFilesAction: () => Promise<void>
   clearStencilFiles: () => void
+
+  // AOI (automated optical inspection) reference generation (see
+  // src/lib/aoi/). Independent of RoutingResult/GcodeFiles/StencilFiles —
+  // only needs a computed PanelResult (to know the whole-panel copper
+  // content and geometry to rasterize). Same "own tab, own Generate button,
+  // own ZIP" shape as Stencil, not Film's "generated inline during the main
+  // Export" shape — AOI is consumed by an external app on its own schedule,
+  // not bundled with a fab-facing Gerber delivery.
+  aoiConfig: AoiConfig
+  /** Shallow merge — AoiConfig is deliberately FLAT, same discipline as
+   *  StencilConfig/RoutingConfig/GcodeContext/PanelArrayConfig. */
+  updateAoiConfig: (updates: Partial<AoiConfig>) => void
+  resetAoiConfig: () => void
+  aoiFiles: AoiGeneratedFile[] | null
+  /** True only while `generateAoiFilesAction` is awaiting the worker calls. */
+  aoiGenerating: boolean
+  generateAoiFilesAction: () => Promise<void>
+  clearAoiFiles: () => void
 
   // Film Plot (PDF) export config (see src/lib/film-types.ts,
   // src/lib/film/). Unlike stencilFiles, films are generated at EXPORT
@@ -1211,6 +1247,25 @@ export const useAppStore = create<AppState>((set, get) => ({
   designs: [],
   activeDesignId: null,
   setActiveDesignId: (id: string) => set({ activeDesignId: id }),
+  // A ZIP/RAR archive always gets its own design (`resolveImportDesignId`),
+  // but loose files always join whichever design is ACTIVE regardless of
+  // camMode (`addLayer` → `ensureActiveDesignId`) — there was previously no
+  // way to tell the app "the next loose files I import are a different
+  // board," so a multi-design user importing a second board via loose files
+  // (rather than a ZIP) had them silently merge into the first board's
+  // design. This gives that same "one import = one design" affordance loose
+  // files never had: create an empty design and make it active, so the next
+  // `addLayer` calls land there instead of the previously-active one.
+  createBlankDesign: () => {
+    const { designs } = get()
+    const id = generateId()
+    const entry: DesignEntry = {
+      id, name: `Design ${designs.length + 1}`, color: DESIGN_COLORS[designs.length % DESIGN_COLORS.length],
+      minCount: 1, maxCount: null, allowRotation: false, rotationBlockedReason: null, priority: designs.length,
+      mirrorBottomOverride: false,
+    }
+    set(state => ({ designs: [...state.designs, entry], activeDesignId: id }))
+  },
   renameDesign: (id: string, name: string) =>
     set(state => ({ designs: state.designs.map(d => d.id === id ? { ...d, name } : d) })),
 
@@ -1257,7 +1312,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       routingResult: null, routingStale: false, routingFocus: null,
       gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
-      stencilFiles: null, stencilPreview: null,
+      stencilFiles: null, stencilPreview: null, aoiFiles: null,
       packCandidates: null, selectedCandidateId: null, packInfeasible: [],
       // The Designs tab doesn't exist in single mode — don't strand the
       // user on a hidden tab.
@@ -1308,7 +1363,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       panelResult: result,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
-      stencilFiles: null, stencilPreview: null,
+      stencilFiles: null, stencilPreview: null, aoiFiles: null,
     })
   },
 
@@ -1430,7 +1485,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       dfmReport: null, dfmReportLayerCount: null, dfmFocus: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
-      stencilFiles: null, stencilPreview: null,
+      stencilFiles: null, stencilPreview: null, aoiFiles: null,
       packCandidates: null, selectedCandidateId: null,
     })
   },
@@ -1462,6 +1517,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Brand-new field — every already-saved CamJob predates it, so fall
       // back to the default rather than restoring `undefined` into state.
       filmConfig: snapshot.filmConfig ?? { ...DEFAULT_FILM_CONFIG, layers: {} },
+      // Same "brand-new field" precedent as filmConfig above.
+      aoiConfig: snapshot.aoiConfig ?? { ...DEFAULT_AOI_CONFIG },
       panelTemplateId: snapshot.panelTemplateId,
       showGrid: snapshot.showGrid,
       showCrosshair: snapshot.showCrosshair,
@@ -1470,7 +1527,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       dfmReport: null, dfmReportLayerCount: null, dfmFocus: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
-      stencilFiles: null, stencilPreview: null,
+      stencilFiles: null, stencilPreview: null, aoiFiles: null,
       packCandidates: null, selectedCandidateId: null,
     })
 
@@ -1623,7 +1680,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       layers: updatedLayers, panelResult: null,
       routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null,
       panelArrayResult: null, panelArrayFiles: null,
-      stencilFiles: null, stencilPreview: null,
+      stencilFiles: null, stencilPreview: null, aoiFiles: null,
       packCandidates: null, selectedCandidateId: null,
     })
     void get().rebuildBoardView()
@@ -2272,9 +2329,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       const gapChanged =
         (updates.gapX !== undefined && updates.gapX !== state.panelConfig.gapX) ||
         (updates.gapY !== undefined && updates.gapY !== state.panelConfig.gapY)
+      // The two slot-output fields change what the DRILLING programs contain
+      // (native slot vs a row of drills) but never any routing path — so an
+      // already-generated G-code / meta-panel bundle is stale, while routing is
+      // not. Drop the bundles (never leave a stale program downloadable — same
+      // rule as every other config edit here) without a spurious "routing is
+      // stale" prompt for a change that can't affect it.
+      const slotFieldsOnly =
+        Object.keys(updates).length > 0 &&
+        Object.keys(updates).every(k => k === 'slotsAsDrills' || k === 'slotDrillPitchRatio')
+      const slotChanged =
+        (updates.slotsAsDrills !== undefined && updates.slotsAsDrills !== state.panelConfig.slotsAsDrills) ||
+        (updates.slotDrillPitchRatio !== undefined && updates.slotDrillPitchRatio !== state.panelConfig.slotDrillPitchRatio)
       return {
         panelConfig: newConfig,
-        routingStale: true,
+        routingStale: slotFieldsOnly ? state.routingStale : true,
+        ...(slotChanged ? { gcodeFiles: null, panelArrayFiles: null } : {}),
         ...(gapChanged ? { packCandidates: null, selectedCandidateId: null } : {}),
       }
     })
@@ -2323,7 +2393,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const pcbNameChanged = updates.pcbName !== undefined && updates.pcbName !== state.panelInfo.pcbName
       return {
         panelInfo: { ...state.panelInfo, ...updates },
-        ...(pcbNameChanged ? { gcodeFiles: null, stencilFiles: null, stencilPreview: null, panelArrayFiles: null } : {}),
+        ...(pcbNameChanged ? { gcodeFiles: null, stencilFiles: null, stencilPreview: null, aoiFiles: null, panelArrayFiles: null } : {}),
       }
     })
   },
@@ -2366,7 +2436,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const clearAll = {
         panelResult: null, routingResult: null, routingStale: false, routingFocus: null,
         gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null,
-        stencilFiles: null, stencilPreview: null,
+        stencilFiles: null, stencilPreview: null, aoiFiles: null,
       }
 
       const specs = buildPackItemSpecs(designs, layers)
@@ -2415,7 +2485,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // happened to see first.
     const designLayers = activeDesignId ? layers.filter(l => l.designId === activeDesignId) : layers
     if (designLayers.length === 0) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, packCandidates: null, selectedCandidateId: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, aoiFiles: null, packCandidates: null, selectedCandidateId: null })
       return
     }
 
@@ -2427,7 +2497,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const geometry = resolveDesignGeometry(designLayers)
 
     if (!geometry) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, packCandidates: null, selectedCandidateId: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, aoiFiles: null, packCandidates: null, selectedCandidateId: null })
       return
     }
 
@@ -2435,7 +2505,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const pcbHeight = geometry.heightMm
 
     if (pcbWidth <= 0 || pcbHeight <= 0) {
-      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, packCandidates: null, selectedCandidateId: null })
+      set({ panelResult: null, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, aoiFiles: null, packCandidates: null, selectedCandidateId: null })
       return
     }
 
@@ -2533,7 +2603,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // A fresh panel invalidates any existing routing plan outright: tool paths
     // are panel-absolute, so keeping them would let a .rou export carry the
     // PREVIOUS panel's coordinates — the worst failure this feature can produce.
-    set({ panelResult: result, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null })
+    set({ panelResult: result, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, aoiFiles: null })
   },
 
   // View state
@@ -2541,7 +2611,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setTargetUnit: (unit) => {
     // Layer geometry is about to be rescaled in place, so any planned routing
     // is measured against dimensions that no longer exist.
-    set({ targetUnit: unit, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null })
+    set({ targetUnit: unit, routingResult: null, routingStale: false, routingFocus: null, gcodeFiles: null, boardContour: null, panelArrayResult: null, panelArrayFiles: null, stencilFiles: null, stencilPreview: null, aoiFiles: null })
     // Convert all layers to new unit
     const { layers } = get()
     for (const layer of layers) {
@@ -2838,7 +2908,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     // routing's own per-design scoping, not a single active design).
     const componentHoleGroups = collectAllDesignsDrillHoles(mirroredLayers, panelResult)
       .map(g => ({ diameterMm: g.diameterMm, holes: g.holes }))
-    const drillSlotGroups = collectAllDesignsDrillSlots(mirroredLayers, panelResult)
+    const collectedSlotGroups = collectAllDesignsDrillSlots(mirroredLayers, panelResult)
+
+    // Slots-as-drills (default): each slot becomes a row of overlapping round
+    // hits that join the ordinary hole list of their own diameter — one tool,
+    // one program, and the nearest-neighbour ordering / mirrorX below then treat
+    // them exactly like any other hole. Native slots (lateral cut in G-code)
+    // remain available by turning the setting off. See `drill-slots.ts`.
+    const slotDrill = resolveSlotDrillSettings(panelConfig)
+    const slotHoleGroups = slotDrill.asDrills ? expandSlotGroupsToHoles(collectedSlotGroups, slotDrill.pitchRatio) : []
+    const drillSlotGroups = slotDrill.asDrills ? [] : collectedSlotGroups
 
     // Tooling/reference (PINN) holes were previously drilled only via the
     // Excellon `_PINN.drl` export and the separate Multi-Panel Array G-code
@@ -2861,14 +2940,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       toolingHoleGroups = [...byDia.entries()].map(([diameterMm, holes]) => ({ diameterMm, holes }))
     }
 
-    const mergedByDia = new Map<number, { x: number; y: number }[]>()
-    for (const g of [...componentHoleGroups, ...toolingHoleGroups]) {
-      if (!mergedByDia.has(g.diameterMm)) mergedByDia.set(g.diameterMm, [])
-      mergedByDia.get(g.diameterMm)!.push(...g.holes)
-    }
-    const mergedHoleGroups = [...mergedByDia.entries()]
-      .sort(([a], [b]) => a - b)
-      .map(([diameterMm, holes]) => ({ diameterMm, holes }))
+    const mergedHoleGroups = mergeHoleGroups(componentHoleGroups, slotHoleGroups, toolingHoleGroups)
 
     // Single-sided PCBs must be drilled with copper facing UP on the CNC —
     // same reasoning and same reused mirror primitive as the meta-panel
@@ -2922,7 +2994,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Every design's own drill hits, each against its own datum/placements
     // then merged by diameter — same reasoning as generateGcodeFilesAction.
     const componentHoleGroups = collectAllDesignsDrillHoles(mirroredLayers, panelResult)
-    const componentSlotGroups = collectAllDesignsDrillSlots(mirroredLayers, panelResult)
+    const collectedSlotGroups = collectAllDesignsDrillSlots(mirroredLayers, panelResult)
+
+    // Slots-as-drills — see generateGcodeFilesAction. Expanded BEFORE the
+    // rotate/mirror/tile steps below so the hits travel with every other hole;
+    // when off, slots stay native and keep taking the slot-group path.
+    const slotDrill = resolveSlotDrillSettings(panelConfig)
+    const slotHoleGroups = slotDrill.asDrills ? expandSlotGroupsToHoles(collectedSlotGroups, slotDrill.pitchRatio) : []
+    const componentSlotGroups = slotDrill.asDrills ? [] : collectedSlotGroups
 
     // Tooling/reference holes join the same {diameterMm, holes} shape so they
     // ride along in the same tiled drill program as the component holes —
@@ -2938,14 +3017,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       toolingHoleGroups = [...byDia.entries()].map(([diameterMm, holes]) => ({ diameterMm, holes }))
     }
 
-    const mergedByDia = new Map<number, { x: number; y: number }[]>()
-    for (const g of [...componentHoleGroups, ...toolingHoleGroups]) {
-      if (!mergedByDia.has(g.diameterMm)) mergedByDia.set(g.diameterMm, [])
-      mergedByDia.get(g.diameterMm)!.push(...g.holes)
-    }
-    const mergedHoleGroups = [...mergedByDia.entries()]
-      .sort(([a], [b]) => a - b)
-      .map(([diameterMm, holes]) => ({ diameterMm, holes }))
+    const mergedHoleGroups = mergeHoleGroups(componentHoleGroups, slotHoleGroups, toolingHoleGroups)
 
     // When the panel is placed rotated on the sheet, every hole/slot's LOCAL
     // coordinate must rotate too — computePanelArray only swapped the cell
@@ -3194,6 +3266,273 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   clearStencilFiles: () => set({ stencilFiles: null, stencilPreview: null }),
+
+  // AOI (automated optical inspection) reference generation — see
+  // src/lib/aoi/. Always whole-panel scope (no single/panel toggle like
+  // Stencil): an inspection reference for one board in isolation isn't
+  // useful, the app photographs the whole fabricated panel.
+  aoiConfig: { ...DEFAULT_AOI_CONFIG },
+  updateAoiConfig: (updates) =>
+    set(state => ({ aoiConfig: { ...state.aoiConfig, ...updates } })),
+  resetAoiConfig: () => set({ aoiConfig: { ...DEFAULT_AOI_CONFIG }, aoiFiles: null }),
+  aoiFiles: null,
+  aoiGenerating: false,
+  generateAoiFilesAction: async () => {
+    const { layers, designs, activeDesignId, aoiConfig, panelInfo, panelConfig, outputFormat } = get()
+
+    const sides: AoiSide[] = [
+      ...(aoiConfig.includeTop ? (['top'] as const) : []),
+      ...(aoiConfig.includeBottom ? (['bottom'] as const) : []),
+    ]
+    // ⚠ Deliberately NOT gated on `panelResult` — a real requirement was
+    // tried here first ("you've set up your job", matching every other
+    // CAM-tool tab's convention) but it was pure friction: AOI exports one
+    // board's own artwork (see below) and never reads panel geometry at
+    // all, so requiring a computed panel just blocked generation for no
+    // reason a user could see — reported live as "why is Generate Reference
+    // disabled" while the Panel Config tab sat untouched. The real
+    // requirement — this design actually has usable geometry — is checked
+    // below instead, where it belongs.
+    if (sides.length === 0) {
+      set({ aoiFiles: null })
+      return
+    }
+
+    set({ aoiGenerating: true })
+    try {
+      // Same mirror-correction every other file-producing consumer goes
+      // through (see design-mirror.ts's own doc) — an AOI reference built
+      // from the unmirrored source would silently disagree with the actual
+      // fabricated board for any design with `mirrorBottomOverride` set.
+      const { layers: mirroredLayers, warnings: mirrorWarnings } = getMirroredLayers(layers, designs)
+      const allWarnings = [...mirrorWarnings]
+
+      // AOI always exports ONE board's own artwork — never the whole
+      // computed panel tiled N times. A multi-copy image is needless
+      // clutter to eyeball (and matches nothing a photograph would ever
+      // show, since a shop-floor photo is of one physical board at a
+      // time), so `activeDesignId` — the same "which board" every other
+      // single-scoped action in this file (rotate, drill-align, DFM) already
+      // uses — decides which design gets rasterised.
+      const designId = activeDesignId ?? designs[0]?.id ?? mirroredLayers[0]?.designId ?? null
+      if (!designId) {
+        set({ aoiFiles: null, aoiGenerating: false })
+        return
+      }
+      const designLayers = mirroredLayers.filter(l => l.designId === designId)
+      // ⚠ Resolve geometry as if every layer were visible — the Layers panel's
+      // show/hide toggle is a viewer-only convenience (declutter the canvas
+      // while you work), never a statement about what the fabricated board
+      // actually contains. `resolveDesignGeometry` filters on `.visible` (a
+      // real requirement for the PANEL export, where hiding a layer can mean
+      // "leave it out of this job"), but AOI's job is the opposite: represent
+      // the real board regardless of what's toggled off right now. Reported
+      // live as two symptoms of the same bug — "Hide All" disabled Generate
+      // Reference entirely (every layer hidden -> no layer qualifies -> `null`
+      // -> no width/height to raster at all), and hiding just the outline
+      // while some copper stayed visible silently sized the reference off a
+      // smaller fallback layer, which then made the OTHER side's real content
+      // fail the bounds guard in `gerberToAoiBitmap` and get dropped from the
+      // ZIP. Only the geometry call gets this treatment — the copper/drill
+      // CONTENT below was already visibility-blind (`LayerFile` carries no
+      // `visible` field at all), so this is the one place that needed it.
+      const geometry = resolveDesignGeometry(designLayers.map(l => ({ ...l, visible: true })))
+      if (!geometry) {
+        allWarnings.push(`Design "${designId}" has no layer with usable bounds — cannot size the AOI reference.`)
+        set({ aoiFiles: null, aoiGenerating: false })
+        return
+      }
+      const { widthMm, heightMm } = geometry
+
+      const layerFiles: LayerFile[] = designLayers.map(l => ({
+        name: l.name,
+        fileName: `panel_${l.type}_${l.id}.gerber`,
+        content: l.rawContent,
+        parsedLayer: l.parsedLayer,
+        type: l.type,
+        side: l.side,
+        designId: l.designId,
+      }))
+
+      // A synthetic 1-board "panel" — one un-panelized copy at the origin,
+      // with every panel-overlay feature (L-shapes, tooling holes,
+      // fiducials, V-score) disabled, same spirit as `identityPanelContext`
+      // above — so the SAME merge/offset pipeline `buildPanelizedCopperSources`
+      // already uses for the real panel produces just this one board's own
+      // artwork instead of tiling it across N placements. A lone depaneled
+      // board legitimately has none of those rib-only decorations, which is
+      // also why the manifest's fiducials/holes below come back empty.
+      const singleBoardPanel: PanelResult = {
+        panelWidth: widthMm, panelHeight: heightMm, totalPCBs: 1,
+        placements: [{ row: 0, col: 0, x: 0, y: 0, w: widthMm, h: heightMm, rotationDeg: 0, designId }],
+        designs: [{ designId, name: designs.find(d => d.id === designId)?.name ?? designId, widthMm, heightMm, count: 1, rotationsDeg: [0] }],
+        toolingHoles: [], fiducials: [], infoTexts: [],
+        source: 'grid',
+        vScoreLines: [],
+      }
+      const singleBoardConfig: PanelConfig = {
+        ...panelConfig,
+        enableLShapeMarks: false,
+        enableToolingHoles: false,
+        enableFiducials: false,
+        enableVScoreMarks: false,
+        enableVScoreLayer: false,
+      }
+
+      const { top: topContent, bottom: bottomContent, warnings: buildWarnings } =
+        buildPanelizedCopperSources(layerFiles, singleBoardPanel, singleBoardConfig, outputFormat)
+      allWarnings.push(...buildWarnings)
+
+      const renderLayers: { side: AoiSide; content: string }[] = []
+      if (aoiConfig.includeTop && topContent) renderLayers.push({ side: 'top', content: topContent })
+      if (aoiConfig.includeTop && !topContent) allWarnings.push('Top_Copper: no top copper layer found for this design — skipped.')
+      if (aoiConfig.includeBottom && bottomContent) renderLayers.push({ side: 'bottom', content: bottomContent })
+      if (aoiConfig.includeBottom && !bottomContent) allWarnings.push('Bottom_Copper: no bottom copper layer found for this design — skipped.')
+
+      if (renderLayers.length === 0) {
+        set({ aoiFiles: null, aoiGenerating: false })
+        return
+      }
+
+      // Drill geometry scoped to just this ONE design's own holes/slots —
+      // the same per-design collector (`collectPanelizedDrillHoles`/`Slots`)
+      // the panel's own drill export uses, fed the synthetic single-board
+      // sub-panel above (and this design's own datum, exactly like
+      // `collectAllDesignsDrillHoles` derives per design) so positions land
+      // at board-relative coordinates, not panel-absolute ones. No tooling/
+      // reference holes — those are panel-rib features a lone board has
+      // none of. Punched directly into the Top/Bottom copper rasters (so a
+      // plated pad/via renders as a real donut, matching an actual
+      // photographed board — see `punchDrillHoles`) and also emitted as the
+      // supplementary Top/Bottom_Drill.png masks.
+      const drillLayerFiles = layerFiles.filter(l => l.type === 'drill' && l.parsedLayer?.bounds)
+      const drillHoleGroups = collectPanelizedDrillHoles(drillLayerFiles, singleBoardPanel, geometry.datum)
+      const drillSlotGroups = collectPanelizedDrillSlots(drillLayerFiles, singleBoardPanel, geometry.datum)
+
+      const { files: rendered } = await renderAoiRasters({
+        layers: renderLayers,
+        panelWidthMm: widthMm,
+        panelHeightMm: heightMm,
+        pxPerMm: aoiConfig.pxPerMm,
+        invert: aoiConfig.invertOutput,
+        drillHoleGroups,
+        drillSlotGroups,
+      })
+      for (const f of rendered) allWarnings.push(...f.warnings)
+
+      // Reference-identity staleness guard — mirrors generateStencilFilesAction's
+      // own, but checks `activeDesignId` instead of `panelResult`: AOI no longer
+      // reads panel geometry (see the gate above), so a panel recompute mid-
+      // render doesn't invalidate this result — a DESIGN SWITCH does, since the
+      // rasterised content would then belong to a board the user has since
+      // navigated away from.
+      if (get().layers !== layers || get().activeDesignId !== activeDesignId) {
+        set({ aoiGenerating: false })
+        return
+      }
+
+      const outFiles: AoiGeneratedFile[] = []
+      const images: AoiImageMeta[] = []
+      const copperValue: 0 | 1 = aoiConfig.invertOutput ? 0 : 1
+
+      // Every side that produced at least one image, with that side's raster
+      // dimensions — the anchor/placement pixel coords below are per SIDE,
+      // not per image (copper and drill share a side's pixel space exactly,
+      // which is the whole point of generating them at identical dimensions).
+      const sideDims = new Map<AoiSide, { widthPx: number; heightPx: number }>()
+
+      for (const f of rendered) {
+        if (!f.bytes) continue
+        const sideLabel = f.side === 'top' ? 'Top' : 'Bottom'
+        const filename = `${sideLabel}_${f.kind === 'drill' ? 'Drill' : 'Copper'}.png`
+        outFiles.push({ filename, kind: 'binary', bytes: f.bytes, mime: 'image/png' })
+        if (!sideDims.has(f.side)) sideDims.set(f.side, { widthPx: f.widthPx, heightPx: f.heightPx })
+
+        const mirrored = f.side === 'bottom'
+        const k = aoiConfig.pxPerMm
+        const forwardFormula = mirrored
+          ? 'x_px = W - k*x_mm, y_px = H - k*y_mm'
+          : 'x_px = k*x_mm, y_px = H - k*y_mm'
+        const inverseFormula = mirrored
+          ? 'x_mm = (W - x_px)/k, y_mm = (H - y_px)/k'
+          : 'x_mm = x_px/k, y_mm = (H - y_px)/k'
+        images.push({
+          file: filename,
+          kind: f.kind,
+          side: f.side,
+          mirrored,
+          widthPx: f.widthPx,
+          heightPx: f.heightPx,
+          bitDepth: 1,
+          colorType: 'grayscale',
+          copperValue,
+          mmToPx: mirrored ? [-k, 0, 0, -k, f.widthPx, f.heightPx] : [k, 0, 0, -k, 0, f.heightPx],
+          forwardFormula,
+          inverseFormula,
+        })
+      }
+
+      if (outFiles.length === 0) {
+        set({ aoiFiles: null, aoiGenerating: false })
+        return
+      }
+
+      const rectPx = (side: AoiSide, x: number, y: number, w: number, h: number, widthPx: number, heightPx: number) => {
+        const k = aoiConfig.pxPerMm
+        return {
+          x: side === 'bottom' ? widthPx - k * (x + w) : k * x,
+          y: heightPx - k * (y + h),
+          w: k * w,
+          h: k * h,
+        }
+      }
+
+      // No panel fiducials/tooling holes on a single un-panelized board —
+      // those only exist on a computed panel's own ribs. `placements` keeps
+      // exactly one entry, documenting this one board's own bounds in both
+      // mm and px, consistent with the schema.
+      const fiducials: AoiFeature[] = []
+      const holes: AoiManifest['holes'] = []
+      const placements: AoiPlacement[] = [{
+        designId, row: 0, col: 0, rotationDeg: 0,
+        mm: { x: 0, y: 0, w: widthMm, h: heightMm },
+        px: (() => {
+          const px: AoiPlacement['px'] = {}
+          for (const [side, dims] of sideDims) px[side] = rectPx(side, 0, 0, widthMm, heightMm, dims.widthPx, dims.heightPx)
+          return px
+        })(),
+      }]
+
+      const manifest: AoiManifest = {
+        schemaVersion: 1,
+        generator: { app: 'ProPCB', generatedAt: new Date().toISOString() },
+        job: {
+          partNumber: panelInfo?.pcbName || 'PCB',
+          revision: panelInfo?.revision || '',
+          customer: panelInfo?.customerRef || '',
+        },
+        panel: {
+          widthMm,
+          heightMm,
+          originMm: [0, 0],
+          axes: { gerber: 'y-up', image: 'y-down' },
+        },
+        pxPerMm: aoiConfig.pxPerMm,
+        images,
+        fiducials,
+        holes,
+        placements,
+        warnings: allWarnings,
+      }
+      outFiles.push({ filename: 'aoi.json', kind: 'text', content: JSON.stringify(manifest, null, 2) })
+
+      set({ aoiFiles: outFiles, aoiGenerating: false })
+    } catch (err) {
+      console.warn('generateAoiFilesAction failed:', err instanceof Error ? err.message : String(err))
+      set({ aoiFiles: null, aoiGenerating: false })
+    }
+  },
+  clearAoiFiles: () => set({ aoiFiles: null }),
 
   // Film Plot (PDF) export config — see the interface field's own comment
   // for why there is no filmFiles slice / invalidation list here.

@@ -7,7 +7,7 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
-import { Boxes, Pencil, Check, Trash2, Search, CheckCircle2 } from 'lucide-react'
+import { Boxes, Pencil, Check, Trash2, Search, CheckCircle2, Plus } from 'lucide-react'
 import type { PackCandidate } from '@/lib/packing/pack'
 
 /** Small rectangles-only preview of a candidate layout — no Gerber content,
@@ -53,6 +53,7 @@ export default function DesignsPanel() {
   const designs = useAppStore(s => s.designs)
   const activeDesignId = useAppStore(s => s.activeDesignId)
   const setActiveDesignId = useAppStore(s => s.setActiveDesignId)
+  const createBlankDesign = useAppStore(s => s.createBlankDesign)
   const renameDesign = useAppStore(s => s.renameDesign)
   const updateDesign = useAppStore(s => s.updateDesign)
   const removeDesign = useAppStore(s => s.removeDesign)
@@ -98,13 +99,25 @@ export default function DesignsPanel() {
                 {designs.length}
               </Badge>
             )}
+            <Button
+              onClick={createBlankDesign}
+              variant="outline"
+              size="sm"
+              className="ml-auto h-6 px-2 text-[10px] border-[#1a3a5c] bg-[#0f2848]/40 hover:bg-[#0ea5e9]/10 hover:border-[#0ea5e9]/40 text-[#94b8d4]"
+              title="Start a new, empty design and make it active — loose files (not ZIP/RAR) always join whichever design is active"
+            >
+              <Plus className="w-3 h-3 mr-1" />
+              New Design
+            </Button>
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-2 text-xs">
           {designs.length === 0 ? (
             <p className="text-[#4a6f94]">
-              Import a Gerber ZIP/RAR or loose files on the Layers tab to create a design.
-              Each archive becomes its own design; loose files join whichever design is active.
+              Import a Gerber ZIP/RAR to create a design automatically, or click &quot;New Design&quot; above
+              and then import loose files on the Layers tab. Each archive always becomes its own design;
+              loose files always join whichever design is active here, so click &quot;New Design&quot; first
+              when the next loose files you import are a different board.
             </p>
           ) : (
             designs.map(d => {
